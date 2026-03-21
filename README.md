@@ -8,7 +8,7 @@
 
 一个面向 Windows 的 Steam 游戏存档管理工具，提供存档扫描、备份、恢复、自动监控、本地云盘同步、冲突处理、托盘运行和远程更新等功能。
 
-<img width="1035" height="717" alt="cdf01064-220e-4b91-b130-02ddb8c26c93" src="https://github.com/user-attachments/assets/2678e918-9e47-4dad-895a-9bca55c84eaf" />
+<img width="1624" height="1127" alt="QQ_1774099792908" src="https://github.com/user-attachments/assets/30964343-f5c4-4bd7-b341-579446b2d83a" />
 
 ## 功能特性
 
