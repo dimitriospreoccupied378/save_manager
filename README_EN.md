@@ -5,7 +5,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows/)
-[![GitHub stars](https://img.shields.io/github/stars/Kiowx/save_manager?style=social)](https://github.com/Kiowx/save_manager)
 
 A Windows-focused Steam save management tool with save scanning, backup and restore, file monitoring, local cloud-folder sync, conflict handling, tray mode, and remote update support.
 
@@ -25,6 +24,61 @@ A Windows-focused Steam save management tool with save scanning, backup and rest
 
 - Python 3.10+
 - Windows
+
+## Local Setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Kiowx/save_manager.git
+cd save_manager
+```
+
+### 2. Create a virtual environment
+
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```bat
+.venv\Scripts\activate.bat
+```
+
+### 3. Install dependencies
+
+```bash
+pip install customtkinter pillow psutil watchdog pystray pyinstaller
+```
+
+If you only want the minimum runtime setup, install the core packages first:
+
+```bash
+pip install customtkinter pillow
+```
+
+### 4. Run the app
+
+```bash
+python steam_save_manager.py
+```
+
+### 5. Optional: build an exe
+
+```bash
+pyinstaller SteamSaveManager.spec
+```
+
+Default output:
+
+- `dist/SteamSaveManager.exe`
 
 ## Dependencies
 
