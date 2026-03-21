@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows/)
+[![GitHub stars](https://img.shields.io/github/stars/Kiowx/save_manager?style=social)](https://github.com/Kiowx/save_manager)
 
 A Windows-focused Steam save management tool with save scanning, backup and restore, file monitoring, local cloud-folder sync, conflict handling, tray mode, and remote update support.
 
@@ -175,6 +176,16 @@ Update behavior:
   Packaged executable output folder
 
 ## Core Capabilities
+
+### Save Path Detection
+
+The app combines multiple signals to detect save paths:
+
+- Built-in known save path templates
+- Steam `userdata` / `remote`
+- `remotecache.vdf`
+- `steam_autocloud.vdf`
+- Fuzzy search in install folders and common Windows save locations
 
 ### Sync Modes
 
