@@ -25,6 +25,61 @@
 - Python 3.10+
 - Windows
 
+## 本地部署
+
+### 1. 克隆项目
+
+```bash
+git clone https://github.com/Kiowx/save_manager.git
+cd save_manager
+```
+
+### 2. 创建虚拟环境
+
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```bat
+.venv\Scripts\activate.bat
+```
+
+### 3. 安装依赖
+
+```bash
+pip install customtkinter pillow psutil watchdog pystray pyinstaller
+```
+
+如果你只想本地运行最小功能，也可以先安装核心依赖：
+
+```bash
+pip install customtkinter pillow
+```
+
+### 4. 启动程序
+
+```bash
+python steam_save_manager.py
+```
+
+### 5. 可选：打包为 exe
+
+```bash
+pyinstaller SteamSaveManager.spec
+```
+
+生成文件默认位于：
+
+- `dist/SteamSaveManager.exe`
+
 ## 依赖
 
 核心依赖：
