@@ -176,16 +176,6 @@ Update behavior:
 
 ## Core Capabilities
 
-### Save Path Detection
-
-The app combines multiple signals to detect save paths:
-
-- Built-in known save path templates
-- Steam `userdata` / `remote`
-- `remotecache.vdf`
-- `steam_autocloud.vdf`
-- Fuzzy search in install folders and common Windows save locations
-
 ### Sync Modes
 
 - Smart Cloud Save
