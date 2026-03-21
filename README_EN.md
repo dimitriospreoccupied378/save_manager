@@ -8,6 +8,8 @@
 
 A Windows-focused Steam save management tool with save scanning, backup and restore, file monitoring, local cloud-folder sync, conflict handling, tray mode, and remote update support.
 
+<img width="1624" height="1127" alt="a9f63c48df57bdf63777caef29f610de" src="https://github.com/user-attachments/assets/afa3f056-e8a6-4e63-9e27-ae279b6e4639" />
+
 ## Features
 
 - Automatically scans installed Steam games and tries to detect common local save locations
