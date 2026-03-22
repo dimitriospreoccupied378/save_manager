@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.0.5 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.1.0 — 通用版"""
 
 import os
 import sys
@@ -20,6 +20,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
+import html
 from pathlib import Path
 from typing import Optional
 
@@ -68,7 +69,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -123,6 +124,8 @@ TRANSLATIONS = {
         "section_system": "系统与存储",
         "section_system_sub": "通知、托盘、自启和备份轮转",
         "steam_path": "Steam 安装路径",
+        "steamdb_detection": "SteamDB 存档识别",
+        "steamdb_detection_desc": "启用后优先使用 SteamDB 严格识别存档目录；若没有结果则视为未识别。",
         "browse": "浏览",
         "language": "界面语言",
         "language_hint": "默认自动跟随当前系统语言，也可以手动覆盖。",
@@ -212,6 +215,8 @@ TRANSLATIONS = {
         "section_system": "System & Storage",
         "section_system_sub": "Notifications, tray behavior, startup, and retention",
         "steam_path": "Steam Install Path",
+        "steamdb_detection": "SteamDB Save Detection",
+        "steamdb_detection_desc": "When enabled, the app uses SteamDB for strict save-path detection. If no result is found, the game is treated as undetected.",
         "browse": "Browse",
         "language": "Interface Language",
         "language_hint": "Defaults to your current system language, but you can override it here.",
@@ -845,6 +850,7 @@ def classify_storage_path(path: str) -> str:
         return "unknown"
     try:
         import ctypes
+        import struct
 
         kernel32 = ctypes.windll.kernel32
         kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
@@ -864,41 +870,59 @@ def classify_storage_path(path: str) -> str:
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
 
-        drive_type = kernel32.GetDriveTypeW(root)
-        if drive_type == 4:
-            kind = "network"
-        elif drive_type == 2:
-            kind = "removable"
-        elif drive_type != 3:
-            kind = "unknown"
-        else:
-            class STORAGE_PROPERTY_QUERY(ctypes.Structure):
-                _fields_ = [
-                    ("PropertyId", ctypes.c_int),
-                    ("QueryType", ctypes.c_int),
-                    ("AdditionalParameters", ctypes.c_byte * 1),
-                ]
+        class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+            _fields_ = [
+                ("PropertyId", ctypes.c_int),
+                ("QueryType", ctypes.c_int),
+                ("AdditionalParameters", ctypes.c_byte * 1),
+            ]
 
-            class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
-                _fields_ = [
-                    ("Version", ctypes.c_uint32),
-                    ("Size", ctypes.c_uint32),
-                    ("IncursSeekPenalty", ctypes.c_byte),
-                ]
+        class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+            _fields_ = [
+                ("Version", ctypes.c_uint32),
+                ("Size", ctypes.c_uint32),
+                ("IncursSeekPenalty", ctypes.c_byte),
+            ]
 
-            IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
-            STORAGE_DEVICE_SEEK_PENALTY_PROPERTY = 7
-            PROPERTY_STANDARD_QUERY = 0
-            GENERIC_READ = 0x80000000
-            FILE_SHARE_READ = 0x00000001
-            FILE_SHARE_WRITE = 0x00000002
-            FILE_SHARE_DELETE = 0x00000004
-            OPEN_EXISTING = 3
-            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        class DEVICE_TRIM_DESCRIPTOR(ctypes.Structure):
+            _fields_ = [
+                ("Version", ctypes.c_uint32),
+                ("Size", ctypes.c_uint32),
+                ("TrimEnabled", ctypes.c_byte),
+            ]
 
-            volume_name = root.rstrip("\\/")
-            device_path = f"\\\\.\\{volume_name}"
-            handle = kernel32.CreateFileW(
+        IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+        STORAGE_DEVICE_SEEK_PENALTY_PROPERTY = 7
+        STORAGE_DEVICE_TRIM_PROPERTY = 8
+        PROPERTY_STANDARD_QUERY = 0
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+
+        def _query_storage_property(handle, property_id: int, descriptor):
+            query = STORAGE_PROPERTY_QUERY(
+                PropertyId=property_id,
+                QueryType=PROPERTY_STANDARD_QUERY,
+            )
+            returned = ctypes.c_uint32()
+            ok = kernel32.DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                ctypes.byref(descriptor),
+                ctypes.sizeof(descriptor),
+                ctypes.byref(returned),
+                None,
+            )
+            return bool(ok)
+
+        def _open_handle(device_path: str):
+            return kernel32.CreateFileW(
                 device_path,
                 GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -907,32 +931,68 @@ def classify_storage_path(path: str) -> str:
                 0,
                 None,
             )
-            if handle == INVALID_HANDLE_VALUE:
+
+        def _query_kind_from_handle(handle) -> str:
+            trim_desc = DEVICE_TRIM_DESCRIPTOR()
+            seek_desc = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+            trim_ok = _query_storage_property(handle, STORAGE_DEVICE_TRIM_PROPERTY, trim_desc)
+            seek_ok = _query_storage_property(handle, STORAGE_DEVICE_SEEK_PENALTY_PROPERTY, seek_desc)
+            if trim_ok and bool(trim_desc.TrimEnabled):
+                return "ssd"
+            if seek_ok:
+                return "hdd" if bool(seek_desc.IncursSeekPenalty) else "ssd"
+            if trim_ok:
+                return "ssd" if bool(trim_desc.TrimEnabled) else "fixed"
+            return "fixed"
+
+        def _get_disk_number_from_volume(handle):
+            buf = ctypes.create_string_buffer(256)
+            returned = ctypes.c_uint32()
+            ok = kernel32.DeviceIoControl(
+                handle,
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                None,
+                0,
+                buf,
+                ctypes.sizeof(buf),
+                ctypes.byref(returned),
+                None,
+            )
+            if not ok or returned.value < 4:
+                return None
+            number_of_extents = struct.unpack_from("<I", buf.raw, 0)[0]
+            if number_of_extents < 1 or returned.value < 8:
+                return None
+            return struct.unpack_from("<I", buf.raw, 4)[0]
+
+        drive_type = kernel32.GetDriveTypeW(root)
+        if drive_type == 4:
+            kind = "network"
+        elif drive_type == 2:
+            kind = "removable"
+        elif drive_type != 3:
+            kind = "unknown"
+        else:
+            volume_name = root.rstrip("\\/")
+            device_path = f"\\\\.\\{volume_name}"
+            volume_handle = _open_handle(device_path)
+            if volume_handle == INVALID_HANDLE_VALUE:
                 kind = "fixed"
             else:
                 try:
-                    query = STORAGE_PROPERTY_QUERY(
-                        PropertyId=STORAGE_DEVICE_SEEK_PENALTY_PROPERTY,
-                        QueryType=PROPERTY_STANDARD_QUERY,
-                    )
-                    desc = DEVICE_SEEK_PENALTY_DESCRIPTOR()
-                    returned = ctypes.c_uint32()
-                    ok = kernel32.DeviceIoControl(
-                        handle,
-                        IOCTL_STORAGE_QUERY_PROPERTY,
-                        ctypes.byref(query),
-                        ctypes.sizeof(query),
-                        ctypes.byref(desc),
-                        ctypes.sizeof(desc),
-                        ctypes.byref(returned),
-                        None,
-                    )
-                    if ok:
-                        kind = "hdd" if bool(desc.IncursSeekPenalty) else "ssd"
-                    else:
-                        kind = "fixed"
+                    kind = "fixed"
+                    disk_number = _get_disk_number_from_volume(volume_handle)
+                    if disk_number is not None:
+                        physical_handle = _open_handle(f"\\\\.\\PhysicalDrive{disk_number}")
+                        if physical_handle != INVALID_HANDLE_VALUE:
+                            try:
+                                kind = _query_kind_from_handle(physical_handle)
+                            finally:
+                                kernel32.CloseHandle(physical_handle)
+                    if kind == "fixed":
+                        kind = _query_kind_from_handle(volume_handle)
                 finally:
-                    kernel32.CloseHandle(handle)
+                    kernel32.CloseHandle(volume_handle)
     except Exception:
         kind = "unknown"
     _STORAGE_KIND_CACHE[root] = kind
@@ -960,9 +1020,12 @@ def recommend_scan_workers(paths: list[str], task_count: int) -> tuple[int, str]
     elif all(k == "ssd" for k in kinds):
         cap = min(12, max(4, cpu))
         profile = "ssd"
-    elif all(k in {"hdd", "fixed"} for k in kinds):
+    elif all(k == "hdd" for k in kinds):
         cap = min(4, max(2, cpu // 3))
         profile = "hdd"
+    elif all(k in {"fixed", "unknown"} for k in kinds):
+        cap = min(8, max(3, cpu // 2))
+        profile = "fixed"
     elif "hdd" in kinds:
         cap = min(6, max(3, cpu // 2))
         profile = "mixed"
@@ -983,12 +1046,42 @@ SAVE_DIR_PATTERNS = [
     "sav", "slot*", "profile*", "userdata",
 ]
 
+SAVE_FILE_HINTS = (
+    "save", "autosave", "quicksave", "slot", "profile", "player",
+    "world", "checkpoint", "progress", "career", "campaign", "story"
+)
+SAVE_FILE_EXTENSIONS = {
+    ".sav", ".save", ".dat", ".bin", ".json", ".xml", ".db", ".sqlite",
+    ".slot", ".profile", ".bak"
+}
+NEGATIVE_FILE_HINTS = {
+    "log", "logs", "cache", "shader", "screenshot", "crash", "dump",
+    "telemetry", "analytics", "temp", "tmp"
+}
+ENGINE_SAVE_DIR_SEQUENCES = [
+    ("saved", "savegames"),
+    ("saved", "savedgames"),
+    ("saved", "profiles"),
+    ("saved", "userdata"),
+    ("userdata",),
+    ("profiles",),
+    ("profile",),
+    ("saves",),
+    ("savegames",),
+    ("savedata",),
+    ("save",),
+]
+
 COMMON_SAVE_BASES = [
     APPDATA, LOCAL_APPDATA, LOCAL_LOW, DOCUMENTS,
     SAVED_GAMES, DOCUMENTS / "My Games"
 ]
 _STEAM_AUTOCLOUD_CACHE: Optional[list[dict]] = None
 _STORAGE_KIND_CACHE: dict[str, str] = {}
+_SAVE_DETECTION_CACHE: dict[str, list[dict]] = {}
+_STEAMDB_UFS_CACHE: dict[str, list[str]] = {}
+_STEAMDB_UFS_LOCK = threading.Lock()
+_STEAMDB_UFS_SEMAPHORE = threading.Semaphore(2)
 
 
 def expand_path(template: str, install_dir: str = "") -> str:
@@ -1001,6 +1094,255 @@ def expand_path(template: str, install_dir: str = "") -> str:
             .replace("{SAVED}", str(SAVED_GAMES))
             .replace("{HOME}", str(USER_HOME))
             .replace("{INSTALL}", install_dir if install_dir else "__NO_INSTALL__"))
+
+
+def _normalize_recognition_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", (name or "").lower())
+
+
+def _recognition_key(appid: str, game_name: str) -> str:
+    appid = str(appid or "").strip()
+    if appid:
+        return f"appid:{appid}"
+    return f"name:{_normalize_recognition_name(game_name)}"
+
+
+def get_recognition_cache(cfg: Optional[dict]) -> dict:
+    if not cfg:
+        return {}
+    cache = cfg.setdefault("recognition_cache", {})
+    if not isinstance(cache, dict):
+        cfg["recognition_cache"] = {}
+        cache = cfg["recognition_cache"]
+    return cache
+
+
+def get_recognition_excludes(cfg: Optional[dict]) -> dict:
+    if not cfg:
+        return {}
+    excludes = cfg.setdefault("recognition_excludes", {})
+    if not isinstance(excludes, dict):
+        cfg["recognition_excludes"] = {}
+        excludes = cfg["recognition_excludes"]
+    return excludes
+
+
+def get_recognition_blacklist(cfg: Optional[dict], appid: str, game_name: str) -> set[str]:
+    key = _recognition_key(appid, game_name)
+    excludes = get_recognition_excludes(cfg).get(key, [])
+    if not isinstance(excludes, list):
+        return set()
+    return {os.path.normpath(p) for p in excludes if isinstance(p, str) and p}
+
+
+def get_cached_recognition_path(cfg: Optional[dict], appid: str, game_name: str) -> str:
+    cache = get_recognition_cache(cfg)
+    key = _recognition_key(appid, game_name)
+    entry = cache.get(key, {})
+    if isinstance(entry, dict):
+        path = entry.get("path", "")
+    elif isinstance(entry, str):
+        path = entry
+    else:
+        path = ""
+    path = os.path.normpath(path) if path else ""
+    if path and os.path.exists(path):
+        return path
+    return ""
+
+
+def remember_recognition_path(cfg: Optional[dict], appid: str, game_name: str, path: str):
+    if not cfg or not path:
+        return
+    key = _recognition_key(appid, game_name)
+    norm = os.path.normpath(path)
+    get_recognition_cache(cfg)[key] = {
+        "path": norm,
+        "updated_at": time.time(),
+    }
+    excludes = get_recognition_excludes(cfg).get(key, [])
+    if isinstance(excludes, list):
+        get_recognition_excludes(cfg)[key] = [p for p in excludes if os.path.normpath(p) != norm]
+    _SAVE_DETECTION_CACHE.clear()
+
+
+def exclude_recognition_path(cfg: Optional[dict], appid: str, game_name: str, path: str):
+    if not cfg or not path:
+        return
+    key = _recognition_key(appid, game_name)
+    norm = os.path.normpath(path)
+    excludes = get_recognition_excludes(cfg).setdefault(key, [])
+    if norm not in [os.path.normpath(p) for p in excludes if isinstance(p, str)]:
+        excludes.append(norm)
+    cached = get_recognition_cache(cfg).get(key)
+    if isinstance(cached, dict) and os.path.normpath(cached.get("path", "")) == norm:
+        get_recognition_cache(cfg).pop(key, None)
+    _SAVE_DETECTION_CACHE.clear()
+
+
+def get_confirmed_game_path(cfg: Optional[dict], appid: str, game_name: str) -> str:
+    if not cfg:
+        return ""
+    target_appid = str(appid or "").strip()
+    target_name = (game_name or "").strip().lower()
+    for game in cfg.get("games", []):
+        game_appid = str(game.get("appid") or "").strip()
+        game_name_norm = str(game.get("name") or "").strip().lower()
+        if (target_appid and game_appid == target_appid) or (not target_appid and target_name and game_name_norm == target_name):
+            save_path = str(game.get("save_path") or "").strip()
+            if save_path and os.path.exists(save_path):
+                return os.path.normpath(save_path)
+    return ""
+
+
+def _steam64_from_accountid(accountid: str) -> str:
+    try:
+        return str(76561197960265728 + int(str(accountid).strip()))
+    except Exception:
+        return ""
+
+
+def _steamdb_strip_html(fragment: str) -> str:
+    text = re.sub(r"(?is)<br\s*/?>", "\n", fragment or "")
+    text = re.sub(r"(?is)<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def _extract_steamdb_path_strings(text: str) -> list[str]:
+    cleaned = (text or "").replace("\r", "\n")
+    results = []
+    seen = set()
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip().strip("`").strip()
+        if not line:
+            continue
+        if " likely means save files are in " in line.lower():
+            match = re.search(r"(?i)likely means save files are in (.+?) folder", line)
+            if match:
+                line = match.group(1).strip()
+        if not any(token in line for token in (
+            "%USERPROFILE%", "%APPDATA%", "%LOCALAPPDATA%", "%DOCUMENTS%",
+            "[Steam Install]", "[Steam Library]", "AppData", "Documents",
+            "Saved Games", "userdata", "{Steam3AccountID}", "{64BitSteamID}"
+        )):
+            continue
+        if line not in seen:
+            seen.add(line)
+            results.append(line)
+    return results
+
+
+def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
+    appid = str(appid or "").strip()
+    if not appid:
+        return []
+    with _STEAMDB_UFS_LOCK:
+        cached = _STEAMDB_UFS_CACHE.get(appid)
+        if cached is not None:
+            return list(cached)
+
+    url = f"https://steamdb.info/app/{appid}/ufs/"
+    headers = {
+        "User-Agent": f"{APP_NAME}/{VERSION} (+https://github.com/Kiowx/save_manager)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    templates: list[str] = []
+    try:
+        with _STEAMDB_UFS_SEMAPHORE:
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                html_text = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        with _STEAMDB_UFS_LOCK:
+            _STEAMDB_UFS_CACHE[appid] = []
+        return []
+
+    rows = re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", html_text)
+    for row in rows:
+        cells = [_steamdb_strip_html(cell) for cell in re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", row)]
+        if not cells:
+            continue
+        row_text = " | ".join(cells).lower()
+        if not any(token in row_text for token in ("windows", "all oses", "all operating systems", "all platforms")):
+            continue
+        for cell in cells:
+            templates.extend(_extract_steamdb_path_strings(cell))
+
+    if not templates:
+        full_text = _steamdb_strip_html(html_text)
+        templates.extend(_extract_steamdb_path_strings(full_text))
+
+    deduped = []
+    seen = set()
+    for item in templates:
+        norm = item.strip()
+        if norm and norm not in seen:
+            seen.add(norm)
+            deduped.append(norm)
+
+    with _STEAMDB_UFS_LOCK:
+        _STEAMDB_UFS_CACHE[appid] = deduped
+    return list(deduped)
+
+
+def expand_steamdb_template(template: str, appid: str,
+                            install_dir: str = "", steam_path: str = "") -> list[str]:
+    if not template:
+        return []
+    values = {
+        "%USERPROFILE%": str(USER_HOME),
+        "%APPDATA%": str(APPDATA),
+        "%LOCALAPPDATA%": str(LOCAL_APPDATA),
+        "%DOCUMENTS%": str(DOCUMENTS),
+        "%SAVEDGAMES%": str(SAVED_GAMES),
+        "%SAVED GAMES%": str(SAVED_GAMES),
+        "[Steam Install]": steam_path or "",
+        "[Steam Library]": os.path.dirname(os.path.dirname(install_dir)) if install_dir else "",
+        "{AppID}": str(appid or "").strip(),
+        "{appid}": str(appid or "").strip(),
+    }
+    normalized = template.replace("\\", os.sep).replace("/", os.sep)
+    normalized = normalized.replace("%USERPROFILE%\\AppData\\LocalLow", str(LOCAL_LOW))
+    normalized = normalized.replace("%USERPROFILE%/AppData/LocalLow", str(LOCAL_LOW))
+    candidates = [normalized]
+    for token, replacement in values.items():
+        next_candidates = []
+        for candidate in candidates:
+            if token in candidate and replacement:
+                next_candidates.append(candidate.replace(token, replacement))
+            else:
+                next_candidates.append(candidate)
+        candidates = next_candidates
+
+    account_ids = get_steam_user_ids(steam_path) if steam_path else []
+    expanded = []
+    for candidate in candidates:
+        queue_items = [candidate]
+        if "{Steam3AccountID}" in candidate:
+            queue_items = [candidate.replace("{Steam3AccountID}", aid) for aid in account_ids]
+        if "{64BitSteamID}" in candidate:
+            replaced = []
+            for item in queue_items:
+                if "{64BitSteamID}" in item:
+                    for aid in account_ids:
+                        steam64 = _steam64_from_accountid(aid)
+                        if steam64:
+                            replaced.append(item.replace("{64BitSteamID}", steam64))
+                else:
+                    replaced.append(item)
+            queue_items = replaced
+        expanded.extend(queue_items)
+
+    final = []
+    seen = set()
+    for candidate in expanded:
+        if any(token in candidate for token in ("{Steam3AccountID}", "{64BitSteamID}")):
+            continue
+        norm = os.path.normpath(candidate)
+        if norm not in seen and os.path.exists(norm):
+            seen.add(norm)
+            final.append(norm)
+    return final
 
 
 def get_steam_userdata_roots(steam_path: str) -> list[str]:
@@ -1084,6 +1426,219 @@ def discover_steam_autocloud_entries() -> list[dict]:
     return list(found)
 
 
+def _gather_candidate_file_signals(path: str, max_depth: int = 2,
+                                   max_files: int = 80) -> dict:
+    signals = {
+        "positive_names": 0,
+        "positive_exts": 0,
+        "negative_names": 0,
+        "steam_autocloud": False,
+        "config_like": 0,
+        "total_files": 0,
+    }
+    seen = 0
+    for root, _, files in _walk_limited(path, max_depth=max_depth):
+        for filename in files:
+            seen += 1
+            lower = filename.lower()
+            stem, ext = os.path.splitext(lower)
+            signals["total_files"] += 1
+            if lower == "steam_autocloud.vdf":
+                signals["steam_autocloud"] = True
+            if any(hint in stem for hint in SAVE_FILE_HINTS):
+                signals["positive_names"] += 1
+            if ext in SAVE_FILE_EXTENSIONS:
+                signals["positive_exts"] += 1
+            if any(hint in stem for hint in NEGATIVE_FILE_HINTS):
+                signals["negative_names"] += 1
+            if ext in {".ini", ".cfg", ".config"}:
+                signals["config_like"] += 1
+            if seen >= max_files:
+                return signals
+    return signals
+
+
+def inspect_save_candidate(path: str, game_name: str = "",
+                           install_dir: str = "") -> dict:
+    norm = os.path.normpath(path)
+    lower = norm.lower()
+    leaf = os.path.basename(norm).lower()
+    path_parts = [p.lower() for p in Path(norm).parts]
+    normalized_parts = [_normalize_recognition_name(p) for p in path_parts]
+    reasons = []
+    score = 0
+
+    if leaf in {"save", "saves", "savegame", "savegames", "savedata"}:
+        score += 14
+        reasons.append("save-dir")
+    elif leaf.startswith("slot") or leaf.startswith("profile"):
+        score += 10
+        reasons.append("slot-profile")
+    elif leaf.isdigit():
+        score += 4
+        reasons.append("account-dir")
+
+    game_norm = _normalize_recognition_name(game_name)
+    name_keywords = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", (game_name or "").lower())
+    exact_keyword_hits = 0
+    partial_keyword_hits = 0
+    if game_norm and game_norm in normalized_parts:
+        score += 18
+        reasons.append("exact-name-part")
+    if name_keywords:
+        for kw in name_keywords[:3]:
+            if len(kw) <= 2:
+                continue
+            kw_norm = _normalize_recognition_name(kw)
+            if kw_norm and kw_norm in normalized_parts:
+                exact_keyword_hits += 1
+            elif len(kw) > 4 and any(kw in part for part in path_parts):
+                partial_keyword_hits += 1
+        if exact_keyword_hits >= 2:
+            score += 14
+            reasons.append("name-match")
+        elif exact_keyword_hits == 1:
+            score += 10
+            reasons.append("name-match")
+        elif partial_keyword_hits >= 2:
+            score += 5
+            reasons.append("partial-name-match")
+
+    if install_dir:
+        try:
+            rel_parts = [p.lower() for p in Path(norm).relative_to(Path(install_dir)).parts]
+        except Exception:
+            rel_parts = []
+        if rel_parts:
+            for seq in ENGINE_SAVE_DIR_SEQUENCES:
+                seq_len = len(seq)
+                if any(tuple(rel_parts[i:i + seq_len]) == seq for i in range(len(rel_parts) - seq_len + 1)):
+                    score += 10 if seq_len > 1 else 6
+                    reasons.append("engine-layout")
+                    break
+
+    signals = _gather_candidate_file_signals(norm)
+    positive_total = min(12, signals["positive_names"]) + min(10, signals["positive_exts"])
+    score += positive_total
+    if positive_total:
+        reasons.append("save-files")
+    if signals["negative_names"] >= max(3, signals["positive_names"] + signals["positive_exts"]):
+        score -= 8
+        reasons.append("noise-heavy")
+    if signals["config_like"] >= 3 and positive_total == 0:
+        score -= 6
+        reasons.append("config-like")
+    if (
+        leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+        and positive_total == 0
+        and "exact-name-part" not in reasons
+        and "engine-layout" not in reasons
+    ):
+        score -= 6
+        reasons.append("generic-save-dir")
+
+    if score >= 28:
+        confidence = "high"
+    elif score >= 14:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    return {
+        "score": score,
+        "confidence": confidence,
+        "reasons": reasons,
+        "signals": signals,
+    }
+
+
+def score_autocloud_candidate(auto: dict, remotecache_entry: Optional[dict] = None,
+                              game_name: str = "", install_dir: str = "") -> int:
+    score = 82
+    if auto.get("accountid"):
+        score += 3
+    if remotecache_entry:
+        if auto.get("accountid") and auto.get("accountid") == remotecache_entry.get("accountid"):
+            score += 8
+        if auto.get("mtime") and remotecache_entry.get("mtime"):
+            time_gap = abs(float(auto["mtime"]) - float(remotecache_entry["mtime"]))
+            if time_gap <= 5 * 60:
+                score += 18
+            elif time_gap <= 30 * 60:
+                score += 10
+    detail = inspect_save_candidate(auto.get("save_root", ""), game_name, install_dir)
+    score += max(0, min(18, detail["score"]))
+    return score
+
+
+def should_accept_candidate(source: str, base_score: int, detail: dict) -> bool:
+    reasons = set(detail.get("reasons", []))
+    confidence = detail.get("confidence", "low")
+    signals = detail.get("signals", {})
+    positive_hits = int(signals.get("positive_names", 0)) + int(signals.get("positive_exts", 0))
+
+    if source in {"confirmed", "known-path", "remotecache", "steam-autocloud", "steam-remote", "steamdb"}:
+        return True
+
+    if source == "cache":
+        return (
+            confidence != "low"
+            or "save-files" in reasons
+            or "exact-name-part" in reasons
+            or "steam-autocloud" in reasons
+            or positive_hits >= 2
+        )
+
+    if source == "steam-app-root":
+        return confidence == "high" or positive_hits >= 3 or "steam-autocloud" in reasons
+
+    if source == "install-dir":
+        return (
+            confidence == "high"
+            or "engine-layout" in reasons
+            or "save-dir" in reasons
+            or "slot-profile" in reasons
+            or positive_hits >= 3
+        )
+
+    if source == "system-search":
+        return (
+            confidence == "high"
+            or ("exact-name-part" in reasons and ("save-files" in reasons or "save-dir" in reasons or "slot-profile" in reasons))
+            or ("name-match" in reasons and positive_hits >= 3)
+            or positive_hits >= 4
+        )
+
+    return base_score + detail.get("score", 0) >= 55
+
+
+def prune_save_candidates(candidates: list[dict]) -> list[dict]:
+    if not candidates:
+        return []
+    top_score = candidates[0]["score"]
+    pruned = []
+    for candidate in candidates:
+        keep = False
+        confidence = candidate.get("confidence", "low")
+        source = candidate.get("source", "")
+        score = int(candidate.get("score", 0))
+        if source in {"confirmed", "cache", "known-path", "remotecache", "steam-autocloud", "steamdb"}:
+            keep = True
+        elif top_score >= 105:
+            keep = score >= top_score - 12 and confidence != "low"
+        elif top_score >= 90:
+            keep = score >= top_score - 16 and confidence != "low"
+        elif top_score >= 70:
+            keep = score >= top_score - 14 and confidence == "high"
+        else:
+            keep = confidence != "low" and score >= 45
+        if keep:
+            pruned.append(candidate)
+
+    if not pruned:
+        pruned = candidates[:1]
+    return pruned[:6]
+
+
 def _guess_remotecache_bases(root_id: str, install_dir: str) -> list[str]:
     """
     根据 remotecache.vdf 中的 root 编号猜测本地根目录。
@@ -1134,7 +1689,23 @@ def extract_local_candidates_from_remotecache(remotecache_path: str,
             parent = os.path.dirname(abs_path)
             grandparent = os.path.dirname(parent)
             greatgrandparent = os.path.dirname(grandparent) if grandparent else ""
-            for candidate in [parent, grandparent, greatgrandparent]:
+            parent_leaf = os.path.basename(parent).lower() if parent else ""
+            grand_leaf = os.path.basename(grandparent).lower() if grandparent else ""
+            candidates_to_try = [parent]
+            if grandparent and (
+                parent_leaf.isdigit()
+                or parent_leaf.startswith("slot")
+                or parent_leaf.startswith("profile")
+                or parent_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+                or grand_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+            ):
+                candidates_to_try.append(grandparent)
+            if greatgrandparent and grandparent and (
+                grand_leaf.isdigit()
+                and os.path.basename(greatgrandparent).lower() in {"save", "saves", "savedata", "savegames", "savegame"}
+            ):
+                candidates_to_try.append(greatgrandparent)
+            for candidate in candidates_to_try:
                 norm = os.path.normpath(candidate) if candidate else ""
                 if norm and norm not in seen and os.path.isdir(norm):
                     seen.add(norm)
@@ -1193,14 +1764,18 @@ def find_save_in_directory(base: str, game_name: str) -> list[str]:
         for dirname in dirs:
             path = os.path.join(root, dirname)
             entry_lower = dirname.lower()
+            entry_norm = _normalize_recognition_name(dirname)
             depth = os.path.normpath(path).count(os.sep) - base_depth
             match_score = 0
             # 全名匹配或关键词匹配
             if name_lower in entry_lower or entry_lower in name_lower:
                 match_score = 3
-            elif len(keywords) >= 2 and all(kw in entry_lower for kw in keywords[:3]):
+            elif len(keywords) >= 2 and sum(1 for kw in keywords[:3] if len(kw) > 2 and kw in entry_lower) >= 2:
                 match_score = 2
-            elif len(keywords) >= 1 and len(keywords[0]) > 4 and keywords[0] in entry_lower:
+            elif len(keywords) >= 1 and len(keywords[0]) > 5 and (
+                entry_norm == _normalize_recognition_name(keywords[0])
+                or entry_lower.startswith(keywords[0])
+            ):
                 match_score = 1
 
             if match_score <= 0:
@@ -1221,88 +1796,178 @@ def find_save_in_directory(base: str, game_name: str) -> list[str]:
 
 
 def find_save_in_install_dir(install_dir: str) -> list[str]:
-    """在游戏安装目录里搜索典型的存档文件夹"""
-    results = []
+    """在游戏安装目录里搜索典型和引擎常见的存档文件夹"""
+    results = set()
     if not install_dir or not os.path.isdir(install_dir):
-        return results
-    for pattern in SAVE_DIR_PATTERNS:
-        for match in glob.glob(os.path.join(install_dir, "**", pattern),
-                                recursive=False):
-            if os.path.isdir(match):
-                results.append(match)
-    # 也搜索一层深度
-    try:
-        for entry in os.scandir(install_dir):
-            if entry.is_dir() and entry.name.lower() in [
-                p.replace("*", "") for p in SAVE_DIR_PATTERNS
-            ]:
-                results.append(entry.path)
-    except PermissionError:
-        pass
-    return list(set(results))
+        return []
+    normalized_patterns = {p.replace("*", "").lower() for p in SAVE_DIR_PATTERNS}
+    for root, dirs, _ in _walk_limited(install_dir, max_depth=5):
+        for dirname in dirs:
+            path = os.path.join(root, dirname)
+            lower = dirname.lower()
+            rel_parts = [p.lower() for p in Path(path).relative_to(Path(install_dir)).parts]
+            if lower in normalized_patterns or any(lower.startswith(p) for p in ("slot", "profile")):
+                results.add(os.path.normpath(path))
+                continue
+            for seq in ENGINE_SAVE_DIR_SEQUENCES:
+                seq_len = len(seq)
+                if any(tuple(rel_parts[i:i + seq_len]) == seq for i in range(len(rel_parts) - seq_len + 1)):
+                    results.add(os.path.normpath(path))
+                    break
+    return sorted(results)
 
 
-def detect_save_paths(appid: str, game_name: str,
-                      install_dir: str, steam_path: str) -> list[str]:
+def detect_save_candidates(appid: str, game_name: str,
+                           install_dir: str, steam_path: str,
+                           cfg: Optional[dict] = None) -> list[dict]:
     """
-    综合检测某游戏的存档路径，返回所有找到的候选路径
-    优先级：内置数据库 > remotecache/autocloud > userdata > 安装目录 > 系统目录模糊搜索
+    综合检测某游戏的存档路径，返回按分数排序后的候选项。
     """
-    scored: dict[str, int] = {}
+    cache_key = "||".join([
+        str(appid or "").strip(),
+        _normalize_recognition_name(game_name),
+        os.path.normpath(install_dir or ""),
+        os.path.normpath(steam_path or ""),
+        "steamdb:on" if cfg and cfg.get("steamdb_detection_enabled") else "steamdb:off",
+        get_cached_recognition_path(cfg, appid, game_name),
+        "|".join(sorted(get_recognition_blacklist(cfg, appid, game_name))),
+    ])
+    cached_candidates = _SAVE_DETECTION_CACHE.get(cache_key)
+    if cached_candidates:
+        valid = [c for c in cached_candidates if os.path.exists(c.get("path", ""))]
+        if valid:
+            return [dict(c) for c in valid]
 
-    def _add(path: str, score: int):
+    scored: dict[str, dict] = {}
+    blacklist = get_recognition_blacklist(cfg, appid, game_name)
+
+    def _add(path: str, score: int, source: str):
         norm = os.path.normpath(path)
-        if os.path.exists(norm):
-            scored[norm] = max(score, scored.get(norm, 0))
+        if not norm or norm in blacklist or not os.path.exists(norm):
+            return
+        detail = inspect_save_candidate(norm, game_name, install_dir)
+        if not should_accept_candidate(source, score, detail):
+            return
+        total = score + detail["score"]
+        existing = scored.get(norm)
+        entry = {
+            "path": norm,
+            "score": total,
+            "source": source,
+            "confidence": detail["confidence"],
+            "reasons": [source] + detail["reasons"],
+        }
+        if existing is None or total > existing["score"]:
+            scored[norm] = entry
 
-    # 1) 内置数据库
+    steamdb_enabled = bool(cfg and cfg.get("steamdb_detection_enabled"))
+
+    confirmed_path = get_confirmed_game_path(cfg, appid, game_name)
+    if confirmed_path:
+        _add(confirmed_path, 108, "confirmed")
+
+    if not steamdb_enabled:
+        cached_path = get_cached_recognition_path(cfg, appid, game_name)
+        if cached_path:
+            _add(cached_path, 104, "cache")
+
+    steamdb_candidates: dict[str, dict] = {}
+
+    def _collect_steamdb_candidate(path: str, score: int = 92):
+        norm = os.path.normpath(path)
+        if not norm or norm in blacklist or not os.path.exists(norm):
+            return
+        detail = inspect_save_candidate(norm, game_name, install_dir)
+        if not should_accept_candidate("steamdb", score, detail):
+            return
+        total = score + detail["score"]
+        existing = steamdb_candidates.get(norm)
+        entry = {
+            "path": norm,
+            "score": total,
+            "source": "steamdb",
+            "confidence": detail["confidence"],
+            "reasons": ["steamdb"] + detail["reasons"],
+        }
+        if existing is None or total > existing["score"]:
+            steamdb_candidates[norm] = entry
+
+    # 1) SteamDB Cloud Save / UFS 线索（可选，需联网，严格模式）
+    if steamdb_enabled and str(appid or "").strip():
+        for template in fetch_steamdb_ufs_templates(appid):
+            for path in expand_steamdb_template(template, appid, install_dir, steam_path):
+                _collect_steamdb_candidate(path)
+
+        merged_candidates = list(steamdb_candidates.values())
+        if confirmed_path:
+            confirmed_entry = scored.get(os.path.normpath(confirmed_path))
+            if confirmed_entry:
+                merged_candidates.append(confirmed_entry)
+        all_candidates = sorted(
+            {item["path"]: item for item in merged_candidates}.values(),
+            key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
+        )
+        final_candidates = all_candidates[:6]
+        _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
+        return [dict(c) for c in final_candidates]
+
+    if steamdb_enabled:
+        final_candidates = []
+        if confirmed_path:
+            confirmed_entry = scored.get(os.path.normpath(confirmed_path))
+            if confirmed_entry:
+                final_candidates = [confirmed_entry]
+        _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
+        return [dict(c) for c in final_candidates]
+
+    # 2) 内置数据库
     if appid in KNOWN_SAVE_PATHS:
         for tmpl in KNOWN_SAVE_PATHS[appid]:
             p = expand_path(tmpl, install_dir)
             if "__NO_INSTALL__" not in p and os.path.exists(p):
-                _add(p, 100)
+                _add(p, 100, "known-path")
 
-    # 2) remotecache.vdf / steam_autocloud.vdf 联动线索
-    remotecache_entries = get_remotecache_entries(appid, steam_path, install_dir)
-    autocloud_entries = discover_steam_autocloud_entries()
-    for entry in remotecache_entries:
-        for path in entry.get("local_candidates", []):
-            _add(path, score_remotecache_candidate(path))
-        if entry["remote_dir"]:
-            _add(entry["remote_dir"], 88)
-        _add(entry["app_root"], 72)
-        for auto in autocloud_entries:
-            if auto.get("accountid") and auto["accountid"] != entry["accountid"]:
-                continue
-            # 与 remotecache 时间接近时，大概率是同一游戏的真实本地 Auto-Cloud 根目录
-            if entry["mtime"] and auto.get("mtime"):
-                time_gap = abs(auto["mtime"] - entry["mtime"])
-                if time_gap <= 30 * 60:
-                    _add(auto["save_root"], 95)
-                    _add(auto["account_root"], 90)
-            elif auto.get("accountid") == entry["accountid"]:
-                _add(auto["save_root"], 86)
-                _add(auto["account_root"], 82)
-
-    # 3) Steam userdata/<uid>/<appid>/remote
-    for entry in remotecache_entries:
-        if entry["remote_dir"]:
-            _add(entry["remote_dir"], 80)
-        _add(entry["app_root"], 68)
-
-    # 4) 安装目录搜索
-    for path in find_save_in_install_dir(install_dir):
-        _add(path, 55)
-
-    # 5) 系统常见目录模糊搜索
+    # 3) 系统常见目录关键词搜索
+    # 本地识别优先依赖游戏名关键词，而不是 Auto-Cloud 元数据。
     for base in COMMON_SAVE_BASES:
         for path in find_save_in_directory(str(base), game_name):
-            _add(path, 40)
+            _add(path, 78, "system-search")
 
-    return [path for path, _ in sorted(
-        scored.items(),
-        key=lambda item: (-item[1], len(item[0]), item[0].lower())
-    )]
+    # 4) remotecache.vdf 联动线索
+    remotecache_entries = get_remotecache_entries(appid, steam_path, install_dir)
+    for entry in remotecache_entries:
+        for path in entry.get("local_candidates", []):
+            _add(path, score_remotecache_candidate(path), "remotecache")
+        if entry["remote_dir"]:
+            _add(entry["remote_dir"], 88, "steam-remote")
+        _add(entry["app_root"], 72, "steam-app-root")
+
+    # 5) Steam userdata/<uid>/<appid>/remote
+    for entry in remotecache_entries:
+        if entry["remote_dir"]:
+            _add(entry["remote_dir"], 80, "steam-remote")
+        _add(entry["app_root"], 68, "steam-app-root")
+
+    # 6) 安装目录搜索
+    for path in find_save_in_install_dir(install_dir):
+        _add(path, 60, "install-dir")
+
+    all_candidates = sorted(
+        scored.values(),
+        key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
+    )
+    preferred_candidates = prune_save_candidates(all_candidates)
+    preferred_paths = {c["path"] for c in preferred_candidates}
+    candidates = list(preferred_candidates)
+    candidates.extend(c for c in all_candidates if c["path"] not in preferred_paths)
+    _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in candidates[:20]]
+    return candidates[:20]
+
+
+def detect_save_paths(appid: str, game_name: str,
+                      install_dir: str, steam_path: str,
+                      cfg: Optional[dict] = None) -> list[str]:
+    return [c["path"] for c in detect_save_candidates(appid, game_name, install_dir, steam_path, cfg)]
 
 
 # ══════════════════════════════════════════════
@@ -1330,8 +1995,11 @@ def load_config() -> dict:
         "sync_folder": "",
         "sync_interval": 10,
         "sync_mode": "smart",
+        "steamdb_detection_enabled": False,
         "sync_state": {},
         "sync_retry_queue": [],
+        "recognition_cache": {},
+        "recognition_excludes": {},
         "minimize_to_tray": True,
         "sync_notify": True,
         "max_backups_per_game": 20,
@@ -3303,6 +3971,7 @@ class SteamSaveManager(ctk.CTk):
             appid = game["appid"]
             name = game["name"]
             save_paths = game.get("save_paths", [])
+            top_candidate = (game.get("save_candidates") or [{}])[0] if save_paths else {}
 
             card = ctk.CTkFrame(self._scan_scroll,
                                 fg_color=("#f1f5f9", "#252640"), corner_radius=10)
@@ -3326,6 +3995,32 @@ class SteamSaveManager(ctk.CTk):
                 ctk.CTkLabel(card, text=f"📁 {pd}{extra}", font=font(11),
                              text_color=C_SUBTLE_TEXT).grid(
                     row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+                confidence_map = {
+                    "high": self.bi("高可信", "High confidence"),
+                    "medium": self.bi("中可信", "Medium confidence"),
+                    "low": self.bi("中可信", "Medium confidence"),
+                }
+                source_map = {
+                    "confirmed": self.bi("已确认路径", "Confirmed path"),
+                    "cache": self.bi("历史缓存", "Cached result"),
+                    "known-path": self.bi("内置规则", "Known rule"),
+                    "steamdb": self.bi("SteamDB", "SteamDB"),
+                    "remotecache": self.bi("remotecache", "remotecache"),
+                    "steam-autocloud": self.bi("Auto-Cloud", "Auto-Cloud"),
+                    "steam-autocloud-account": self.bi("Auto-Cloud 账号目录", "Auto-Cloud account root"),
+                    "steam-remote": self.bi("Steam remote", "Steam remote"),
+                    "steam-app-root": self.bi("Steam app root", "Steam app root"),
+                    "install-dir": self.bi("安装目录", "Install dir"),
+                    "system-search": self.bi("系统模糊搜索", "System search"),
+                }
+                confidence_text = confidence_map.get(top_candidate.get("confidence", "low"), confidence_map["low"])
+                source_text = source_map.get(top_candidate.get("source", ""), top_candidate.get("source", ""))
+                reason_text = self.bi("文件特征匹配", "Save file signals") if "save-files" in top_candidate.get("reasons", []) else ""
+                meta_parts = [p for p in [confidence_text, source_text, reason_text] if p]
+                if meta_parts:
+                    ctk.CTkLabel(card, text=" · ".join(meta_parts), font=font(10),
+                                 text_color=C_SUBTLE_TEXT).grid(
+                        row=2, column=0, padx=14, pady=(0, 8), sticky="w")
                 if appid not in already_added:
                     addable += 1
                     if len(save_paths) > 1:
@@ -3424,18 +4119,22 @@ class SteamSaveManager(ctk.CTk):
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
-                    detect_save_paths,
-                    game["appid"], game["name"], game["install_dir"], steam_path
+                    detect_save_candidates,
+                    game["appid"], game["name"], game["install_dir"], steam_path, self.cfg
                 ): game
                 for game in installed
             }
             for future in concurrent.futures.as_completed(future_map):
                 game = future_map[future]
                 try:
-                    save_paths = future.result()
+                    save_candidates = future.result()
                 except Exception:
-                    save_paths = []
-                results.append({**game, "save_paths": save_paths})
+                    save_candidates = []
+                results.append({
+                    **game,
+                    "save_candidates": save_candidates,
+                    "save_paths": [c["path"] for c in save_candidates],
+                })
                 completed += 1
                 if completed == total or completed == 1 or completed % 5 == 0:
                     self.after(
@@ -3483,6 +4182,7 @@ class SteamSaveManager(ctk.CTk):
             self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
             return
         games.append({"appid": appid, "name": name, "save_path": save_path})
+        remember_recognition_path(self.cfg, appid, name, save_path)
         save_config(self.cfg)
         self._refresh_games_list()
         self._render_scan_results()
@@ -3500,6 +4200,7 @@ class SteamSaveManager(ctk.CTk):
                 continue
             selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
             games.append({"appid": appid, "name": result["name"], "save_path": selected})
+            remember_recognition_path(self.cfg, appid, result["name"], selected)
             existing.add(appid)
             added += 1
         if not added:
@@ -3623,8 +4324,10 @@ class SteamSaveManager(ctk.CTk):
             n, p = ne.get().strip(), pe.get().strip()
             if not n or not p:
                 self._show_warning(self.bi("提示", "Notice"), self.bi("请填写名称和路径", "Please enter both the game name and save path")); return
+            appid = ae.get().strip()
             self.cfg.setdefault("games", []).append(
-                {"name": n, "save_path": p, "appid": ae.get().strip()})
+                {"name": n, "save_path": p, "appid": appid})
+            remember_recognition_path(self.cfg, appid, n, p)
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("确认添加", "Add Game"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -3647,9 +4350,14 @@ class SteamSaveManager(ctk.CTk):
                       command=lambda: self._browse(pe)).pack(side="left", padx=6)
         def _sv():
             old_game = dict(self.cfg["games"][idx])
-            self.cfg["games"][idx]["name"] = ne.get().strip()
-            self.cfg["games"][idx]["save_path"] = pe.get().strip()
+            new_name = ne.get().strip()
+            new_path = pe.get().strip()
+            self.cfg["games"][idx]["name"] = new_name
+            self.cfg["games"][idx]["save_path"] = new_path
             clear_game_sync_state(self.cfg, old_game)
+            if old_game.get("save_path") and old_game.get("save_path") != new_path:
+                exclude_recognition_path(self.cfg, old_game.get("appid", ""), old_game.get("name", ""), old_game.get("save_path", ""))
+            remember_recognition_path(self.cfg, self.cfg["games"][idx].get("appid", ""), new_name, new_path)
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("保存", "Save"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -4797,6 +5505,15 @@ class SteamSaveManager(ctk.CTk):
         ctk.CTkButton(sf, text=self.t("browse"), width=80, font=font(12),
                       command=lambda: self._browse(self._steam_e, self._apply_steam_path)).pack(side="left", padx=8)
 
+        _label(general, 8, "steamdb_detection")
+        self._steamdb_detection_var = ctk.StringVar(
+            value="on" if self.cfg.get("steamdb_detection_enabled") else "off")
+        ctk.CTkSwitch(
+            general, text=self.t("steamdb_detection_desc"),
+            variable=self._steamdb_detection_var, onvalue="on", offvalue="off",
+            font=font(12), command=self._toggle_steamdb_detection
+        ).grid(row=9, column=0, padx=22, pady=(0, 18), sticky="w")
+
         # Automation
         _label(automation, 2, "auto_backup")
         af = ctk.CTkFrame(automation, fg_color="transparent")
@@ -5108,6 +5825,11 @@ class SteamSaveManager(ctk.CTk):
         en = self._watch_var.get() == "on"
         self.cfg["watch_enabled"] = en; save_config(self.cfg)
         self._restart_watchers_runtime()
+
+    def _toggle_steamdb_detection(self):
+        self.cfg["steamdb_detection_enabled"] = self._steamdb_detection_var.get() == "on"
+        _SAVE_DETECTION_CACHE.clear()
+        save_config(self.cfg)
 
     def _auto_detect_cloud(self):
         path = detect_cloud_folder()
