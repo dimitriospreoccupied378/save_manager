@@ -1,0 +1,6 @@
+customtkinter
+Pillow
+psutil
+watchdog
+pystray
+pyinstaller
