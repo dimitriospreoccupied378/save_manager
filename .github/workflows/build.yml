@@ -4,9 +4,25 @@ on:
   push:
     branches:
       - main
+    paths:
+      - main.py
+      - steam_save_manager.py
+      - SteamSaveManager.spec
+      - README.md
+      - README_EN.md
+      - LICENSE
+      - .github/workflows/build.yml
     tags:
       - "v*"
   pull_request:
+    paths:
+      - main.py
+      - steam_save_manager.py
+      - SteamSaveManager.spec
+      - README.md
+      - README_EN.md
+      - LICENSE
+      - .github/workflows/build.yml
   workflow_dispatch:
 
 permissions:
@@ -38,9 +54,25 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install customtkinter pillow psutil watchdog pystray pyinstaller
 
+      - name: Resolve build target
+        id: target
+        shell: pwsh
+        run: |
+          if (Test-Path main.py) {
+            $entry = "main.py"
+          } elseif (Test-Path steam_save_manager.py) {
+            $entry = "steam_save_manager.py"
+          } else {
+            throw "No entry script found. Expected main.py or steam_save_manager.py."
+          }
+
+          $useSpec = Test-Path "SteamSaveManager.spec"
+          "entry=$entry" >> $env:GITHUB_OUTPUT
+          "use_spec=$($useSpec.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
       - name: Verify source compiles
         shell: pwsh
-        run: python -m py_compile steam_save_manager.py
+        run: python -m py_compile "${{ steps.target.outputs.entry }}"
 
       - name: Clean old build output
         shell: pwsh
@@ -51,7 +83,12 @@ jobs:
 
       - name: Build executable with PyInstaller
         shell: pwsh
-        run: pyinstaller --clean SteamSaveManager.spec
+        run: |
+          if ("${{ steps.target.outputs.use_spec }}" -eq "true") {
+            pyinstaller --clean SteamSaveManager.spec
+          } else {
+            pyinstaller --clean --noconsole --onefile --name "${{ env.APP_NAME }}" "${{ steps.target.outputs.entry }}"
+          }
 
       - name: Prepare release files
         id: package
