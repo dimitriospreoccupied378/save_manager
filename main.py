@@ -4054,6 +4054,7 @@ class SteamSaveManager(ctk.CTk):
                 }
                 source_map = {
                     "confirmed": self.bi("已确认路径", "Confirmed path"),
+                    "manual": self.bi("手动指定", "Manual override"),
                     "cache": self.bi("历史缓存", "Cached result"),
                     "known-path": self.bi("内置规则", "Known rule"),
                     "steamdb": self.bi("SteamDB", "SteamDB"),
@@ -4080,12 +4081,20 @@ class SteamSaveManager(ctk.CTk):
                     ctk.CTkOptionMenu(card, variable=pv, values=save_paths,
                                       width=240, font=font(11)).grid(
                         row=0, column=1, padx=6, pady=4, sticky="e")
-                    ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
+                    action_frame = ctk.CTkFrame(card, fg_color="transparent")
+                    action_frame.grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
+                    ctk.CTkButton(action_frame, text="📁", width=36, height=28,
+                                  font=font(14), corner_radius=6,
+                                  fg_color=BTN_WARN, hover_color=BTN_WARN_H,
+                                  command=lambda a=appid, n=name:
+                                  self._override_scan_result_path(a, n)
+                                  ).pack(side="left")
+                    ctk.CTkButton(action_frame, text=self.bi("添加", "Add"), width=64, height=28,
                                   font=font(12), corner_radius=6,
                                   fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
                                   command=lambda a=appid, n=name, v=pv:
                                   self._add_from_scan(a, n, v.get())
-                                  ).grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
+                                  ).pack(side="left", padx=(8, 0))
                 else:
                     ctk.CTkLabel(card, text=self.bi("✔ 已添加", "✔ Added"), font=font(11),
                                  text_color=BTN_SUCCESS).grid(
@@ -4094,11 +4103,11 @@ class SteamSaveManager(ctk.CTk):
                 ctk.CTkLabel(card, text=self.bi("未检测到存档路径", "No save path detected"), font=font(11),
                              text_color=("#ea580c", "#fb923c")).grid(
                     row=1, column=0, padx=14, pady=(0, 10), sticky="w")
-                ctk.CTkButton(card, text=self.bi("手动选择", "Choose Manually"), width=80, height=28,
-                              font=font(12), corner_radius=6,
+                ctk.CTkButton(card, text="📁", width=36, height=28,
+                              font=font(14), corner_radius=6,
                               fg_color=BTN_WARN, hover_color=BTN_WARN_H,
                               command=lambda a=appid, n=name:
-                              self._manual_add_from_scan(a, n)
+                              self._override_scan_result_path(a, n)
                               ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
 
         if not self._scan_in_progress:
@@ -4266,6 +4275,36 @@ class SteamSaveManager(ctk.CTk):
         d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
         if d:
             self._add_from_scan(appid, name, d)
+
+    def _override_scan_result_path(self, appid, name):
+        d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
+        if not d:
+            return
+        norm = os.path.normpath(d)
+        for result in self._scan_results:
+            if result.get("appid") != appid:
+                continue
+            existing_paths = [os.path.normpath(p) for p in result.get("save_paths", [])]
+            if norm in existing_paths:
+                idx = existing_paths.index(norm)
+                if idx != 0:
+                    result["save_paths"].insert(0, result["save_paths"].pop(idx))
+                    candidates = result.get("save_candidates", [])
+                    if idx < len(candidates):
+                        candidates.insert(0, candidates.pop(idx))
+            else:
+                result.setdefault("save_paths", [])
+                result["save_paths"] = [norm] + [p for p in result["save_paths"] if os.path.normpath(p) != norm]
+                result.setdefault("save_candidates", [])
+                result["save_candidates"] = [{
+                    "path": norm,
+                    "score": 999,
+                    "source": "manual",
+                    "confidence": "high",
+                    "reasons": ["manual"],
+                }] + [c for c in result["save_candidates"] if os.path.normpath(c.get("path", "")) != norm]
+            break
+        self._render_scan_results()
 
     # ─── 游戏列表 ───
     def _build_games_frame(self):
