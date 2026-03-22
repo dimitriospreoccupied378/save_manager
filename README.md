@@ -69,7 +69,7 @@ pip install customtkinter pillow
 ### 4. 启动程序
 
 ```bash
-python steam_save_manager.py
+python main.py
 ```
 
 ### 5. 可选：打包为 exe
@@ -111,7 +111,7 @@ pip install customtkinter pillow psutil watchdog pystray pyinstaller
 直接运行：
 
 ```bash
-python steam_save_manager.py
+python main.py
 ```
 
 启动后主窗口会默认居中显示。
@@ -167,7 +167,7 @@ https://raw.githubusercontent.com/Kiowx/save_manager/refs/heads/main/update/upda
 
 ## 目录说明
 
-- [steam_save_manager.py](d:\project\steam\steam_save_manager.py)
+- [main.py](d:\project\steam\main.py)
   主程序入口和全部核心逻辑
 - [SteamSaveManager.spec](d:\project\steam\SteamSaveManager.spec)
   PyInstaller 打包配置
