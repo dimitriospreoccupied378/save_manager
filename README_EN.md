@@ -69,7 +69,7 @@ pip install customtkinter pillow
 ### 4. Run the app
 
 ```bash
-python steam_save_manager.py
+python main.py
 ```
 
 ### 5. Optional: build an exe
@@ -111,7 +111,7 @@ pip install customtkinter pillow psutil watchdog pystray pyinstaller
 Run directly:
 
 ```bash
-python steam_save_manager.py
+python main.py
 ```
 
 The main window starts centered on screen by default.
@@ -167,7 +167,7 @@ Update behavior:
 
 ## Project Structure
 
-- [steam_save_manager.py](d:\project\steam\steam_save_manager.py)
+- [main.py](d:\project\steam\main.py)
   Main entry point and core logic
 - [SteamSaveManager.spec](d:\project\steam\SteamSaveManager.spec)
   PyInstaller build configuration
