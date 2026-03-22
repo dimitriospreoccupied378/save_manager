@@ -66,7 +66,16 @@ jobs:
             throw "No entry script found. Expected main.py or steam_save_manager.py."
           }
 
-          $useSpec = Test-Path "SteamSaveManager.spec"
+          $useSpec = $false
+          if (Test-Path "SteamSaveManager.spec") {
+            $specContent = Get-Content "SteamSaveManager.spec" -Raw
+            if ($specContent -match [regex]::Escape("'$entry'")) {
+              $useSpec = $true
+            } elseif ($specContent -match [regex]::Escape('"' + $entry + '"')) {
+              $useSpec = $true
+            }
+          }
+
           "entry=$entry" >> $env:GITHUB_OUTPUT
           "use_spec=$($useSpec.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
