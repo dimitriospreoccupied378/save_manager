@@ -1,6 +1,6 @@
 {
-  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.1.0/SteamSaveManager.exe",
-  "sha256": "36c5c63821cb08613ee13b1f4e8962aab2ad959332ef15cc56f624abc92812ed",
-  "notes": "1. 新增可选的 SteamDB 存档识别模式\n2. 设置中可手动开启 SteamDB 严格识别\n3. 开启后优先使用 SteamDB 的存档目录结果\n4. 本地存档识别逻辑已调整为更偏向关键词匹配\n5. 优化目录关键词权重，提升按游戏名匹配本地存档目录的优先级\n6. 停用 Auto-Cloud 作为本地存档归因依据，减少误匹配\n7. 扫描结果中的低可信候选现在统一显示为中可信\n8. 优化磁盘类型判断逻辑\n9. 现在会优先从卷映射到物理磁盘后再识别 SSD / HDD\n10. 修复部分固态硬盘被错误识别为机械硬盘的问题\n11. 无法明确判断介质类型时，会显示为固定磁盘而不再直接按机械盘处理",
-  "version": "1.1.0"
+  "version": "1.1.1",
+  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.1.1/SteamSaveManager.exe",
+  "sha256": "9a1a1ee22dccd41041c9d86e20d09c2777b6b128b2b2b5f4cc84db7aadfb8663",
+  "notes": "1. - 优化本地存档识别优先级\n2. - 调整 `remotecache.vdf`、`userdata/remote`、`userdata/<steamid>/<appid>` 与内置规则的排序逻辑\n3. - `remotecache.vdf` 未能还原本地路径时，会优先使用对应的 `userdata/remote` 目录\n4. - 提升 `userdata` 相关候选在扫描结果中的保留优先级\n5. - 优化 `remotecache.vdf` 路径解析，优先识别带账号 ID 的真实存档目录\n6. - SteamDB 模式调整为“优先使用 SteamDB，未命中时回退到本地 Steam userdata 目录”\n7. - 优化 SteamDB 与本地识别的切换逻辑\n8. - 修复 SteamDB 未命中时 fallback 分支未正确执行的问题\n9. - 扫描页恢复多候选下拉选择\n10. - 已识别到存档路径的游戏现在可以正常显示多个候选目录\n11. - 每次启动软件时自动清理识别缓存，减少旧结果干扰\n12. - 每次重新扫描前自动清理临时识别缓存\n13. - 优化 `Steam userdata` 根目录的查找方式，兼容更多 Steam 路径布局\n"
 }
