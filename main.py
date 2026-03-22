@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.1.0 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.1.1 — 通用版"""
 
 import os
 import sys
@@ -69,7 +69,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -125,7 +125,7 @@ TRANSLATIONS = {
         "section_system_sub": "通知、托盘、自启和备份轮转",
         "steam_path": "Steam 安装路径",
         "steamdb_detection": "SteamDB 存档识别",
-        "steamdb_detection_desc": "启用后优先使用 SteamDB 严格识别存档目录；若没有结果则视为未识别。",
+        "steamdb_detection_desc": "启用后优先使用 SteamDB 识别；若无结果则回退到普通本地识别。",
         "browse": "浏览",
         "language": "界面语言",
         "language_hint": "默认自动跟随当前系统语言，也可以手动覆盖。",
@@ -216,7 +216,7 @@ TRANSLATIONS = {
         "section_system_sub": "Notifications, tray behavior, startup, and retention",
         "steam_path": "Steam Install Path",
         "steamdb_detection": "SteamDB Save Detection",
-        "steamdb_detection_desc": "When enabled, the app uses SteamDB for strict save-path detection. If no result is found, the game is treated as undetected.",
+        "steamdb_detection_desc": "When enabled, the app prioritizes SteamDB for save detection. If no result is found, it falls back to normal local detection.",
         "browse": "Browse",
         "language": "Interface Language",
         "language_hint": "Defaults to your current system language, but you can override it here.",
@@ -1349,8 +1349,12 @@ def get_steam_userdata_roots(steam_path: str) -> list[str]:
     """收集可能存在 Steam userdata 的根目录。"""
     roots = []
     seen = set()
+    steam_norm = os.path.normpath(steam_path) if steam_path else ""
     candidates = [
-        os.path.join(steam_path, "userdata") if steam_path else "",
+        os.path.join(steam_norm, "userdata") if steam_norm else "",
+        steam_norm if steam_norm and os.path.basename(steam_norm).lower() == "userdata" else "",
+        os.path.join(os.path.dirname(steam_norm), "userdata") if steam_norm else "",
+        os.path.join(os.path.dirname(os.path.dirname(steam_norm)), "userdata") if steam_norm else "",
         os.path.join(str(LOCAL_APPDATA), "Steam", "userdata"),
         os.path.join(r"C:\Program Files (x86)\Steam", "userdata"),
         os.path.join(r"C:\Program Files\Steam", "userdata"),
@@ -1360,6 +1364,24 @@ def get_steam_userdata_roots(steam_path: str) -> list[str]:
         if norm and norm not in seen and os.path.isdir(norm):
             seen.add(norm)
             roots.append(norm)
+
+    search_bases = []
+    for base in [steam_norm, os.path.dirname(steam_norm), os.path.dirname(os.path.dirname(steam_norm))]:
+        norm = os.path.normpath(base) if base else ""
+        if norm and os.path.isdir(norm) and norm not in search_bases:
+            search_bases.append(norm)
+
+    for base in search_bases:
+        try:
+            for root, dirs, _ in _walk_limited(base, max_depth=2):
+                if os.path.basename(root).lower() == "userdata":
+                    norm = os.path.normpath(root)
+                    if norm not in seen and os.path.isdir(norm):
+                        seen.add(norm)
+                        roots.append(norm)
+                        dirs[:] = []
+        except Exception:
+            continue
     return roots
 
 
@@ -1576,7 +1598,7 @@ def should_accept_candidate(source: str, base_score: int, detail: dict) -> bool:
     signals = detail.get("signals", {})
     positive_hits = int(signals.get("positive_names", 0)) + int(signals.get("positive_exts", 0))
 
-    if source in {"confirmed", "known-path", "remotecache", "steam-autocloud", "steam-remote", "steamdb"}:
+    if source in {"confirmed", "known-path", "remotecache", "steam-autocloud", "steam-remote", "steam-app-root", "steamdb"}:
         return True
 
     if source == "cache":
@@ -1587,9 +1609,6 @@ def should_accept_candidate(source: str, base_score: int, detail: dict) -> bool:
             or "steam-autocloud" in reasons
             or positive_hits >= 2
         )
-
-    if source == "steam-app-root":
-        return confidence == "high" or positive_hits >= 3 or "steam-autocloud" in reasons
 
     if source == "install-dir":
         return (
@@ -1621,7 +1640,7 @@ def prune_save_candidates(candidates: list[dict]) -> list[dict]:
         confidence = candidate.get("confidence", "low")
         source = candidate.get("source", "")
         score = int(candidate.get("score", 0))
-        if source in {"confirmed", "cache", "known-path", "remotecache", "steam-autocloud", "steamdb"}:
+        if source in {"confirmed", "cache", "known-path", "remotecache", "steam-autocloud", "steam-remote", "steam-app-root", "steamdb"}:
             keep = True
         elif top_score >= 105:
             keep = score >= top_score - 12 and confidence != "low"
@@ -1691,20 +1710,45 @@ def extract_local_candidates_from_remotecache(remotecache_path: str,
             greatgrandparent = os.path.dirname(grandparent) if grandparent else ""
             parent_leaf = os.path.basename(parent).lower() if parent else ""
             grand_leaf = os.path.basename(grandparent).lower() if grandparent else ""
-            candidates_to_try = [parent]
+            preferred_candidates = []
+            fallback_candidates = []
+
+            # 优先使用带账号 ID 的目录，例如 Pearl Abyss/CD/save/1007873524
+            if grandparent and grand_leaf.isdigit():
+                preferred_candidates.append(grandparent)
+            elif parent and parent_leaf.isdigit():
+                preferred_candidates.append(parent)
+
             if grandparent and (
-                parent_leaf.isdigit()
-                or parent_leaf.startswith("slot")
+                parent_leaf.startswith("slot")
                 or parent_leaf.startswith("profile")
-                or parent_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
-                or grand_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+                or parent_leaf.startswith("account")
             ):
-                candidates_to_try.append(grandparent)
+                if grandparent not in preferred_candidates:
+                    preferred_candidates.append(grandparent)
+
+            if parent:
+                fallback_candidates.append(parent)
+
+            if grandparent and grandparent not in preferred_candidates:
+                if (
+                    parent_leaf.startswith("slot")
+                    or parent_leaf.startswith("profile")
+                    or parent_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+                    or grand_leaf in {"save", "saves", "savedata", "savegames", "savegame"}
+                ):
+                    fallback_candidates.append(grandparent)
+
             if greatgrandparent and grandparent and (
                 grand_leaf.isdigit()
                 and os.path.basename(greatgrandparent).lower() in {"save", "saves", "savedata", "savegames", "savegame"}
             ):
-                candidates_to_try.append(greatgrandparent)
+                fallback_candidates.append(greatgrandparent)
+
+            candidates_to_try = preferred_candidates + [
+                candidate for candidate in fallback_candidates
+                if candidate not in preferred_candidates
+            ]
             for candidate in candidates_to_try:
                 norm = os.path.normpath(candidate) if candidate else ""
                 if norm and norm not in seen and os.path.isdir(norm):
@@ -1715,14 +1759,18 @@ def extract_local_candidates_from_remotecache(remotecache_path: str,
 
 def score_remotecache_candidate(path: str) -> int:
     """对 remotecache 还原出的候选目录做层级排序。"""
-    leaf = os.path.basename(os.path.normpath(path)).lower()
+    norm = os.path.normpath(path)
+    leaf = os.path.basename(norm).lower()
+    parent_leaf = os.path.basename(os.path.dirname(norm)).lower()
     if leaf.isdigit():
-        return 98
+        if parent_leaf in {"save", "saves", "savedata", "savegames", "savegame"}:
+            return 128
+        return 122
     if leaf.startswith("slot") or leaf.startswith("profile"):
-        return 93
+        return 108
     if leaf in {"save", "saves", "savedata", "savegames", "savegame"}:
-        return 97
-    return 95
+        return 96
+    return 100
 
 
 def get_remotecache_entries(appid: str, steam_path: str,
@@ -1865,11 +1913,7 @@ def detect_save_candidates(appid: str, game_name: str,
     confirmed_path = get_confirmed_game_path(cfg, appid, game_name)
     if confirmed_path:
         _add(confirmed_path, 108, "confirmed")
-
-    if not steamdb_enabled:
-        cached_path = get_cached_recognition_path(cfg, appid, game_name)
-        if cached_path:
-            _add(cached_path, 104, "cache")
+    cached_path = get_cached_recognition_path(cfg, appid, game_name)
 
     steamdb_candidates: dict[str, dict] = {}
 
@@ -1892,40 +1936,30 @@ def detect_save_candidates(appid: str, game_name: str,
         if existing is None or total > existing["score"]:
             steamdb_candidates[norm] = entry
 
-    # 1) SteamDB Cloud Save / UFS 线索（可选，需联网，严格模式）
+    # 1) SteamDB Cloud Save / UFS 线索（可选，需联网，优先模式）
     if steamdb_enabled and str(appid or "").strip():
         for template in fetch_steamdb_ufs_templates(appid):
             for path in expand_steamdb_template(template, appid, install_dir, steam_path):
                 _collect_steamdb_candidate(path)
 
-        merged_candidates = list(steamdb_candidates.values())
-        if confirmed_path:
-            confirmed_entry = scored.get(os.path.normpath(confirmed_path))
-            if confirmed_entry:
-                merged_candidates.append(confirmed_entry)
-        all_candidates = sorted(
-            {item["path"]: item for item in merged_candidates}.values(),
-            key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
-        )
-        final_candidates = all_candidates[:6]
-        _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
-        return [dict(c) for c in final_candidates]
+        if steamdb_candidates:
+            all_candidates = sorted(
+                steamdb_candidates.values(),
+                key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
+            )
+            final_candidates = all_candidates[:6]
+            _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
+            return [dict(c) for c in final_candidates]
 
-    if steamdb_enabled:
-        final_candidates = []
-        if confirmed_path:
-            confirmed_entry = scored.get(os.path.normpath(confirmed_path))
-            if confirmed_entry:
-                final_candidates = [confirmed_entry]
-        _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
-        return [dict(c) for c in final_candidates]
+    if cached_path:
+        _add(cached_path, 104, "cache")
 
     # 2) 内置数据库
     if appid in KNOWN_SAVE_PATHS:
         for tmpl in KNOWN_SAVE_PATHS[appid]:
             p = expand_path(tmpl, install_dir)
             if "__NO_INSTALL__" not in p and os.path.exists(p):
-                _add(p, 100, "known-path")
+                _add(p, 92, "known-path")
 
     # 3) 系统常见目录关键词搜索
     # 本地识别优先依赖游戏名关键词，而不是 Auto-Cloud 元数据。
@@ -1936,17 +1970,19 @@ def detect_save_candidates(appid: str, game_name: str,
     # 4) remotecache.vdf 联动线索
     remotecache_entries = get_remotecache_entries(appid, steam_path, install_dir)
     for entry in remotecache_entries:
-        for path in entry.get("local_candidates", []):
+        local_candidates = entry.get("local_candidates", [])
+        has_local_candidates = bool(local_candidates)
+        for path in local_candidates:
             _add(path, score_remotecache_candidate(path), "remotecache")
         if entry["remote_dir"]:
-            _add(entry["remote_dir"], 88, "steam-remote")
-        _add(entry["app_root"], 72, "steam-app-root")
+            _add(entry["remote_dir"], 104 if has_local_candidates else 112, "steam-remote")
+        _add(entry["app_root"], 98, "steam-app-root")
 
     # 5) Steam userdata/<uid>/<appid>/remote
     for entry in remotecache_entries:
-        if entry["remote_dir"]:
-            _add(entry["remote_dir"], 80, "steam-remote")
-        _add(entry["app_root"], 68, "steam-app-root")
+        if entry["remote_dir"] and not entry.get("local_candidates"):
+            _add(entry["remote_dir"], 108, "steam-remote")
+        _add(entry["app_root"], 94, "steam-app-root")
 
     # 6) 安装目录搜索
     for path in find_save_in_install_dir(install_dir):
@@ -2046,6 +2082,21 @@ def save_config(cfg: dict):
     ensure_dirs()
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def clear_startup_caches(cfg: Optional[dict] = None):
+    global _STEAM_AUTOCLOUD_CACHE
+
+    _STEAM_AUTOCLOUD_CACHE = None
+    _STORAGE_KIND_CACHE.clear()
+    _SAVE_DETECTION_CACHE.clear()
+    _STEAMDB_UFS_CACHE.clear()
+
+    if cfg is not None:
+        cache = cfg.get("recognition_cache")
+        if isinstance(cache, dict) and cache:
+            cfg["recognition_cache"] = {}
+            save_config(cfg)
 
 
 # ══════════════════════════════════════════════
@@ -3495,6 +3546,7 @@ class SteamSaveManager(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.cfg = load_config()
+        clear_startup_caches(self.cfg)
         self.lang = normalize_language(self.cfg.get("language"))
         self.auto_backup_running = False
         self._stop_event = threading.Event()
@@ -4023,25 +4075,17 @@ class SteamSaveManager(ctk.CTk):
                         row=2, column=0, padx=14, pady=(0, 8), sticky="w")
                 if appid not in already_added:
                     addable += 1
-                    if len(save_paths) > 1:
-                        pv = ctk.StringVar(value=save_paths[0])
-                        self._scan_choice_vars[appid] = pv
-                        ctk.CTkOptionMenu(card, variable=pv, values=save_paths,
-                                          width=240, font=font(11)).grid(
-                            row=0, column=1, padx=6, pady=4, sticky="e")
-                        ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
-                                      font=font(12), corner_radius=6,
-                                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                                      command=lambda a=appid, n=name, v=pv:
-                                      self._add_from_scan(a, n, v.get())
-                                      ).grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
-                    else:
-                        ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
-                                      font=font(12), corner_radius=6,
-                                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                                      command=lambda a=appid, n=name, p=save_paths[0]:
-                                      self._add_from_scan(a, n, p)
-                                      ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
+                    pv = ctk.StringVar(value=save_paths[0])
+                    self._scan_choice_vars[appid] = pv
+                    ctk.CTkOptionMenu(card, variable=pv, values=save_paths,
+                                      width=240, font=font(11)).grid(
+                        row=0, column=1, padx=6, pady=4, sticky="e")
+                    ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
+                                  font=font(12), corner_radius=6,
+                                  fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                                  command=lambda a=appid, n=name, v=pv:
+                                  self._add_from_scan(a, n, v.get())
+                                  ).grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
                 else:
                     ctk.CTkLabel(card, text=self.bi("✔ 已添加", "✔ Added"), font=font(11),
                                  text_color=BTN_SUCCESS).grid(
@@ -4163,6 +4207,7 @@ class SteamSaveManager(ctk.CTk):
     def _do_scan(self):
         if self._scan_in_progress:
             return
+        _SAVE_DETECTION_CACHE.clear()
         self._scan_results = []
         self._scan_lib_folders = []
         self._scan_choice_vars = {}
