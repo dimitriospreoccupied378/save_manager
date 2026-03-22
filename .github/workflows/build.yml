@@ -1,29 +1,20 @@
-name: Build Steam Save Manager
+name: Build and Release Windows EXE
 
 on:
   push:
     branches:
       - main
+      - master
     paths:
       - main.py
       - steam_save_manager.py
       - SteamSaveManager.spec
-      - README.md
-      - README_EN.md
-      - LICENSE
-      - .github/workflows/build.yml
-    tags:
-      - "v*"
-  pull_request:
-    paths:
-      - main.py
-      - steam_save_manager.py
-      - SteamSaveManager.spec
-      - README.md
-      - README_EN.md
-      - LICENSE
-      - .github/workflows/build.yml
+      - requirements.txt
   workflow_dispatch:
+
+concurrency:
+  group: build-release
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -33,28 +24,17 @@ env:
   PYTHON_VERSION: "3.11"
 
 jobs:
-  build-windows:
+  build:
+    name: Package Windows Executable
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
+      - name: 1. Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install customtkinter pillow psutil watchdog pystray pyinstaller
-
-      - name: Resolve build target
+      - name: 2. Resolve build target
         id: target
         shell: pwsh
         run: |
@@ -79,19 +59,77 @@ jobs:
           "entry=$entry" >> $env:GITHUB_OUTPUT
           "use_spec=$($useSpec.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
-      - name: Verify source compiles
+      - name: 3. Extract version and create tag
+        id: version
+        shell: pwsh
+        run: |
+          $entry = "${{ steps.target.outputs.entry }}"
+          $content = Get-Content $entry -Raw
+          $match = [regex]::Match($content, '(?m)^\s*(?:CURRENT_VERSION|VERSION)\s*=\s*"([^"]+)"')
+          if (-not $match.Success) {
+            throw "Failed to extract CURRENT_VERSION or VERSION from $entry"
+          }
+
+          $version = $match.Groups[1].Value
+          $releaseTag = "v$version"
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+          Write-Host "Detected version: $releaseTag"
+
+          git fetch --tags
+          git rev-parse $releaseTag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Tag $releaseTag already exists. Skipping build."
+            "skip_build=true" >> $env:GITHUB_OUTPUT
+          } else {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a $releaseTag -m "Release $releaseTag"
+            git push origin $releaseTag
+            Write-Host "Created and pushed tag: $releaseTag"
+            "skip_build=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 4. Set up Python
+        if: steps.version.outputs.skip_build != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: 5. Install dependencies
+        if: steps.version.outputs.skip_build != 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          } else {
+            pip install customtkinter pillow psutil watchdog pystray pyinstaller
+          }
+
+      - name: 6. Install UPX
+        if: steps.version.outputs.skip_build != 'true'
+        shell: pwsh
+        run: choco install upx -y
+
+      - name: 7. Verify source compiles
+        if: steps.version.outputs.skip_build != 'true'
         shell: pwsh
         run: python -m py_compile "${{ steps.target.outputs.entry }}"
 
-      - name: Clean old build output
+      - name: 8. Clean old build output
+        if: steps.version.outputs.skip_build != 'true'
         shell: pwsh
         run: |
           if (Test-Path build) { Remove-Item build -Recurse -Force }
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           if (Test-Path release) { Remove-Item release -Recurse -Force }
 
-      - name: Build executable with PyInstaller
+      - name: 9. Build executable
+        if: steps.version.outputs.skip_build != 'true'
         shell: pwsh
+        env:
+          PYTHONIOENCODING: utf8
         run: |
           if ("${{ steps.target.outputs.use_spec }}" -eq "true") {
             pyinstaller --clean SteamSaveManager.spec
@@ -99,47 +137,66 @@ jobs:
             pyinstaller --clean --noconsole --onefile --name "${{ env.APP_NAME }}" "${{ steps.target.outputs.entry }}"
           }
 
-      - name: Prepare release files
+      - name: 10. Prepare release files
+        if: steps.version.outputs.skip_build != 'true'
         id: package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "dev-${{ github.run_number }}" }
+          $version = "${{ steps.version.outputs.release_tag }}".TrimStart("v")
           $zipName = "${{ env.APP_NAME }}-$version-windows-x64.zip"
           $exePath = Join-Path $PWD "dist\${{ env.APP_NAME }}.exe"
           $zipPath = Join-Path $PWD ("release\" + $zipName)
           Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
           $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
-          "version=$version" >> $env:GITHUB_OUTPUT
           "exe_path=$exePath" >> $env:GITHUB_OUTPUT
           "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
-          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
           "sha256=$hash" >> $env:GITHUB_OUTPUT
 
-      - name: Upload build artifact
+      - name: 11. Extract latest commit notes
+        if: steps.version.outputs.skip_build != 'true'
+        shell: bash
+        run: |
+          ENTRY_FILE="${{ steps.target.outputs.entry }}"
+          git log --format="%b" -1 -- "$ENTRY_FILE" | grep -v '^[[:space:]]*$' > main_release_notes.txt || true
+          if [ ! -s main_release_notes.txt ]; then
+            echo "Regular updates and improvements" > main_release_notes.txt
+          fi
+          echo "" >> main_release_notes.txt
+          echo "---" >> main_release_notes.txt
+          cat main_release_notes.txt
+
+      - name: 12. Upload workflow artifact
+        if: steps.version.outputs.skip_build != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ steps.package.outputs.version }}-windows
+          name: ${{ env.APP_NAME }}-${{ steps.version.outputs.release_tag }}-windows
           path: |
             ${{ steps.package.outputs.exe_path }}
             ${{ steps.package.outputs.zip_path }}
 
-      - name: Create GitHub release
-        if: github.ref_type == 'tag'
+      - name: 13. Create GitHub release
+        if: steps.version.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
           files: |
             ${{ steps.package.outputs.exe_path }}
             ${{ steps.package.outputs.zip_path }}
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: ${{ steps.version.outputs.release_tag }}
+          body_path: main_release_notes.txt
+          prerelease: ${{ contains(steps.version.outputs.release_tag, 'alpha') || contains(steps.version.outputs.release_tag, 'beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update remote update manifest
-        if: github.ref_type == 'tag'
+      - name: 14. Update remote update manifest
+        if: steps.version.outputs.skip_build != 'true'
         shell: pwsh
         run: |
-          $version = "${{ steps.package.outputs.version }}"
-          $exeUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.APP_NAME }}.exe"
-          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          $tag = "${{ steps.version.outputs.release_tag }}"
+          $version = $tag.TrimStart("v")
+          $exeUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/${{ env.APP_NAME }}.exe"
+          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$tag"
           $manifestDir = Join-Path $PWD "update"
           $manifestPath = Join-Path $manifestDir "update.json"
           New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
@@ -155,8 +212,8 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout main
+          git fetch origin "${{ github.ref_name }}"
+          git checkout "${{ github.ref_name }}"
           git add update/update.json
           git commit -m "chore: update manifest for $version" || exit 0
-          git push origin main
+          git push origin "${{ github.ref_name }}"
