@@ -1,0 +1,116 @@
+name: Build Steam Save Manager
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: SteamSaveManager
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install customtkinter pillow psutil watchdog pystray pyinstaller
+
+      - name: Verify source compiles
+        shell: pwsh
+        run: python -m py_compile steam_save_manager.py
+
+      - name: Clean old build output
+        shell: pwsh
+        run: |
+          if (Test-Path build) { Remove-Item build -Recurse -Force }
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          if (Test-Path release) { Remove-Item release -Recurse -Force }
+
+      - name: Build executable with PyInstaller
+        shell: pwsh
+        run: pyinstaller --clean SteamSaveManager.spec
+
+      - name: Prepare release files
+        id: package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "dev-${{ github.run_number }}" }
+          $zipName = "${{ env.APP_NAME }}-$version-windows-x64.zip"
+          $exePath = Join-Path $PWD "dist\${{ env.APP_NAME }}.exe"
+          $zipPath = Join-Path $PWD ("release\" + $zipName)
+          Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "exe_path=$exePath" >> $env:GITHUB_OUTPUT
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.package.outputs.version }}-windows
+          path: |
+            ${{ steps.package.outputs.exe_path }}
+            ${{ steps.package.outputs.zip_path }}
+
+      - name: Create GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.exe_path }}
+            ${{ steps.package.outputs.zip_path }}
+
+      - name: Update remote update manifest
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.package.outputs.version }}"
+          $exeUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.APP_NAME }}.exe"
+          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          $manifestDir = Join-Path $PWD "update"
+          $manifestPath = Join-Path $manifestDir "update.json"
+          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+
+          $manifest = @{
+            version = $version
+            notes = "See release notes: $releaseUrl"
+            url = $exeUrl
+            sha256 = "${{ steps.package.outputs.sha256 }}"
+          } | ConvertTo-Json -Depth 4
+
+          Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          git add update/update.json
+          git commit -m "chore: update manifest for $version" || exit 0
+          git push origin main
