@@ -3,7 +3,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path.cwd().resolve()
 
 if (ROOT / "main.py").is_file():
     ENTRY_SCRIPT = "main.py"
