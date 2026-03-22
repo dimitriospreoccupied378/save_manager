@@ -1,6 +1,6 @@
 {
-  "notes": "1.扫描页新增“全部添加”功能，可将已识别到存档路径的游戏一键加入列表\n2.优化 Steam 游戏扫描流程，支持后台多线程扫描\n3.根据磁盘类型动态调整扫描线程数，提升扫描效率并降低机械硬盘卡顿风险\n4.扫描状态现在会显示当前进度、线程数和磁盘类型\n5.优化存档路径识别逻辑，综合使用多种线索进行判断\n6.模糊搜索从原来的单层目录匹配升级为有限深度递归搜索，可识别更深层的子目录存档路径\n7.提升了对多层目录、厂商目录名与游戏名不一致场景下的识别准确率",
-  "version": "1.0.5",
-  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.0.5/SteamSaveManager.exe",
-  "sha256": "6c833a3a57014e8a167dd1dc2ab1cebd51d367d68c3ed58998b466838b4d45cf"
+  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.1.0/SteamSaveManager.exe",
+  "sha256": "36c5c63821cb08613ee13b1f4e8962aab2ad959332ef15cc56f624abc92812ed",
+  "notes": "1. Regular updates and improvements\n",
+  "version": "1.1.0"
 }
