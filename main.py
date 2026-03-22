@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.0.0 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.0.5 — 通用版"""
 
 import os
 import sys
@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import threading
+import concurrent.futures
 import datetime
 import zipfile
 import glob
@@ -67,7 +68,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.0.0"
+VERSION = "1.0.5"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -107,6 +108,7 @@ TRANSLATIONS = {
         "home_no_backups": "暂无备份记录，快去扫描游戏吧 →",
         "scan_title": "🔍 扫描 Steam 游戏库",
         "scan_start": "开始扫描",
+        "scan_add_all": "全部添加",
         "scan_hint": "点击「开始扫描」自动检测已安装的 Steam 游戏",
         "scan_missing_steam": "⚠️ 未检测到 Steam 库路径\n请在设置中配置 Steam 安装路径",
         "backup_title": "💾 备份记录",
@@ -195,6 +197,7 @@ TRANSLATIONS = {
         "home_no_backups": "No backups yet. Try scanning your games →",
         "scan_title": "🔍 Scan Steam Libraries",
         "scan_start": "Start Scan",
+        "scan_add_all": "Add All",
         "scan_hint": "Click “Start Scan” to detect installed Steam games automatically",
         "scan_missing_steam": "⚠️ No Steam library path was detected.\nPlease configure your Steam install path in Settings.",
         "backup_title": "💾 Backup History",
@@ -816,6 +819,160 @@ def scan_installed_games(steam_path: str) -> list[dict]:
     return games
 
 
+def _get_volume_root(path: str) -> str:
+    norm = os.path.abspath(path or "")
+    if not norm:
+        return ""
+    drive, _ = os.path.splitdrive(norm)
+    if drive:
+        return drive.rstrip("\\/") + "\\"
+    if norm.startswith("\\\\"):
+        parts = [p for p in norm.split("\\") if p]
+        if len(parts) >= 2:
+            return f"\\\\{parts[0]}\\{parts[1]}\\"
+    return ""
+
+
+def classify_storage_path(path: str) -> str:
+    root = _get_volume_root(path)
+    if not root:
+        return "unknown"
+    cached = _STORAGE_KIND_CACHE.get(root)
+    if cached:
+        return cached
+    if sys.platform != "win32":
+        _STORAGE_KIND_CACHE[root] = "unknown"
+        return "unknown"
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+        kernel32.GetDriveTypeW.restype = ctypes.c_uint
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.DeviceIoControl.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+        ]
+        kernel32.DeviceIoControl.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        drive_type = kernel32.GetDriveTypeW(root)
+        if drive_type == 4:
+            kind = "network"
+        elif drive_type == 2:
+            kind = "removable"
+        elif drive_type != 3:
+            kind = "unknown"
+        else:
+            class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+                _fields_ = [
+                    ("PropertyId", ctypes.c_int),
+                    ("QueryType", ctypes.c_int),
+                    ("AdditionalParameters", ctypes.c_byte * 1),
+                ]
+
+            class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+                _fields_ = [
+                    ("Version", ctypes.c_uint32),
+                    ("Size", ctypes.c_uint32),
+                    ("IncursSeekPenalty", ctypes.c_byte),
+                ]
+
+            IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+            STORAGE_DEVICE_SEEK_PENALTY_PROPERTY = 7
+            PROPERTY_STANDARD_QUERY = 0
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            FILE_SHARE_DELETE = 0x00000004
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            volume_name = root.rstrip("\\/")
+            device_path = f"\\\\.\\{volume_name}"
+            handle = kernel32.CreateFileW(
+                device_path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if handle == INVALID_HANDLE_VALUE:
+                kind = "fixed"
+            else:
+                try:
+                    query = STORAGE_PROPERTY_QUERY(
+                        PropertyId=STORAGE_DEVICE_SEEK_PENALTY_PROPERTY,
+                        QueryType=PROPERTY_STANDARD_QUERY,
+                    )
+                    desc = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+                    returned = ctypes.c_uint32()
+                    ok = kernel32.DeviceIoControl(
+                        handle,
+                        IOCTL_STORAGE_QUERY_PROPERTY,
+                        ctypes.byref(query),
+                        ctypes.sizeof(query),
+                        ctypes.byref(desc),
+                        ctypes.sizeof(desc),
+                        ctypes.byref(returned),
+                        None,
+                    )
+                    if ok:
+                        kind = "hdd" if bool(desc.IncursSeekPenalty) else "ssd"
+                    else:
+                        kind = "fixed"
+                finally:
+                    kernel32.CloseHandle(handle)
+    except Exception:
+        kind = "unknown"
+    _STORAGE_KIND_CACHE[root] = kind
+    return kind
+
+
+def recommend_scan_workers(paths: list[str], task_count: int) -> tuple[int, str]:
+    task_count = max(1, int(task_count or 1))
+    cpu = max(2, os.cpu_count() or 4)
+    roots = []
+    seen = set()
+    for path in paths:
+        root = _get_volume_root(path)
+        if root and root not in seen:
+            seen.add(root)
+            roots.append(root)
+
+    kinds = [classify_storage_path(root) for root in roots] or ["unknown"]
+    if any(k == "network" for k in kinds):
+        cap = 2
+        profile = "network"
+    elif any(k == "removable" for k in kinds):
+        cap = 2
+        profile = "removable"
+    elif all(k == "ssd" for k in kinds):
+        cap = min(12, max(4, cpu))
+        profile = "ssd"
+    elif all(k in {"hdd", "fixed"} for k in kinds):
+        cap = min(4, max(2, cpu // 3))
+        profile = "hdd"
+    elif "hdd" in kinds:
+        cap = min(6, max(3, cpu // 2))
+        profile = "mixed"
+    else:
+        cap = min(8, max(3, cpu // 2))
+        profile = "mixed" if len(set(kinds)) > 1 else kinds[0]
+
+    return max(1, min(task_count, cap)), profile
+
+
 # ══════════════════════════════════════════════
 #  通用存档路径探测（核心）
 # ══════════════════════════════════════════════
@@ -831,6 +988,7 @@ COMMON_SAVE_BASES = [
     SAVED_GAMES, DOCUMENTS / "My Games"
 ]
 _STEAM_AUTOCLOUD_CACHE: Optional[list[dict]] = None
+_STORAGE_KIND_CACHE: dict[str, str] = {}
 
 
 def expand_path(template: str, install_dir: str = "") -> str:
@@ -1021,28 +1179,45 @@ def get_remotecache_entries(appid: str, steam_path: str,
 
 
 def find_save_in_directory(base: str, game_name: str) -> list[str]:
-    """在某个基目录下通过游戏名模糊搜索存档文件夹"""
-    results = []
+    """在某个基目录下递归有限深度地通过游戏名模糊搜索存档文件夹"""
+    scored: dict[str, tuple[int, int]] = {}
     if not os.path.isdir(base):
-        return results
+        return []
     name_lower = game_name.lower()
     # 提取关键词（去掉标点、分隔）
     keywords = re.findall(r'[a-zA-Z0-9\u4e00-\u9fff]+', name_lower)
-    try:
-        for entry in os.scandir(base):
-            if not entry.is_dir():
-                continue
-            entry_lower = entry.name.lower()
+    base_norm = os.path.normpath(base)
+    base_depth = base_norm.count(os.sep)
+
+    for root, dirs, _ in _walk_limited(base_norm, max_depth=4):
+        for dirname in dirs:
+            path = os.path.join(root, dirname)
+            entry_lower = dirname.lower()
+            depth = os.path.normpath(path).count(os.sep) - base_depth
+            match_score = 0
             # 全名匹配或关键词匹配
             if name_lower in entry_lower or entry_lower in name_lower:
-                results.append(entry.path)
+                match_score = 3
             elif len(keywords) >= 2 and all(kw in entry_lower for kw in keywords[:3]):
-                results.append(entry.path)
+                match_score = 2
             elif len(keywords) >= 1 and len(keywords[0]) > 4 and keywords[0] in entry_lower:
-                results.append(entry.path)
-    except PermissionError:
-        pass
-    return results
+                match_score = 1
+
+            if match_score <= 0:
+                continue
+
+            norm = os.path.normpath(path)
+            prev = scored.get(norm)
+            rank = (match_score, -depth)
+            if prev is None or rank > prev:
+                scored[norm] = rank
+
+    return [
+        path for path, _ in sorted(
+            scored.items(),
+            key=lambda item: (-item[1][0], -item[1][1], len(item[0]), item[0].lower())
+        )
+    ]
 
 
 def find_save_in_install_dir(install_dir: str) -> list[str]:
@@ -2666,6 +2841,14 @@ class SteamSaveManager(ctk.CTk):
         self._sidebar_version_text = f"v{VERSION}"
         self._sidebar_version_color = ("#cbd5e1", "#3f3f46")
         self._update_manifest_cache: Optional[dict] = None
+        self._scan_results: list[dict] = []
+        self._scan_lib_folders: list[str] = []
+        self._scan_choice_vars: dict[str, ctk.StringVar] = {}
+        self._scan_in_progress = False
+        self._scan_worker_count = 0
+        self._scan_storage_profile = "unknown"
+        self._scan_start_btn = None
+        self._scan_add_all_btn = None
 
         self.title(self.t("product_title"))
         self.geometry("1080x720")
@@ -3049,10 +3232,18 @@ class SteamSaveManager(ctk.CTk):
         hdr.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(hdr, text=self.t("scan_title"),
                      font=font(20, "bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(hdr, text=self.t("scan_start"), width=120, height=38,
-                      font=font(13, "bold"), corner_radius=10,
-                      fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-                      command=self._do_scan).grid(row=0, column=1, sticky="e")
+        self._scan_add_all_btn = ctk.CTkButton(
+            hdr, text=self.t("scan_add_all"), width=120, height=38,
+            font=font(13, "bold"), corner_radius=10,
+            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+            state="disabled", command=self._add_all_from_scan)
+        self._scan_add_all_btn.grid(row=0, column=1, padx=(0, 10), sticky="e")
+        self._scan_start_btn = ctk.CTkButton(
+            hdr, text=self.t("scan_start"), width=120, height=38,
+            font=font(13, "bold"), corner_radius=10,
+            fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
+            command=self._do_scan)
+        self._scan_start_btn.grid(row=0, column=2, sticky="e")
 
         self._scan_status = ctk.CTkLabel(
             frame, text=self.t("scan_hint"),
@@ -3064,38 +3255,54 @@ class SteamSaveManager(ctk.CTk):
         self._scan_scroll.grid(row=2, column=0, padx=30, pady=10, sticky="nsew")
         frame.grid_rowconfigure(2, weight=1)
 
-    def _do_scan(self):
-        steam_path = self.cfg.get("steam_path", "")
-        self._scan_status.configure(text=self.bi("扫描中...", "Scanning...")); self.update()
-        for w in self._scan_scroll.winfo_children(): w.destroy()
+    def _scan_profile_label(self, profile: str) -> str:
+        labels = {
+            "ssd": self.bi("SSD", "SSD"),
+            "hdd": self.bi("机械硬盘", "HDD"),
+            "mixed": self.bi("混合磁盘", "Mixed"),
+            "network": self.bi("网络磁盘", "Network"),
+            "removable": self.bi("可移动磁盘", "Removable"),
+            "fixed": self.bi("固定磁盘", "Fixed"),
+            "unknown": self.bi("未知磁盘", "Unknown"),
+        }
+        return labels.get(profile, labels["unknown"])
 
-        lib_folders = get_steam_library_folders(steam_path)
-        if lib_folders:
+    def _set_scan_busy(self, busy: bool):
+        self._scan_in_progress = busy
+        if self._scan_start_btn is not None:
+            self._scan_start_btn.configure(state="disabled" if busy else "normal")
+        if self._scan_add_all_btn is not None:
+            can_add = bool(
+                not busy and any(r.get("save_paths") for r in self._scan_results)
+                and any(
+                    r.get("appid") not in {g.get("appid") for g in self.cfg.get("games", [])}
+                    for r in self._scan_results if r.get("save_paths")
+                )
+            )
+            self._scan_add_all_btn.configure(state="normal" if can_add else "disabled")
+
+    def _render_scan_results(self):
+        for w in self._scan_scroll.winfo_children():
+            w.destroy()
+
+        self._scan_choice_vars = {}
+        if self._scan_lib_folders:
             ic = ctk.CTkFrame(self._scan_scroll, fg_color=("#eef2ff", "#1e1b4b"),
                               corner_radius=10)
             ic.pack(fill="x", padx=4, pady=(0, 8))
             txt = self.bi("检测到的 Steam 库路径：\n", "Detected Steam library paths:\n") + "\n".join(
-                f"  📂 {p}" for p in lib_folders)
+                f"  📂 {p}" for p in self._scan_lib_folders)
             ctk.CTkLabel(ic, text=txt, font=font(11),
                          justify="left", text_color=C_BODY_TEXT).pack(
                 padx=14, pady=10, anchor="w")
-        else:
-            ic = ctk.CTkFrame(self._scan_scroll, fg_color=("#fef2f2", "#450a0a"),
-                              corner_radius=10)
-            ic.pack(fill="x", padx=4, pady=(0, 8))
-            ctk.CTkLabel(ic,
-                text=self.t("scan_missing_steam"),
-                font=font(12), text_color=("#dc2626", "#fca5a5"),
-                justify="left").pack(padx=14, pady=10, anchor="w")
-            self._scan_status.configure(text=self.bi("扫描失败：未找到 Steam 库路径", "Scan failed: no Steam library path was found"))
-            return
 
-        installed = scan_installed_games(steam_path)
         already_added = {g.get("appid") for g in self.cfg.get("games", [])}
         found = 0
-        for game in installed:
-            appid, name, install_dir = game["appid"], game["name"], game["install_dir"]
-            save_paths = detect_save_paths(appid, name, install_dir, steam_path)
+        addable = 0
+        for game in self._scan_results:
+            appid = game["appid"]
+            name = game["name"]
+            save_paths = game.get("save_paths", [])
 
             card = ctk.CTkFrame(self._scan_scroll,
                                 fg_color=("#f1f5f9", "#252640"), corner_radius=10)
@@ -3110,7 +3317,8 @@ class SteamSaveManager(ctk.CTk):
             if save_paths:
                 found += 1
                 pd = save_paths[0]
-                if len(pd) > 60: pd = "..." + pd[-57:]
+                if len(pd) > 60:
+                    pd = "..." + pd[-57:]
                 extra = (
                     self.bi(f"  (+{len(save_paths)-1} 个候选)", f"  (+{len(save_paths)-1} candidates)")
                     if len(save_paths) > 1 else ""
@@ -3119,24 +3327,26 @@ class SteamSaveManager(ctk.CTk):
                              text_color=C_SUBTLE_TEXT).grid(
                     row=1, column=0, padx=14, pady=(0, 10), sticky="w")
                 if appid not in already_added:
+                    addable += 1
                     if len(save_paths) > 1:
                         pv = ctk.StringVar(value=save_paths[0])
+                        self._scan_choice_vars[appid] = pv
                         ctk.CTkOptionMenu(card, variable=pv, values=save_paths,
-                            width=240, font=font(11)).grid(
+                                          width=240, font=font(11)).grid(
                             row=0, column=1, padx=6, pady=4, sticky="e")
                         ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
-                            font=font(12), corner_radius=6,
-                            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                            command=lambda a=appid, n=name, v=pv:
-                                self._add_from_scan(a, n, v.get())
-                        ).grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
+                                      font=font(12), corner_radius=6,
+                                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                                      command=lambda a=appid, n=name, v=pv:
+                                      self._add_from_scan(a, n, v.get())
+                                      ).grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
                     else:
                         ctk.CTkButton(card, text=self.bi("添加", "Add"), width=64, height=28,
-                            font=font(12), corner_radius=6,
-                            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                            command=lambda a=appid, n=name, p=save_paths[0]:
-                                self._add_from_scan(a, n, p)
-                        ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
+                                      font=font(12), corner_radius=6,
+                                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                                      command=lambda a=appid, n=name, p=save_paths[0]:
+                                      self._add_from_scan(a, n, p)
+                                      ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
                 else:
                     ctk.CTkLabel(card, text=self.bi("✔ 已添加", "✔ Added"), font=font(11),
                                  text_color=BTN_SUCCESS).grid(
@@ -3146,30 +3356,170 @@ class SteamSaveManager(ctk.CTk):
                              text_color=("#ea580c", "#fb923c")).grid(
                     row=1, column=0, padx=14, pady=(0, 10), sticky="w")
                 ctk.CTkButton(card, text=self.bi("手动选择", "Choose Manually"), width=80, height=28,
-                    font=font(12), corner_radius=6,
-                    fg_color=BTN_WARN, hover_color=BTN_WARN_H,
-                    command=lambda a=appid, n=name:
-                        self._manual_add_from_scan(a, n)
-                ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
+                              font=font(12), corner_radius=6,
+                              fg_color=BTN_WARN, hover_color=BTN_WARN_H,
+                              command=lambda a=appid, n=name:
+                              self._manual_add_from_scan(a, n)
+                              ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
 
-        self._scan_status.configure(
-            text=self.bi(
-                f"扫描完成：发现 {len(installed)} 款已安装游戏，其中 {found} 款检测到存档路径",
-                f"Scan complete: found {len(installed)} installed games, and detected save paths for {found}",
-            ))
+        if not self._scan_in_progress:
+            self._scan_status.configure(
+                text=self.bi(
+                    f"扫描完成：发现 {len(self._scan_results)} 款已安装游戏，其中 {found} 款检测到存档路径 · 使用 {self._scan_worker_count} 个线程（{self._scan_profile_label(self._scan_storage_profile)}）",
+                    f"Scan complete: found {len(self._scan_results)} installed games, detected save paths for {found}, using {self._scan_worker_count} threads ({self._scan_profile_label(self._scan_storage_profile)})",
+                ))
+        if self._scan_add_all_btn is not None:
+            self._scan_add_all_btn.configure(state="normal" if addable and not self._scan_in_progress else "disabled")
+
+    def _finish_scan_with_error(self, message: str):
+        self._scan_results = []
+        self._scan_lib_folders = []
+        self._scan_worker_count = 0
+        self._scan_storage_profile = "unknown"
+        for w in self._scan_scroll.winfo_children():
+            w.destroy()
+        ic = ctk.CTkFrame(self._scan_scroll, fg_color=("#fef2f2", "#450a0a"),
+                          corner_radius=10)
+        ic.pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkLabel(
+            ic,
+            text=self.t("scan_missing_steam"),
+            font=font(12), text_color=("#dc2626", "#fca5a5"),
+            justify="left",
+        ).pack(padx=14, pady=10, anchor="w")
+        self._scan_status.configure(text=message)
+        self._set_scan_busy(False)
+
+    def _scan_worker(self, steam_path: str):
+        lib_folders = get_steam_library_folders(steam_path)
+        if not lib_folders:
+            self.after(0, lambda: self._finish_scan_with_error(
+                self.bi("扫描失败：未找到 Steam 库路径", "Scan failed: no Steam library path was found")))
+            return
+
+        installed = scan_installed_games(steam_path)
+        discover_steam_autocloud_entries()
+        scan_paths = lib_folders + [steam_path] + [str(base) for base in COMMON_SAVE_BASES]
+        for game in installed:
+            if game.get("install_dir"):
+                scan_paths.append(game["install_dir"])
+            if game.get("library_path"):
+                scan_paths.append(game["library_path"])
+        worker_count, storage_profile = recommend_scan_workers(scan_paths, len(installed))
+
+        if not installed:
+            def _finish_empty():
+                self._scan_results = []
+                self._scan_lib_folders = lib_folders
+                self._scan_worker_count = worker_count
+                self._scan_storage_profile = storage_profile
+                self._set_scan_busy(False)
+                self._render_scan_results()
+            self.after(0, _finish_empty)
+            return
+
+        results = []
+        total = len(installed)
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(
+                    detect_save_paths,
+                    game["appid"], game["name"], game["install_dir"], steam_path
+                ): game
+                for game in installed
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                game = future_map[future]
+                try:
+                    save_paths = future.result()
+                except Exception:
+                    save_paths = []
+                results.append({**game, "save_paths": save_paths})
+                completed += 1
+                if completed == total or completed == 1 or completed % 5 == 0:
+                    self.after(
+                        0,
+                        lambda c=completed, t=total, wc=worker_count, sp=storage_profile:
+                        self._scan_status.configure(
+                            text=self.bi(
+                                f"扫描中... {c}/{t} · {wc} 线程（{self._scan_profile_label(sp)}）",
+                                f"Scanning... {c}/{t} · {wc} threads ({self._scan_profile_label(sp)})",
+                            )
+                        )
+                    )
+
+        results.sort(key=lambda g: g["name"].lower())
+
+        def _finish():
+            self._scan_results = results
+            self._scan_lib_folders = lib_folders
+            self._scan_worker_count = worker_count
+            self._scan_storage_profile = storage_profile
+            self._set_scan_busy(False)
+            self._render_scan_results()
+
+        self.after(0, _finish)
+
+    def _do_scan(self):
+        if self._scan_in_progress:
+            return
+        self._scan_results = []
+        self._scan_lib_folders = []
+        self._scan_choice_vars = {}
+        self._scan_worker_count = 0
+        self._scan_storage_profile = "unknown"
+        steam_path = self.cfg.get("steam_path", "")
+        for w in self._scan_scroll.winfo_children():
+            w.destroy()
+        self._set_scan_busy(True)
+        self._scan_status.configure(text=self.bi("扫描中...", "Scanning..."))
+        self.update_idletasks()
+        threading.Thread(target=self._scan_worker, args=(steam_path,), daemon=True).start()
 
     def _add_from_scan(self, appid, name, save_path):
         games = self.cfg.setdefault("games", [])
         if any(g.get("appid") == appid for g in games):
-            self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added")); return
+            self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
+            return
         games.append({"appid": appid, "name": name, "save_path": save_path})
         save_config(self.cfg)
+        self._refresh_games_list()
+        self._render_scan_results()
         self._show_info(self.bi("成功", "Success"), self.bi(f"已添加「{name}」", f"Added {name}"))
-        self._do_scan()
+
+    def _add_all_from_scan(self):
+        if self._scan_in_progress:
+            return
+        games = self.cfg.setdefault("games", [])
+        existing = {g.get("appid") for g in games}
+        added = 0
+        for result in self._scan_results:
+            appid = result.get("appid")
+            if not result.get("save_paths") or appid in existing:
+                continue
+            selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
+            games.append({"appid": appid, "name": result["name"], "save_path": selected})
+            existing.add(appid)
+            added += 1
+        if not added:
+            self._show_info(
+                self.bi("提示", "Notice"),
+                self.bi("当前没有可添加的已识别游戏", "There are no detected games available to add right now"),
+            )
+            return
+        save_config(self.cfg)
+        self._refresh_games_list()
+        self._render_scan_results()
+        self._show_info(
+            self.bi("成功", "Success"),
+            self.bi(f"已批量添加 {added} 款游戏", f"Added {added} games in bulk"),
+        )
 
     def _manual_add_from_scan(self, appid, name):
         d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
-        if d: self._add_from_scan(appid, name, d)
+        if d:
+            self._add_from_scan(appid, name, d)
 
     # ─── 游戏列表 ───
     def _build_games_frame(self):
