@@ -142,15 +142,9 @@ jobs:
         id: package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          $version = "${{ steps.version.outputs.release_tag }}".TrimStart("v")
-          $zipName = "${{ env.APP_NAME }}-$version-windows-x64.zip"
           $exePath = Join-Path $PWD "dist\${{ env.APP_NAME }}.exe"
-          $zipPath = Join-Path $PWD ("release\" + $zipName)
-          Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
           $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
           "exe_path=$exePath" >> $env:GITHUB_OUTPUT
-          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
           "sha256=$hash" >> $env:GITHUB_OUTPUT
 
       - name: 11. Extract latest commit notes
@@ -161,31 +155,29 @@ jobs:
           RAW_NOTES="$(git log --format="%b" -1 -- "$ENTRY_FILE" || true)"
           CLEAN_NOTES="$(printf '%s\n' "$RAW_NOTES" | sed '/^[[:space:]]*$/d')"
           if [ -z "$CLEAN_NOTES" ]; then
-            printf '1. Regular updates and improvements\n' > main_release_notes.txt
+            printf 'Regular updates and improvements\n' > release_notes.txt
+            printf '1. Regular updates and improvements\n' > update_notes.txt
           else
-            printf '%s\n' "$CLEAN_NOTES" | nl -w1 -s'. ' > main_release_notes.txt
+            printf '%s\n' "$CLEAN_NOTES" > release_notes.txt
+            printf '%s\n' "$CLEAN_NOTES" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//' | nl -w1 -s'. ' > update_notes.txt
           fi
-          cat main_release_notes.txt
+          cat release_notes.txt
 
       - name: 12. Upload workflow artifact
         if: steps.version.outputs.skip_build != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-${{ steps.version.outputs.release_tag }}-windows
-          path: |
-            ${{ steps.package.outputs.exe_path }}
-            ${{ steps.package.outputs.zip_path }}
+          path: ${{ steps.package.outputs.exe_path }}
 
       - name: 13. Create GitHub release
         if: steps.version.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ steps.package.outputs.exe_path }}
-            ${{ steps.package.outputs.zip_path }}
+          files: ${{ steps.package.outputs.exe_path }}
           tag_name: ${{ steps.version.outputs.release_tag }}
           name: ${{ steps.version.outputs.release_tag }}
-          body_path: main_release_notes.txt
+          body_path: release_notes.txt
           prerelease: ${{ contains(steps.version.outputs.release_tag, 'alpha') || contains(steps.version.outputs.release_tag, 'beta') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -200,14 +192,14 @@ jobs:
           $manifestDir = Join-Path $PWD "update"
           $manifestPath = Join-Path $manifestDir "update.json"
           New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
-          $notesPath = Join-Path $PWD "main_release_notes.txt"
+          $notesPath = Join-Path $PWD "update_notes.txt"
           $notes = if (Test-Path $notesPath) {
             Get-Content $notesPath -Raw
           } else {
-            "Regular updates and improvements"
+            "1. Regular updates and improvements"
           }
           if ([string]::IsNullOrWhiteSpace($notes)) {
-            $notes = "Regular updates and improvements"
+            $notes = "1. Regular updates and improvements"
           }
 
           $manifest = @{
