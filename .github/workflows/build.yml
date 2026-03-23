@@ -159,7 +159,19 @@ jobs:
             printf '1. Regular updates and improvements\n' > update_notes.txt
           else
             printf '%s\n' "$CLEAN_NOTES" > release_notes.txt
-            printf '%s\n' "$CLEAN_NOTES" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//' | nl -w1 -s'. ' > update_notes.txt
+            PRIMARY_BLOCK="$(printf '%s\n' "$CLEAN_NOTES" | awk '/^[[:space:]]*---[[:space:]]*$/ {exit} {print}')"
+            if printf '%s\n' "$PRIMARY_BLOCK" | grep -Eq '^[[:space:]]*[-*][[:space:]]+'; then
+              UPDATE_SOURCE="$(printf '%s\n' "$PRIMARY_BLOCK" | grep -E '^[[:space:]]*[-*][[:space:]]+')"
+            else
+              UPDATE_SOURCE="$PRIMARY_BLOCK"
+            fi
+            if [ -z "$(printf '%s' "$UPDATE_SOURCE" | tr -d '[:space:]')" ]; then
+              UPDATE_SOURCE="$PRIMARY_BLOCK"
+            fi
+            printf '%s\n' "$UPDATE_SOURCE" \
+              | sed -E '/^[[:space:]]*---[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]+//' \
+              | sed '/^[[:space:]]*$/d' \
+              | nl -w1 -s'.'' ' > update_notes.txt
           fi
           cat release_notes.txt
       - name: 12. Create GitHub release
@@ -193,6 +205,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($notes)) {
             $notes = "1. Regular updates and improvements"
           }
+          $notes = $notes.TrimEnd("`r", "`n")
 
           $manifest = @{
             version = $version
