@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.0 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.3 — 通用版"""
 
 import os
 import sys
@@ -39,6 +39,13 @@ try:
 except ImportError:
     HAS_TRAY = False
 
+try:
+    import py7zr
+    HAS_PY7ZR = True
+except ImportError:
+    py7zr = None
+    HAS_PY7ZR = False
+
 if HAS_TRAY and sys.platform == "win32":
     from pystray._util import win32 as _pystray_win32
 
@@ -69,7 +76,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.0"
+VERSION = "1.2.3"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -147,7 +154,7 @@ TRANSLATIONS = {
         "sync_mode_bidirectional": "双向同步",
         "sync_mode_upload": "仅上传",
         "sync_mode_download": "仅下载",
-        "sync_hint": "智能云存档（推荐）：检测到游戏启动时自动下载云端存档，游戏关闭后自动上传\n双向同步：基于上次同步快照判断单边改动；两边都改时弹出冲突处理，失败任务会自动重试",
+        "sync_hint": "智能云存档（推荐）：检测到游戏启动时自动下载并解压云端 7z，游戏关闭后自动打包为 7z 上传\n双向同步：基于上次同步快照判断单边改动；两边都改时弹出冲突处理，失败任务会自动重试",
         "sync_notify": "同步完成后发送 Windows 桌面通知",
         "minimize_tray": "关闭时最小化到托盘",
         "minimize_tray_desc": "关闭窗口时最小化到系统托盘后台运行",
@@ -238,7 +245,7 @@ TRANSLATIONS = {
         "sync_mode_bidirectional": "Bidirectional",
         "sync_mode_upload": "Upload Only",
         "sync_mode_download": "Download Only",
-        "sync_hint": "Smart Cloud Save (recommended): download cloud data when a game starts, then upload local saves after it closes.\nBidirectional mode uses the last sync snapshot to detect one-sided changes; if both sides changed, you'll get a conflict dialog and failed tasks will retry automatically.",
+        "sync_hint": "Smart Cloud Save (recommended): download and extract the latest cloud 7z when a game starts, then package local saves into a 7z archive after it closes.\nBidirectional mode uses the last sync snapshot to detect one-sided changes; if both sides changed, you'll get a conflict dialog and failed tasks will retry automatically.",
         "sync_notify": "Send a Windows desktop notification after sync completes",
         "minimize_tray": "Close to System Tray",
         "minimize_tray_desc": "When closing the window, keep the app running in the tray",
@@ -409,6 +416,10 @@ LOCAL_LOW = Path.home() / "AppData" / "LocalLow"
 DOCUMENTS = Path.home() / "Documents"
 SAVED_GAMES = Path.home() / "Saved Games"
 USER_HOME = Path.home()
+PROGRAMDATA = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+PUBLIC_HOME = Path(os.environ.get("PUBLIC", str(USER_HOME.parent / "Public")))
+PUBLIC_DOCUMENTS = PUBLIC_HOME / "Documents"
+LOCAL_PACKAGES = LOCAL_APPDATA / "Packages"
 
 
 # ══════════════════════════════════════════════
@@ -1130,10 +1141,22 @@ SAVE_FILE_HINTS = (
     "world", "checkpoint", "progress", "career", "campaign", "story",
     "game", "backup", "manual"
 )
+STRONG_SAVE_FILE_HINTS = ("save", "autosave", "quicksave", "slot", "profile")
+WEAK_SAVE_FILE_HINTS = tuple(h for h in SAVE_FILE_HINTS if h not in STRONG_SAVE_FILE_HINTS)
 SAVE_FILE_EXTENSIONS = {
     ".sav", ".save", ".dat", ".bin", ".json", ".xml", ".db", ".sqlite",
-    ".slot", ".profile", ".bak", ".savemeta", ".bson"
+    ".slot", ".profile", ".bak", ".savemeta", ".bson",
+    ".sav2", ".bak2", ".rpgsave",          # RPG Maker / 多版本备份
+    ".ess", ".skse",                        # Creation Engine (Skyrim/Fallout)
+    ".wld", ".plr",                         # Terraria
+    ".world", ".player", ".chunked",        # 沙盒类 / UE 打包存档
 }
+STRONG_SAVE_FILE_EXTENSIONS = {
+    ".sav", ".save", ".slot", ".profile", ".savemeta",
+    ".sav2", ".bak2", ".rpgsave", ".ess", ".skse",
+    ".wld", ".plr", ".world", ".player", ".chunked",
+}
+WEAK_SAVE_FILE_EXTENSIONS = SAVE_FILE_EXTENSIONS - STRONG_SAVE_FILE_EXTENSIONS
 NEGATIVE_FILE_HINTS = {
     "log", "logs", "cache", "shader", "screenshot", "crash", "dump",
     "telemetry", "analytics", "temp", "tmp"
@@ -1154,11 +1177,28 @@ ENGINE_SAVE_DIR_SEQUENCES = [
     ("_data", "saves"),
     ("www", "save"),
     ("data", "save"),
+    # Godot
+    ("user_data",),
+    ("app_userdata",),
+    # GameMaker
+    ("local_data",),
+    ("localdata",),
+    # CryEngine
+    ("user", "profiles"),
+    ("user", "savegames"),
 ]
 
 COMMON_SAVE_BASES = [
-    APPDATA, LOCAL_APPDATA, LOCAL_LOW, DOCUMENTS,
-    SAVED_GAMES, DOCUMENTS / "My Games"
+    APPDATA,
+    LOCAL_APPDATA,
+    LOCAL_LOW,
+    LOCAL_PACKAGES,
+    DOCUMENTS,
+    DOCUMENTS / "My Games",
+    DOCUMENTS / "Saved Games",
+    SAVED_GAMES,
+    PROGRAMDATA,
+    PUBLIC_DOCUMENTS,
 ]
 _STEAM_AUTOCLOUD_CACHE: Optional[list[dict]] = None
 _STORAGE_KIND_CACHE: dict[str, str] = {}
@@ -1345,12 +1385,62 @@ def _extract_ufs_savefiles(record_data: bytes) -> list[dict]:
 
 
 _APPINFO_ROOT_MAP = {
-    "0": "",          # game install dir
-    "1": "%DOCUMENTS%",
-    "2": "%APPDATA%",
+    "0": "[Game Install]",
+    "1": "[WinMyDocuments]",
+    "2": "[WinAppDataRoaming]",
     "3": "%USERPROFILE%",
-    "4": "%LOCALAPPDATA%",
+    "4": "[WinAppDataLocal]",
+    "5": "[WinAppDataLocalLow]",  # Unity 游戏常用
 }
+
+_STEAM_TEMPLATE_PATH_HINTS = tuple(token.lower() for token in (
+    "%userprofile%", "%appdata%", "%localappdata%", "%programdata%",
+    "%public%", "%documents%", "%mydocuments%", "%savedgames%",
+    "%saved games%", "%locallow%",
+    "[steam install]", "[steam library]", "[game install]",
+    "[winmydocuments]", "[windocuments]", "[documents]", "[my documents]",
+    "[winuserprofile]", "[userprofile]",
+    "[winappdata]", "[appdata]", "[appdataroaming]", "[winappdataroaming]",
+    "[localappdata]", "[winappdatalocal]", "[locallow]", "[winappdatalocallow]",
+    "[saved games]", "[winsavedgames]", "[programdata]", "[winprogramdata]",
+    "[public]", "[public documents]",
+    "appdata", "documents", "saved games", "programdata", "userdata",
+    "{steam3accountid}", "{64bitsteamid}",
+))
+
+
+def _get_steam_library_root(install_dir: str = "", steam_path: str = "") -> str:
+    candidates = []
+    seen = set()
+
+    norm_install = os.path.normpath(install_dir) if install_dir else ""
+    if norm_install:
+        parts = Path(norm_install).parts
+        lower_parts = [part.lower() for part in parts]
+        for idx in range(len(lower_parts) - 1):
+            if lower_parts[idx] == "steamapps" and idx + 1 < len(lower_parts) and lower_parts[idx + 1] == "common":
+                lib_root = Path(*parts[:idx])
+                lib_str = os.path.normpath(str(lib_root)) if str(lib_root) else ""
+                if lib_str and lib_str not in seen:
+                    seen.add(lib_str)
+                    candidates.append(lib_str)
+                break
+
+    steam_norm = os.path.normpath(steam_path) if steam_path else ""
+    if steam_norm:
+        defaults = [steam_norm, os.path.dirname(steam_norm)]
+        for candidate in defaults:
+            norm = os.path.normpath(candidate) if candidate else ""
+            if not norm or norm in seen:
+                continue
+            if os.path.isdir(os.path.join(norm, "steamapps")):
+                seen.add(norm)
+                candidates.append(norm)
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
 
 
 def parse_appinfo_ufs(steam_path: str, appid: str) -> list[str]:
@@ -1394,10 +1484,7 @@ def parse_appinfo_ufs(steam_path: str, appid: str) -> list[str]:
         root_prefix = _APPINFO_ROOT_MAP.get(root)
         if root_prefix is None:
             continue
-        if root == "0":
-            template = f"[Steam Install]/{clean_path}"
-        else:
-            template = f"{root_prefix}/{clean_path}"
+        template = f"{root_prefix}/{clean_path}"
 
         if template not in seen:
             seen.add(template)
@@ -1555,10 +1642,50 @@ def get_confirmed_game_path(cfg: Optional[dict], appid: str, game_name: str) -> 
         game_appid = str(game.get("appid") or "").strip()
         game_name_norm = str(game.get("name") or "").strip().lower()
         if (target_appid and game_appid == target_appid) or (not target_appid and target_name and game_name_norm == target_name):
-            save_path = str(game.get("save_path") or "").strip()
-            if save_path and os.path.exists(save_path):
-                return os.path.normpath(save_path)
+            save_paths = get_game_save_paths(game, existing_only=True)
+            if save_paths:
+                return save_paths[0]
     return ""
+
+
+def _normalize_unique_paths(paths: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for path in paths:
+        if not isinstance(path, str):
+            continue
+        clean = path.strip()
+        if not clean:
+            continue
+        norm = os.path.normpath(clean)
+        key = os.path.normcase(norm)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(norm)
+    return normalized
+
+
+def get_game_save_paths(game: Optional[dict], existing_only: bool = False) -> list[str]:
+    if not isinstance(game, dict):
+        return []
+    paths = []
+    raw_paths = game.get("save_paths", [])
+    if isinstance(raw_paths, list):
+        paths.extend(raw_paths)
+    primary = game.get("save_path", "")
+    if isinstance(primary, str) and primary.strip():
+        paths.append(primary)
+    result = _normalize_unique_paths(paths)
+    if existing_only:
+        result = [p for p in result if os.path.isdir(p)]
+    return result
+
+
+def set_game_save_paths(game: dict, paths: list[str]):
+    normalized = _normalize_unique_paths(paths)
+    game["save_paths"] = normalized
+    game["save_path"] = normalized[0] if normalized else ""
 
 
 def _steam64_from_accountid(accountid: str) -> str:
@@ -1586,11 +1713,8 @@ def _extract_steamdb_path_strings(text: str) -> list[str]:
             match = re.search(r"(?i)likely means save files are in (.+?) folder", line)
             if match:
                 line = match.group(1).strip()
-        if not any(token in line for token in (
-            "%USERPROFILE%", "%APPDATA%", "%LOCALAPPDATA%", "%DOCUMENTS%",
-            "[Steam Install]", "[Steam Library]", "AppData", "Documents",
-            "Saved Games", "userdata", "{Steam3AccountID}", "{64BitSteamID}"
-        )):
+        line_lower = line.lower()
+        if not any(token in line_lower for token in _STEAM_TEMPLATE_PATH_HINTS):
             continue
         if line not in seen:
             seen.add(line)
@@ -1655,15 +1779,41 @@ def expand_steamdb_template(template: str, appid: str,
                             install_dir: str = "", steam_path: str = "") -> list[str]:
     if not template:
         return []
+    library_root = _get_steam_library_root(install_dir, steam_path)
     values = {
         "%USERPROFILE%": str(USER_HOME),
         "%APPDATA%": str(APPDATA),
         "%LOCALAPPDATA%": str(LOCAL_APPDATA),
+        "%PROGRAMDATA%": str(PROGRAMDATA),
+        "%PUBLIC%": str(PUBLIC_HOME),
         "%DOCUMENTS%": str(DOCUMENTS),
+        "%MYDOCUMENTS%": str(DOCUMENTS),
         "%SAVEDGAMES%": str(SAVED_GAMES),
         "%SAVED GAMES%": str(SAVED_GAMES),
+        "%LOCALLOW%": str(LOCAL_LOW),
         "[Steam Install]": steam_path or "",
-        "[Steam Library]": os.path.dirname(os.path.dirname(install_dir)) if install_dir else "",
+        "[Steam Library]": library_root,
+        "[Game Install]": install_dir or "",
+        "[WinMyDocuments]": str(DOCUMENTS),
+        "[WinDocuments]": str(DOCUMENTS),
+        "[Documents]": str(DOCUMENTS),
+        "[My Documents]": str(DOCUMENTS),
+        "[WinUserProfile]": str(USER_HOME),
+        "[UserProfile]": str(USER_HOME),
+        "[WinAppData]": str(APPDATA),
+        "[AppData]": str(APPDATA),
+        "[AppDataRoaming]": str(APPDATA),
+        "[WinAppDataRoaming]": str(APPDATA),
+        "[LocalAppData]": str(LOCAL_APPDATA),
+        "[WinAppDataLocal]": str(LOCAL_APPDATA),
+        "[LocalLow]": str(LOCAL_LOW),
+        "[WinAppDataLocalLow]": str(LOCAL_LOW),
+        "[Saved Games]": str(SAVED_GAMES),
+        "[WinSavedGames]": str(SAVED_GAMES),
+        "[ProgramData]": str(PROGRAMDATA),
+        "[WinProgramData]": str(PROGRAMDATA),
+        "[Public]": str(PUBLIC_HOME),
+        "[Public Documents]": str(PUBLIC_DOCUMENTS),
         "{AppID}": str(appid or "").strip(),
         "{appid}": str(appid or "").strip(),
     }
@@ -1679,6 +1829,7 @@ def expand_steamdb_template(template: str, appid: str,
             else:
                 next_candidates.append(candidate)
         candidates = next_candidates
+    candidates = [os.path.expandvars(candidate) for candidate in candidates]
 
     account_ids = get_steam_user_ids(steam_path) if steam_path else []
     expanded = []
@@ -1829,6 +1980,10 @@ def _gather_candidate_file_signals(path: str, max_depth: int = 2,
     signals = {
         "positive_names": 0,
         "positive_exts": 0,
+        "strong_names": 0,
+        "weak_names": 0,
+        "strong_exts": 0,
+        "weak_exts": 0,
         "negative_names": 0,
         "steam_autocloud": False,
         "config_like": 0,
@@ -1843,13 +1998,21 @@ def _gather_candidate_file_signals(path: str, max_depth: int = 2,
             signals["total_files"] += 1
             if lower == "steam_autocloud.vdf":
                 signals["steam_autocloud"] = True
-            if any(hint in stem for hint in SAVE_FILE_HINTS):
+            if any(hint in stem for hint in STRONG_SAVE_FILE_HINTS):
+                signals["strong_names"] += 1
                 signals["positive_names"] += 1
-            if ext in SAVE_FILE_EXTENSIONS:
+            elif any(hint in stem for hint in WEAK_SAVE_FILE_HINTS):
+                signals["weak_names"] += 1
+                signals["positive_names"] += 1
+            if ext in STRONG_SAVE_FILE_EXTENSIONS:
+                signals["strong_exts"] += 1
+                signals["positive_exts"] += 1
+            elif ext in WEAK_SAVE_FILE_EXTENSIONS:
+                signals["weak_exts"] += 1
                 signals["positive_exts"] += 1
             if any(hint in stem for hint in NEGATIVE_FILE_HINTS):
                 signals["negative_names"] += 1
-            if ext in {".ini", ".cfg", ".config"}:
+            if ext in {".ini", ".cfg", ".config", ".yaml", ".yml", ".toml"}:
                 signals["config_like"] += 1
             if seen >= max_files:
                 return signals
@@ -1916,16 +2079,31 @@ def inspect_save_candidate(path: str, game_name: str = "",
                     break
 
     signals = _gather_candidate_file_signals(norm)
-    positive_total = min(12, signals["positive_names"]) + min(10, signals["positive_exts"])
+    strong_signal_score = min(18, signals["strong_names"] * 5 + signals["strong_exts"] * 4)
+    weak_signal_score = min(6, signals["weak_names"] * 2 + signals["weak_exts"])
+    positive_total = strong_signal_score + weak_signal_score
     score += positive_total
     if positive_total:
         reasons.append("save-files")
     if signals["negative_names"] >= max(3, signals["positive_names"] + signals["positive_exts"]):
         score -= 8
         reasons.append("noise-heavy")
-    if signals["config_like"] >= 3 and positive_total == 0:
+    if (
+        signals["config_like"] >= 3
+        and signals["strong_names"] == 0
+        and signals["strong_exts"] == 0
+        and signals["weak_names"] <= 1
+    ):
         score -= 6
         reasons.append("config-like")
+    if (
+        signals["strong_names"] == 0
+        and signals["strong_exts"] == 0
+        and signals["positive_names"] == 0
+        and signals["weak_exts"] >= 6
+    ):
+        score -= 6
+        reasons.append("generic-data-dir")
     if (
         leaf in {"save", "saves", "savedata", "savegames", "savegame"}
         and positive_total == 0
@@ -2334,6 +2512,7 @@ def detect_save_candidates(appid: str, game_name: str,
 
         if steamdb_candidates:
             merged_candidates = list(steamdb_candidates.values())
+            confirmed_entry = None
             if confirmed_path:
                 confirmed_entry = scored.get(os.path.normpath(confirmed_path))
                 if confirmed_entry and confirmed_entry["path"] not in {c["path"] for c in merged_candidates}:
@@ -2342,6 +2521,11 @@ def detect_save_candidates(appid: str, game_name: str,
                 merged_candidates,
                 key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
             )
+            if confirmed_entry:
+                all_candidates = [confirmed_entry] + [
+                    item for item in all_candidates
+                    if item["path"] != confirmed_entry["path"]
+                ]
             final_candidates = all_candidates[:6]
             _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
             return [dict(c) for c in final_candidates]
@@ -2418,6 +2602,7 @@ def ensure_dirs():
 
 def load_config() -> dict:
     ensure_dirs()
+    changed = False
     defaults = {
         "steam_path": "",
         "games": [],
@@ -2449,33 +2634,50 @@ def load_config() -> dict:
                 cfg = json.load(f)
             # 用 defaults 补齐缺失的键
             for k, v in defaults.items():
-                cfg.setdefault(k, v)
+                if k not in cfg:
+                    cfg[k] = v
+                    changed = True
         except Exception:
             cfg = defaults.copy()
     else:
         cfg = defaults.copy()
+        changed = True
+
+    games = cfg.get("games", [])
+    if isinstance(games, list):
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            old_primary = game.get("save_path", "")
+            normalized = get_game_save_paths(game, existing_only=False)
+            set_game_save_paths(game, normalized)
+            if game.get("save_path", "") != old_primary or "save_paths" not in game:
+                changed = True
+
     detected_lang = normalize_language(cfg.get("language") or detect_system_language())
     if cfg.get("language") != detected_lang:
         cfg["language"] = detected_lang
-        save_config(cfg)
+        changed = True
     # 如果 steam_path 为空或不存在，自动重新检测
     if not cfg.get("steam_path") or not os.path.isdir(cfg["steam_path"]):
         detected = detect_steam_path()
         if detected:
             cfg["steam_path"] = detected
-            save_config(cfg)  # 保存检测结果，下次不用再检测
+            changed = True
     # 如果 sync_folder 为空或不存在，自动检测云盘文件夹
     if not cfg.get("sync_folder") or not os.path.isdir(cfg.get("sync_folder", "")):
         cloud = detect_cloud_folder()
         if cloud:
             cfg["sync_folder"] = cloud
-            save_config(cfg)
+            changed = True
     # 自定义备份路径
     global BACKUP_ROOT
     custom_bp = cfg.get("backup_path", "").strip()
     if custom_bp:
         BACKUP_ROOT = Path(custom_bp)
         BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    if changed:
+        save_config(cfg)
     return cfg
 
 
@@ -2713,6 +2915,174 @@ def get_sync_game_dir(sync_folder: str, game_name: str) -> Path:
     return Path(sync_folder) / "SteamSaveSync" / sanitize(game_name)
 
 
+def get_sync_archive_root(sync_game_dir: Path) -> Path:
+    return sync_game_dir / "archives"
+
+
+def get_sync_archive_meta_path(archive_path: Path) -> Path:
+    return Path(str(archive_path) + ".meta.json")
+
+
+def _remove_tree_contents(path: Path):
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for item in path.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception:
+            pass
+
+
+def _iter_sync_payload_files(save_paths: list[str]):
+    multi = len(save_paths) > 1
+    for idx, save_path in enumerate(save_paths, start=1):
+        base = Path(save_path)
+        if not base.is_dir():
+            continue
+        prefix = Path("_paths") / f"p{idx}" if multi else Path()
+        for root, _, files in os.walk(base):
+            for file_name in files:
+                abs_f = Path(root) / file_name
+                rel = abs_f.relative_to(base)
+                arcname = prefix / rel if multi else rel
+                yield abs_f, arcname.as_posix()
+
+
+def create_sync_archive(game: dict, sync_game_dir: Path,
+                        save_paths: list[str], snapshot: dict) -> tuple[Path, Path]:
+    if not HAS_PY7ZR:
+        raise RuntimeError("py7zr is not installed")
+    now = datetime.datetime.now()
+    month_dir = get_sync_archive_root(sync_game_dir) / now.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = month_dir / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.7z"
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        for abs_f, arcname in _iter_sync_payload_files(save_paths):
+            archive.write(str(abs_f), arcname)
+    meta = {
+        "version": 1,
+        "game": game.get("name", ""),
+        "appid": str(game.get("appid", "") or "").strip(),
+        "created_at": now.isoformat(timespec="seconds"),
+        "timestamp": now.timestamp(),
+        "hash": snapshot.get("hash", ""),
+        "file_count": snapshot.get("file_count", 0),
+        "latest_mtime": snapshot.get("latest_mtime", 0.0),
+        "path_count": len(save_paths),
+        "paths": [os.path.normpath(p) for p in save_paths],
+    }
+    meta_path = get_sync_archive_meta_path(archive_path)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return archive_path, meta_path
+
+
+def get_latest_sync_archive(sync_game_dir: Path) -> Optional[dict]:
+    archive_root = get_sync_archive_root(sync_game_dir)
+    if not archive_root.is_dir():
+        return None
+    archives = sorted(
+        archive_root.rglob("*.7z"),
+        key=lambda p: (p.stat().st_mtime, p.name.lower()),
+        reverse=True,
+    )
+    for archive_path in archives:
+        meta_path = get_sync_archive_meta_path(archive_path)
+        meta = {}
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                meta = {}
+        return {
+            "kind": "archive",
+            "archive_path": archive_path,
+            "meta_path": meta_path if meta_path.exists() else None,
+            "hash": str(meta.get("hash", "") or ""),
+            "file_count": int(meta.get("file_count", 0) or 0),
+            "latest_mtime": float(meta.get("latest_mtime", 0.0) or 0.0),
+            "timestamp": float(meta.get("timestamp", archive_path.stat().st_mtime)),
+            "path_count": int(meta.get("path_count", 1) or 1),
+            "paths": meta.get("paths", []),
+        }
+    return None
+
+
+def get_legacy_sync_snapshot(sync_game_dir: Path, path_count: int) -> Optional[dict]:
+    if path_count <= 1:
+        targets = [str(sync_game_dir)]
+    else:
+        targets = [str(sync_game_dir / f"path_{idx}") for idx in range(1, path_count + 1)]
+    snapshot = snapshot_sync_paths(targets, str(sync_game_dir))
+    if not snapshot.get("file_count"):
+        return None
+    return {
+        "kind": "legacy",
+        "path": str(sync_game_dir),
+        "hash": snapshot.get("hash", ""),
+        "file_count": snapshot.get("file_count", 0),
+        "latest_mtime": snapshot.get("latest_mtime", 0.0),
+        "timestamp": snapshot.get("latest_mtime", 0.0),
+        "path_count": path_count,
+    }
+
+
+def get_remote_sync_payload(sync_game_dir: Path, path_count: int) -> Optional[dict]:
+    archive_info = get_latest_sync_archive(sync_game_dir)
+    if archive_info:
+        return archive_info
+    return get_legacy_sync_snapshot(sync_game_dir, path_count)
+
+
+def extract_sync_archive(archive_path: Path, target_paths: list[str]):
+    if not HAS_PY7ZR:
+        raise RuntimeError("py7zr is not installed")
+    targets = _normalize_unique_paths(target_paths)
+    if not targets:
+        return
+    temp_parent = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / ".sync_extract_tmp"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    temp_root = temp_parent / f"steam_sync_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with py7zr.SevenZipFile(archive_path, "r") as archive:
+            archive.extractall(path=temp_root)
+        multi_root = temp_root / "_paths"
+        if multi_root.is_dir():
+            for idx, target_path in enumerate(targets, start=1):
+                source_dir = multi_root / f"p{idx}"
+                if not source_dir.exists():
+                    continue
+                target_dir = Path(target_path)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                _remove_tree_contents(target_dir)
+                for item in source_dir.iterdir():
+                    dest = target_dir / item.name
+                    if item.is_dir():
+                        shutil.copytree(item, dest, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, dest)
+            return
+        target_dir = Path(targets[0])
+        target_dir.mkdir(parents=True, exist_ok=True)
+        _remove_tree_contents(target_dir)
+        for item in temp_root.iterdir():
+            if item.name == "_paths":
+                continue
+            dest = target_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def compute_dir_hash(directory: str) -> str:
     """
     递归计算目录内所有文件的内容 MD5 校验和。
@@ -2782,6 +3152,48 @@ def snapshot_sync_side(directory: str) -> dict:
     }
 
 
+def combine_sync_hash(parts: list[tuple[str, str]]) -> str:
+    """
+    组合多个目录 hash，得到稳定总 hash。
+    parts: [(key, hash), ...]
+    """
+    if not parts:
+        return ""
+    h = hashlib.md5()
+    for key, value in sorted(parts, key=lambda item: item[0].lower()):
+        h.update(key.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update((value or "").encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def snapshot_sync_paths(paths: list[str], label: str) -> dict:
+    """采集多个目录的同步摘要。"""
+    existing = [os.path.normpath(p) for p in paths if os.path.isdir(p)]
+    if not existing:
+        return {
+            "path": label,
+            "file_count": 0,
+            "hash": "",
+            "latest_mtime": 0.0,
+        }
+    hash_parts = []
+    total_files = 0
+    latest_mtime = 0.0
+    for idx, path in enumerate(existing, start=1):
+        file_count = compute_dir_file_count(path)
+        total_files += file_count
+        latest_mtime = max(latest_mtime, compute_dir_latest_mtime(path))
+        hash_parts.append((f"{idx}:{path}", compute_dir_hash(path) if file_count else ""))
+    return {
+        "path": label,
+        "file_count": total_files,
+        "hash": combine_sync_hash(hash_parts),
+        "latest_mtime": latest_mtime,
+    }
+
+
 def format_sync_time(timestamp: float) -> str:
     if not timestamp:
         return "—"
@@ -2792,8 +3204,11 @@ def get_game_sync_key(game: dict) -> str:
     """为游戏生成稳定的同步状态键。"""
     appid = str(game.get("appid", "")).strip() or "-"
     name = sanitize(game.get("name", "")).lower() or "-"
-    save_path = os.path.normcase(os.path.normpath(game.get("save_path", "") or ""))
-    return f"appid:{appid}|name:{name}|path:{save_path}"
+    paths = get_game_save_paths(game, existing_only=False)
+    if not paths:
+        paths = [str(game.get("save_path", "") or "")]
+    path_sig = "|".join(os.path.normcase(os.path.normpath(p)) for p in paths if p)
+    return f"appid:{appid}|name:{name}|paths:{path_sig}"
 
 
 def get_game_sync_state(cfg: Optional[dict], game: dict) -> dict:
@@ -3006,11 +3421,14 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     lang = cfg_language(cfg)
     sync_tag = bilingual_text(lang, "自动同步成功", "Auto sync completed") if auto else bilingual_text(lang, "同步成功", "Sync completed")
     pre_sync_backup_tag = bilingual_text(lang, "同步前自动备份", "Auto backup before sync")
-    # smart 模式在手动触发时等同 bidirectional
     if mode == "smart":
         mode = "bidirectional"
-    save_path = game.get("save_path", "")
-    if not save_path or not os.path.isdir(save_path):
+
+    configured_paths = get_game_save_paths(game, existing_only=False)
+    if not configured_paths:
+        fallback = str(game.get("save_path", "") or "").strip()
+        configured_paths = [os.path.normpath(fallback)] if fallback else []
+    if not configured_paths:
         return bilingual_text(lang, "跳过：存档路径不存在", "Skipped: save path does not exist")
     if not sync_folder or not os.path.isdir(sync_folder):
         return bilingual_text(lang, "跳过：同步文件夹不存在", "Skipped: sync folder does not exist")
@@ -3018,53 +3436,98 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     dest_dir = get_sync_game_dir(sync_folder, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    local_count = compute_dir_file_count(save_path)
-    remote_count = compute_dir_file_count(str(dest_dir))
-    local_hash = compute_dir_hash(save_path) if local_count else ""
-    remote_hash = compute_dir_hash(str(dest_dir)) if remote_count else ""
+    local_hash_parts = []
+    local_count = 0
+    for idx, local_path in enumerate(configured_paths, start=1):
+        local_files = compute_dir_file_count(local_path) if os.path.isdir(local_path) else 0
+        local_count += local_files
+        local_hash_parts.append((f"{idx}:{local_path}", compute_dir_hash(local_path) if local_files else ""))
+
+    local_hash = combine_sync_hash(local_hash_parts) if local_count else ""
     state = get_game_sync_state(cfg, game)
     base_local = state.get("local_hash", "")
     base_remote = state.get("remote_hash", "")
-    local_info = snapshot_sync_side(save_path)
-    remote_info = snapshot_sync_side(str(dest_dir))
+    local_label = configured_paths[0] if len(configured_paths) == 1 else bilingual_text(lang, f"{len(configured_paths)} 个本地目录", f"{len(configured_paths)} local folders")
+    local_info = snapshot_sync_paths(configured_paths, local_label)
+    remote_payload = get_remote_sync_payload(dest_dir, len(configured_paths))
+    remote_hash = remote_payload.get("hash", "") if remote_payload else ""
+    remote_count = int(remote_payload.get("file_count", 0) or 0) if remote_payload else 0
+    if remote_payload:
+        if remote_payload.get("kind") == "archive":
+            remote_label = str(remote_payload.get("archive_path", dest_dir))
+        else:
+            remote_label = str(dest_dir)
+        remote_info = {
+            "path": remote_label,
+            "file_count": remote_count,
+            "hash": remote_hash,
+            "latest_mtime": float(remote_payload.get("latest_mtime", remote_payload.get("timestamp", 0.0)) or 0.0),
+        }
+    else:
+        remote_label = str(dest_dir)
+        remote_info = {
+            "path": remote_label,
+            "file_count": 0,
+            "hash": "",
+            "latest_mtime": 0.0,
+        }
 
     def _mirror(src: str, dst: str):
         """将 src 目录完整镜像到 dst（兼容 OneDrive/Dropbox 等云盘锁定）"""
         dst_p = Path(dst)
         dst_p.mkdir(parents=True, exist_ok=True)
-        # 1) 复制/覆盖所有源文件
-        for root, dirs, files in os.walk(src):
+        for root, _, files in os.walk(src):
             rel = os.path.relpath(root, src)
-            target_dir = dst_p / rel if rel != '.' else dst_p
+            target_dir = dst_p / rel if rel != "." else dst_p
             target_dir.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                src_file = os.path.join(root, f)
-                dst_file = target_dir / f
+            for file_name in files:
+                src_file = os.path.join(root, file_name)
+                dst_file = target_dir / file_name
                 try:
                     shutil.copy2(src_file, dst_file)
                 except PermissionError:
-                    # 云盘锁定时等待短暂重试
-                    import time
                     time.sleep(0.5)
                     try:
                         shutil.copy2(src_file, dst_file)
                     except PermissionError:
-                        pass  # 跳过仍被锁定的文件
-        # 2) 清理目标中多余的文件（源中不存在的）
+                        pass
         src_files = set()
-        for root, dirs, files in os.walk(src):
+        for root, _, files in os.walk(src):
             rel = os.path.relpath(root, src)
-            for f in files:
-                src_files.add(os.path.normpath(os.path.join(rel, f)))
-        for root, dirs, files in os.walk(str(dst_p)):
+            for file_name in files:
+                src_files.add(os.path.normpath(os.path.join(rel, file_name)))
+        for root, _, files in os.walk(str(dst_p)):
             rel = os.path.relpath(root, str(dst_p))
-            for f in files:
-                rel_path = os.path.normpath(os.path.join(rel, f))
+            for file_name in files:
+                rel_path = os.path.normpath(os.path.join(rel, file_name))
                 if rel_path not in src_files:
                     try:
-                        os.remove(os.path.join(root, f))
+                        os.remove(os.path.join(root, file_name))
                     except (PermissionError, OSError):
-                        pass  # 被锁定的旧文件跳过
+                        pass
+
+    def _create_remote_archive():
+        archive_path, _ = create_sync_archive(game, dest_dir, configured_paths, local_info)
+        return archive_path
+
+    def _download_remote_payload():
+        current_remote = get_remote_sync_payload(dest_dir, len(configured_paths))
+        if not current_remote:
+            return
+        if current_remote.get("kind") == "archive":
+            extract_sync_archive(Path(current_remote["archive_path"]), configured_paths)
+            return
+        if len(configured_paths) == 1:
+            legacy_pairs = [(configured_paths[0], str(dest_dir))]
+        else:
+            legacy_pairs = [
+                (local_path, str(dest_dir / f"path_{idx}"))
+                for idx, local_path in enumerate(configured_paths, start=1)
+            ]
+        for local_path, remote_path in legacy_pairs:
+            if os.path.isdir(remote_path):
+                Path(local_path).mkdir(parents=True, exist_ok=True)
+                _mirror(remote_path, local_path)
 
     def _record_synced(hash_value: str, action: str):
         set_game_sync_state(cfg, game, hash_value, hash_value, action)
@@ -3079,73 +3542,72 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         if local_count == 0:
             return bilingual_text(
                 lang,
-                f"跳过：本地存档为空（路径：{save_path}）",
-                f"Skipped: local save folder is empty ({save_path})",
+                "跳过：本地存档为空",
+                "Skipped: local save folders are empty",
             )
         if local_hash == remote_hash:
             _record_current()
             return bilingual_text(lang, "跳过：本地与同步文件夹已一致", "Skipped: local and sync folders are already identical")
-        _mirror(save_path, str(dest_dir))
+        _create_remote_archive()
         create_backup(game, sync_tag)
         _record_synced(local_hash, "upload")
         return bilingual_text(
             lang,
-            f"↑ 已上传（本地 → 同步文件夹），共 {local_count} 个文件",
-            f"↑ Uploaded (local → sync folder), {local_count} files",
+            f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
+            f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
         )
-    elif mode == "download":
+    if mode == "download":
         if remote_count == 0:
             return bilingual_text(lang, "跳过：同步文件夹中无存档", "Skipped: no save files were found in the sync folder")
         if local_hash == remote_hash:
             _record_current()
             return bilingual_text(lang, "跳过：本地与同步文件夹已一致", "Skipped: local and sync folders are already identical")
         create_backup(game, pre_sync_backup_tag)
-        _mirror(str(dest_dir), save_path)
+        _download_remote_payload()
         create_backup(game, sync_tag)
         _record_synced(remote_hash, "download")
-        return bilingual_text(lang, "↓ 已下载（同步文件夹 → 本地）", "↓ Downloaded (sync folder → local)")
-    elif mode == "bidirectional":
+        return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
+    if mode == "bidirectional":
         if local_count == 0 and remote_count == 0:
             _record_current()
             return bilingual_text(lang, "跳过：两端存档均为空", "Skipped: both sides are empty")
         if local_count == 0:
             create_backup(game, pre_sync_backup_tag)
-            _mirror(str(dest_dir), save_path)
+            _download_remote_payload()
             create_backup(game, sync_tag)
             _record_synced(remote_hash, "download")
-            return bilingual_text(lang, "↓ 已下载（同步文件夹 → 本地）", "↓ Downloaded (sync folder → local)")
+            return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
         if remote_count == 0:
-            _mirror(save_path, str(dest_dir))
+            _create_remote_archive()
             create_backup(game, sync_tag)
             _record_synced(local_hash, "upload")
             return bilingual_text(
                 lang,
-                f"↑ 已上传（本地 → 同步文件夹），共 {local_count} 个文件",
-                f"↑ Uploaded (local → sync folder), {local_count} files",
+                f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
+                f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
             )
         if local_hash == remote_hash:
             _record_current()
             return bilingual_text(lang, "跳过：两端存档已一致", "Skipped: both sides are already identical")
 
-        # 有已知基线时，优先按单边变更决定方向；双边都改则提示冲突。
         if state:
             local_changed = local_hash != base_local
             remote_changed = remote_hash != base_remote
             if local_changed and not remote_changed:
-                _mirror(save_path, str(dest_dir))
+                _create_remote_archive()
                 create_backup(game, sync_tag)
                 _record_synced(local_hash, "upload")
                 return bilingual_text(
                     lang,
-                    f"↑ 已上传（本地 → 同步文件夹），共 {local_count} 个文件",
-                    f"↑ Uploaded (local → sync folder), {local_count} files",
+                    f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
+                    f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
                 )
             if remote_changed and not local_changed:
                 create_backup(game, pre_sync_backup_tag)
-                _mirror(str(dest_dir), save_path)
+                _download_remote_payload()
                 create_backup(game, sync_tag)
                 _record_synced(remote_hash, "download")
-                return bilingual_text(lang, "↓ 已下载（同步文件夹 → 本地）", "↓ Downloaded (sync folder → local)")
+                return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
             if local_changed and remote_changed:
                 if local_hash == remote_hash:
                     _record_current()
@@ -3160,7 +3622,6 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                     "Conflict: both the local and sync copies changed. Please choose Upload Only or Download Only first.",
                 )
 
-        # 首次建立基线时，不盲目覆盖两端不同的存档。
         mark_game_sync_conflict(
             cfg, game,
             bilingual_text(lang, "首次同步检测到两端内容不同", "The first sync found different content on both sides"),
@@ -3209,22 +3670,30 @@ def fmt_size(size: int) -> str:
 
 
 def create_backup(game: dict, note: str = "") -> Optional[str]:
-    save_path = Path(game["save_path"])
-    if not save_path.exists():
+    save_paths = get_game_save_paths(game, existing_only=True)
+    if not save_paths:
         return None
     game_dir = BACKUP_ROOT / sanitize(game["name"])
     game_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = game_dir / f"{ts}.zip"
+    is_multi = len(save_paths) > 1
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(save_path):
-            for file in files:
-                abs_f = Path(root) / file
-                zf.write(abs_f, abs_f.relative_to(save_path))
+        for idx, save_path in enumerate(save_paths, start=1):
+            base = Path(save_path)
+            arc_prefix = Path("__multi__") / f"p{idx}" if is_multi else Path()
+            for root, _, files in os.walk(base):
+                for file in files:
+                    abs_f = Path(root) / file
+                    rel = abs_f.relative_to(base)
+                    arcname = arc_prefix / rel if is_multi else rel
+                    zf.write(abs_f, arcname)
     meta = {
         "game": game["name"], "appid": game.get("appid", ""),
         "timestamp": ts, "note": note,
-        "source": str(save_path), "size": zip_path.stat().st_size,
+        "source": str(save_paths[0]), "sources": save_paths,
+        "multi_path": is_multi,
+        "size": zip_path.stat().st_size,
     }
     with open(zip_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -3312,17 +3781,44 @@ def migrate_backups(old_root: Path, new_root: Path) -> int:
     return moved
 
 
-def restore_backup(zip_path: str, target_dir: str):
-    target = Path(target_dir)
-    if target.exists():
-        safety = target.parent / (
-            target.name + "_pre_restore_" +
-            datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        shutil.copytree(target, safety)
-    else:
-        target.mkdir(parents=True, exist_ok=True)
+def restore_backup(zip_path: str, target_dir):
+    targets = target_dir if isinstance(target_dir, list) else [target_dir]
+    target_paths = _normalize_unique_paths([str(t) for t in targets if t])
+    if not target_paths:
+        return
+
+    for item in target_paths:
+        target = Path(item)
+        if target.exists():
+            safety = target.parent / (
+                target.name + "_pre_restore_" +
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+            shutil.copytree(target, safety)
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(target)
+        names = [n for n in zf.namelist() if n and not n.endswith("/")]
+        is_multi = any(n.startswith("__multi__/p") for n in names)
+        if not is_multi:
+            zf.extractall(Path(target_paths[0]))
+            return
+
+        for member in names:
+            match = re.match(r"^__multi__/p(\d+)/(.*)$", member)
+            if not match:
+                continue
+            idx = int(match.group(1)) - 1
+            rel = match.group(2)
+            if not rel:
+                continue
+            if idx < 0:
+                continue
+            target_idx = idx if idx < len(target_paths) else 0
+            dest = Path(target_paths[target_idx]) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
 
 
 def get_backups(game_name: str) -> list:
@@ -3402,15 +3898,18 @@ class GameProcessMonitor:
         等待游戏退出后存档目录稳定，避免游戏延迟落盘导致过早上传。
         返回实际等待秒数。
         """
-        save_path = game.get("save_path", "")
-        if not save_path or not os.path.isdir(save_path):
+        save_paths = get_game_save_paths(game, existing_only=True)
+        if not save_paths:
             return 0.0
 
         def _sig():
-            return (
-                compute_dir_file_count(save_path),
-                compute_dir_hash(save_path),
-            )
+            hash_parts = []
+            file_count = 0
+            for idx, save_path in enumerate(save_paths, start=1):
+                count = compute_dir_file_count(save_path)
+                file_count += count
+                hash_parts.append((f"{idx}:{save_path}", compute_dir_hash(save_path) if count else ""))
+            return (file_count, combine_sync_hash(hash_parts))
 
         start = time.monotonic()
         deadline = start + max(0.0, timeout)
@@ -4109,7 +4608,27 @@ class SteamSaveManager(ctk.CTk):
         except Exception:
             pass
 
+    def _prepare_dialog_parent(self):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+        except Exception:
+            pass
+        try:
+            self.lift()
+        except Exception:
+            pass
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+
     def _prepare_popup(self, window):
+        self._prepare_dialog_parent()
         try:
             window.transient(self)
         except Exception:
@@ -4119,6 +4638,7 @@ class SteamSaveManager(ctk.CTk):
         except Exception:
             pass
         self.after(0, lambda w=window: self._center_window(w))
+        self.after(120, lambda w=window: self._center_window(w) if w.winfo_exists() else None)
         return window
 
     def _create_popup(self, title: str, geometry: Optional[str] = None):
@@ -4130,29 +4650,37 @@ class SteamSaveManager(ctk.CTk):
         return window
 
     def _show_info(self, title: str, message: str):
+        self._prepare_dialog_parent()
         return messagebox.showinfo(title, message, parent=self)
 
     def _show_warning(self, title: str, message: str):
+        self._prepare_dialog_parent()
         return messagebox.showwarning(title, message, parent=self)
 
     def _show_error(self, title: str, message: str):
+        self._prepare_dialog_parent()
         return messagebox.showerror(title, message, parent=self)
 
     def _ask_yes_no(self, title: str, message: str):
+        self._prepare_dialog_parent()
         return messagebox.askyesno(title, message, parent=self)
 
     def _ask_yes_no_cancel(self, title: str, message: str):
+        self._prepare_dialog_parent()
         return messagebox.askyesnocancel(title, message, parent=self)
 
     def _ask_directory(self, **kwargs):
+        self._prepare_dialog_parent()
         kwargs.setdefault("parent", self)
         return filedialog.askdirectory(**kwargs)
 
     def _ask_open_filename(self, **kwargs):
+        self._prepare_dialog_parent()
         kwargs.setdefault("parent", self)
         return filedialog.askopenfilename(**kwargs)
 
     def _input_dialog(self, title: str, text: str) -> str:
+        self._prepare_dialog_parent()
         dialog = ctk.CTkInputDialog(text=text, title=title)
         self._prepare_popup(dialog)
         return dialog.get_input() or ""
@@ -4408,11 +4936,12 @@ class SteamSaveManager(ctk.CTk):
         if self._scan_start_btn is not None:
             self._scan_start_btn.configure(state="disabled" if busy else "normal")
         if self._scan_add_all_btn is not None:
+            filtered_results = self._get_filtered_scan_results()
             can_add = bool(
-                not busy and any(r.get("save_paths") for r in self._scan_results)
+                not busy and any(r.get("save_paths") for r in filtered_results)
                 and any(
                     r.get("appid") not in {g.get("appid") for g in self.cfg.get("games", [])}
-                    for r in self._scan_results if r.get("save_paths")
+                    for r in filtered_results if r.get("save_paths")
                 )
             )
             self._scan_add_all_btn.configure(state="normal" if can_add else "disabled")
@@ -4659,17 +5188,52 @@ class SteamSaveManager(ctk.CTk):
         self.update_idletasks()
         threading.Thread(target=self._scan_worker, args=(steam_path,), daemon=True).start()
 
+    def _collect_scan_add_paths(self, appid: str, selected_path: str) -> list[str]:
+        selected_norm = os.path.normpath(selected_path) if selected_path else ""
+        if not selected_norm:
+            return []
+        result = next((r for r in self._scan_results if r.get("appid") == appid), None)
+        if not result:
+            return [selected_norm]
+        candidates = result.get("save_candidates", [])
+        selected_candidate = next(
+            (c for c in candidates if os.path.normpath(c.get("path", "")) == selected_norm),
+            None,
+        )
+        if selected_candidate and selected_candidate.get("source") in {"steamdb", "appinfo"}:
+            same_source_paths = [
+                c.get("path", "")
+                for c in candidates
+                if c.get("source") == selected_candidate.get("source")
+            ]
+            merged = _normalize_unique_paths([selected_norm] + same_source_paths)
+            if len(merged) > 1:
+                return merged
+        return [selected_norm]
+
     def _add_from_scan(self, appid, name, save_path):
         games = self.cfg.setdefault("games", [])
         if any(g.get("appid") == appid for g in games):
             self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
             return
-        games.append({"appid": appid, "name": name, "save_path": save_path})
-        remember_recognition_path(self.cfg, appid, name, save_path)
+        save_paths = self._collect_scan_add_paths(appid, save_path)
+        game = {"appid": appid, "name": name}
+        set_game_save_paths(game, save_paths if save_paths else [save_path])
+        games.append(game)
+        remember_recognition_path(self.cfg, appid, name, game.get("save_path", ""))
         save_config(self.cfg)
         self._refresh_games_list()
         self._render_scan_results()
-        self._show_info(self.bi("成功", "Success"), self.bi(f"已添加「{name}」", f"Added {name}"))
+        if len(game.get("save_paths", [])) > 1:
+            self._show_info(
+                self.bi("成功", "Success"),
+                self.bi(
+                    f"已添加「{name}」，共 {len(game['save_paths'])} 个存档目录",
+                    f"Added {name} with {len(game['save_paths'])} save folders",
+                ),
+            )
+        else:
+            self._show_info(self.bi("成功", "Success"), self.bi(f"已添加「{name}」", f"Added {name}"))
 
     def _add_all_from_scan(self):
         if self._scan_in_progress:
@@ -4682,8 +5246,11 @@ class SteamSaveManager(ctk.CTk):
             if not result.get("save_paths") or appid in existing:
                 continue
             selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
-            games.append({"appid": appid, "name": result["name"], "save_path": selected})
-            remember_recognition_path(self.cfg, appid, result["name"], selected)
+            save_paths = self._collect_scan_add_paths(appid, selected)
+            game = {"appid": appid, "name": result["name"]}
+            set_game_save_paths(game, save_paths if save_paths else [selected])
+            games.append(game)
+            remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
             existing.add(appid)
             added += 1
         if not added:
@@ -4792,8 +5359,11 @@ class SteamSaveManager(ctk.CTk):
                          text_color=C_BODY_TEXT).grid(
                 row=0, column=0, columnspan=2, padx=14, pady=(10, 2), sticky="w")
 
-            p = g["save_path"]
+            save_paths = get_game_save_paths(g, existing_only=False)
+            p = save_paths[0] if save_paths else g.get("save_path", "")
             if len(p) > 68: p = "..." + p[-65:]
+            if len(save_paths) > 1:
+                p += self.bi(f"  (+{len(save_paths)-1} 个目录)", f"  (+{len(save_paths)-1} folders)")
             ctk.CTkLabel(card, text=f"📁 {p}", font=font(11),
                          text_color=C_SUBTLE_TEXT).grid(
                 row=1, column=0, columnspan=2, padx=14, pady=(0, 3), sticky="w")
@@ -4829,32 +5399,172 @@ class SteamSaveManager(ctk.CTk):
                     _w.bind("<Button-1>", _click)
                     _w.configure(cursor="hand2")
 
+    def _create_save_paths_editor(self, parent, initial_paths=None, width=420):
+        state = {"rows": []}
+        initial = _normalize_unique_paths(initial_paths or [])
+        if not initial:
+            initial = [""]
+
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(wrap, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr,
+            text=self.bi(
+                "可添加多个存档目录，第一项会作为主路径显示",
+                "You can add multiple save folders. The first one is treated as the primary path.",
+            ),
+            font=font(11),
+            text_color=C_SUBTLE_TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            hdr,
+            text=self.bi("+ 添加目录", "+ Add Folder"),
+            width=104,
+            height=30,
+            font=font(12),
+            corner_radius=8,
+            fg_color=BTN_PRIMARY,
+            hover_color=BTN_PRIMARY_H,
+            command=lambda: _append_row(""),
+        ).grid(row=0, column=1, sticky="e")
+
+        rows_frame = ctk.CTkFrame(wrap, fg_color="transparent")
+        rows_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        rows_frame.grid_columnconfigure(0, weight=1)
+
+        def _browse_row(row):
+            chosen = self._ask_directory(
+                title=self.bi("选择存档文件夹", "Choose a save folder")
+            )
+            if chosen:
+                row["var"].set(chosen)
+
+        def _set_primary(index: int):
+            rows = state["rows"]
+            if 0 <= index < len(rows):
+                rows.insert(0, rows.pop(index))
+                _render_rows()
+
+        def _remove_row(index: int):
+            rows = state["rows"]
+            if len(rows) == 1:
+                rows[0]["var"].set("")
+            elif 0 <= index < len(rows):
+                rows.pop(index)
+            _render_rows()
+
+        def _append_row(value: str):
+            state["rows"].append({"var": ctk.StringVar(value=value)})
+            _render_rows()
+
+        def _render_rows():
+            for child in rows_frame.winfo_children():
+                child.destroy()
+            for idx, row in enumerate(state["rows"]):
+                row_frame = ctk.CTkFrame(rows_frame, fg_color=("white", "#20223a"), corner_radius=10)
+                row_frame.grid(row=idx, column=0, sticky="ew", pady=(0, 8))
+                row_frame.grid_columnconfigure(1, weight=1)
+
+                badge_text = self.bi("主路径", "Primary") if idx == 0 else self.bi(f"路径 {idx+1}", f"Path {idx+1}")
+                badge_color = BTN_SUCCESS if idx == 0 else ("#cbd5e1", "#374151")
+                ctk.CTkLabel(
+                    row_frame,
+                    text=badge_text,
+                    width=64,
+                    font=font(11, "bold" if idx == 0 else "normal"),
+                    text_color=("white" if idx == 0 else C_BODY_TEXT),
+                    fg_color=badge_color,
+                    corner_radius=8,
+                    padx=8,
+                    pady=5,
+                ).grid(row=0, column=0, padx=(10, 8), pady=10, sticky="w")
+
+                entry = ctk.CTkEntry(
+                    row_frame,
+                    textvariable=row["var"],
+                    width=width,
+                    font=font(12),
+                    placeholder_text=self.bi("选择存档文件夹", "Choose a save folder"),
+                )
+                entry.grid(row=0, column=1, padx=(0, 8), pady=10, sticky="ew")
+
+                ctk.CTkButton(
+                    row_frame,
+                    text=self.t("browse"),
+                    width=64,
+                    height=30,
+                    font=font(12),
+                    corner_radius=8,
+                    fg_color=BTN_PRIMARY,
+                    hover_color=BTN_PRIMARY_H,
+                    command=lambda r=row: _browse_row(r),
+                ).grid(row=0, column=2, padx=(0, 8), pady=10)
+
+                ctk.CTkButton(
+                    row_frame,
+                    text=self.bi("置顶", "Primary"),
+                    width=66,
+                    height=30,
+                    font=font(11),
+                    corner_radius=8,
+                    fg_color=BTN_BLUE if idx != 0 else ("#d1fae5", "#064e3b"),
+                    hover_color=BTN_BLUE_H if idx != 0 else ("#a7f3d0", "#065f46"),
+                    text_color=("white" if idx != 0 else "#ecfdf5"),
+                    state="normal" if idx != 0 else "disabled",
+                    command=lambda i=idx: _set_primary(i),
+                ).grid(row=0, column=3, padx=(0, 8), pady=10)
+
+                ctk.CTkButton(
+                    row_frame,
+                    text=self.bi("删除", "Remove"),
+                    width=66,
+                    height=30,
+                    font=font(11),
+                    corner_radius=8,
+                    fg_color=BTN_DANGER,
+                    hover_color=BTN_DANGER_H,
+                    command=lambda i=idx: _remove_row(i),
+                ).grid(row=0, column=4, padx=(0, 10), pady=10)
+
+        def _get_paths():
+            return _normalize_unique_paths([row["var"].get() for row in state["rows"]])
+
+        state["frame"] = wrap
+        state["get_paths"] = _get_paths
+        for value in initial:
+            state["rows"].append({"var": ctk.StringVar(value=value)})
+        _render_rows()
+        return state
+
     def _add_game_dialog(self):
-        d = self._create_popup(self.bi("手动添加游戏", "Add Game Manually"), "520x310")
+        d = self._create_popup(self.bi("手动添加游戏", "Add Game Manually"), "700x500")
+        d.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(d, text=self.bi("游戏名称", "Game Name"), font=font(13)).grid(
             row=0, column=0, padx=24, pady=(20, 4), sticky="w")
-        ne = ctk.CTkEntry(d, width=440, placeholder_text=self.bi("例如：Elden Ring", "Example: Elden Ring"))
-        ne.grid(row=1, column=0, padx=24, sticky="w")
+        ne = ctk.CTkEntry(d, width=620, placeholder_text=self.bi("例如：Elden Ring", "Example: Elden Ring"))
+        ne.grid(row=1, column=0, padx=24, sticky="ew")
         ctk.CTkLabel(d, text=self.bi("AppID（可选）", "AppID (Optional)"), font=font(13)).grid(
             row=2, column=0, padx=24, pady=(12, 4), sticky="w")
         ae = ctk.CTkEntry(d, width=200, placeholder_text=self.bi("如 1245620", "For example: 1245620"))
         ae.grid(row=3, column=0, padx=24, sticky="w")
-        ctk.CTkLabel(d, text=self.bi("存档路径", "Save Path"), font=font(13)).grid(
+        ctk.CTkLabel(d, text=self.bi("存档路径", "Save Paths"), font=font(13)).grid(
             row=4, column=0, padx=24, pady=(12, 4), sticky="w")
-        pf = ctk.CTkFrame(d, fg_color="transparent")
-        pf.grid(row=5, column=0, padx=24, sticky="w")
-        pe = ctk.CTkEntry(pf, width=360, placeholder_text=self.bi("选择存档文件夹", "Choose a save folder"))
-        pe.pack(side="left")
-        ctk.CTkButton(pf, text=self.t("browse"), width=64,
-                      command=lambda: self._browse(pe)).pack(side="left", padx=6)
+        editor = self._create_save_paths_editor(d, width=420)
+        editor["frame"].grid(row=5, column=0, padx=24, sticky="ew")
         def _sv():
-            n, p = ne.get().strip(), pe.get().strip()
-            if not n or not p:
-                self._show_warning(self.bi("提示", "Notice"), self.bi("请填写名称和路径", "Please enter both the game name and save path")); return
+            n = ne.get().strip()
+            save_paths = editor["get_paths"]()
+            if not n or not save_paths:
+                self._show_warning(self.bi("提示", "Notice"), self.bi("请填写名称并至少添加一个存档目录", "Please enter a name and add at least one save folder")); return
             appid = ae.get().strip()
-            self.cfg.setdefault("games", []).append(
-                {"name": n, "save_path": p, "appid": appid})
-            remember_recognition_path(self.cfg, appid, n, p)
+            game = {"name": n, "appid": appid}
+            set_game_save_paths(game, save_paths)
+            self.cfg.setdefault("games", []).append(game)
+            remember_recognition_path(self.cfg, appid, n, game["save_path"])
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("确认添加", "Add Game"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -4862,29 +5572,29 @@ class SteamSaveManager(ctk.CTk):
 
     def _edit_game_dialog(self, idx):
         g = self.cfg["games"][idx]
-        d = self._create_popup(self.bi("编辑游戏", "Edit Game"), "520x260")
+        d = self._create_popup(self.bi("编辑游戏", "Edit Game"), "700x500")
+        d.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(d, text=self.bi("游戏名称", "Game Name"), font=font(13)).grid(
             row=0, column=0, padx=24, pady=(20, 4), sticky="w")
-        ne = ctk.CTkEntry(d, width=440); ne.insert(0, g["name"])
-        ne.grid(row=1, column=0, padx=24, sticky="w")
-        ctk.CTkLabel(d, text=self.bi("存档路径", "Save Path"), font=font(13)).grid(
+        ne = ctk.CTkEntry(d, width=620); ne.insert(0, g["name"])
+        ne.grid(row=1, column=0, padx=24, sticky="ew")
+        ctk.CTkLabel(d, text=self.bi("存档路径", "Save Paths"), font=font(13)).grid(
             row=2, column=0, padx=24, pady=(12, 4), sticky="w")
-        pf = ctk.CTkFrame(d, fg_color="transparent")
-        pf.grid(row=3, column=0, padx=24, sticky="w")
-        pe = ctk.CTkEntry(pf, width=360); pe.insert(0, g["save_path"])
-        pe.pack(side="left")
-        ctk.CTkButton(pf, text=self.t("browse"), width=64,
-                      command=lambda: self._browse(pe)).pack(side="left", padx=6)
+        editor = self._create_save_paths_editor(d, get_game_save_paths(g, existing_only=False), width=420)
+        editor["frame"].grid(row=3, column=0, padx=24, sticky="ew")
         def _sv():
             old_game = dict(self.cfg["games"][idx])
+            old_game["save_paths"] = list(get_game_save_paths(self.cfg["games"][idx], existing_only=False))
             new_name = ne.get().strip()
-            new_path = pe.get().strip()
+            new_paths = editor["get_paths"]()
+            if not new_name or not new_paths:
+                self._show_warning(self.bi("提示", "Notice"), self.bi("请填写名称并至少保留一个存档目录", "Please enter a name and keep at least one save folder")); return
             self.cfg["games"][idx]["name"] = new_name
-            self.cfg["games"][idx]["save_path"] = new_path
+            set_game_save_paths(self.cfg["games"][idx], new_paths)
             clear_game_sync_state(self.cfg, old_game)
-            if old_game.get("save_path") and old_game.get("save_path") != new_path:
+            if old_game.get("save_path") and old_game.get("save_path") != self.cfg["games"][idx].get("save_path"):
                 exclude_recognition_path(self.cfg, old_game.get("appid", ""), old_game.get("name", ""), old_game.get("save_path", ""))
-            remember_recognition_path(self.cfg, self.cfg["games"][idx].get("appid", ""), new_name, new_path)
+            remember_recognition_path(self.cfg, self.cfg["games"][idx].get("appid", ""), new_name, self.cfg["games"][idx].get("save_path", ""))
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("保存", "Save"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -4929,7 +5639,10 @@ class SteamSaveManager(ctk.CTk):
             with open(dest.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             if self._ask_yes_no(self.bi("导入成功", "Import Complete"), self.bi("已导入为备份！\n是否立即还原？", "Imported as a backup.\nRestore it now?")):
-                try: restore_backup(str(dest), g["save_path"]); self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+                try:
+                    targets = get_game_save_paths(g, existing_only=False)
+                    restore_backup(str(dest), targets if len(targets) > 1 else (targets[0] if targets else g.get("save_path", "")))
+                    self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
         else:
             folder = self._ask_directory(title=self.bi("选择存档文件夹", "Choose a save folder"))
@@ -4948,7 +5661,10 @@ class SteamSaveManager(ctk.CTk):
             with open(zp.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             if self._ask_yes_no(self.bi("导入成功", "Import Complete"), self.bi("已打包为备份！\n是否立即还原？", "Packed as a backup.\nRestore it now?")):
-                try: restore_backup(str(zp), g["save_path"]); self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+                try:
+                    targets = get_game_save_paths(g, existing_only=False)
+                    restore_backup(str(zp), targets if len(targets) > 1 else (targets[0] if targets else g.get("save_path", "")))
+                    self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
 
     # ─── 游戏详情 ───
@@ -5114,14 +5830,16 @@ class SteamSaveManager(ctk.CTk):
             text=g.get("appid", "") or self.bi("未设置", "Not set"))
         self._detail_stats["backups"].configure(text=str(len(backups)))
         self._detail_stats["size"].configure(text=fmt_size(total_size))
-        path_ok = os.path.isdir(g.get("save_path", ""))
+        save_paths = get_game_save_paths(g, existing_only=False)
+        existing_paths = [p for p in save_paths if os.path.isdir(p)]
+        path_ok = bool(existing_paths)
         file_count = 0
-        if path_ok:
+        for path in existing_paths:
             try:
-                for _, _, fs in os.walk(g["save_path"]):
+                for _, _, fs in os.walk(path):
                     file_count += len(fs)
             except Exception:
-                pass
+                continue
         self._detail_stats["files"].configure(
             text=self.bi(f"{file_count} 个", f"{file_count}") if path_ok else "—")
 
@@ -5134,7 +5852,15 @@ class SteamSaveManager(ctk.CTk):
                 text=self.bi("● 路径异常", "● Path Error"), text_color=("#dc2626", "#fca5a5"))
 
         # 路径
-        self._detail_path.configure(text=g.get("save_path", ""))
+        primary_path = save_paths[0] if save_paths else g.get("save_path", "")
+        if len(save_paths) > 1:
+            path_text = self.bi(
+                f"{primary_path}\n(+{len(save_paths) - 1} 个额外目录)",
+                f"{primary_path}\n(+{len(save_paths) - 1} additional folders)",
+            )
+        else:
+            path_text = primary_path
+        self._detail_path.configure(text=path_text)
         self._detail_open_btn.configure(
             command=lambda: self._open_save_folder(idx))
 
@@ -5246,7 +5972,8 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(f"还原 {self._fmt_ts(backup['timestamp'])} 的备份？\n当前存档将被自动备份后覆盖",
                         f"Restore the backup from {self._fmt_ts(backup['timestamp'])}?\nYour current save will be backed up automatically before being overwritten.")):
             try:
-                restore_backup(backup["path"], game["save_path"])
+                targets = get_game_save_paths(game, existing_only=False)
+                restore_backup(backup["path"], targets if len(targets) > 1 else (targets[0] if targets else game.get("save_path", "")))
                 self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
                 dialog.destroy()
                 self._show_game_detail(self._detail_idx)
@@ -5829,7 +6556,8 @@ class SteamSaveManager(ctk.CTk):
 
     def _open_save_folder(self, idx):
         g = self.cfg["games"][idx]
-        p = g.get("save_path", "")
+        save_paths = get_game_save_paths(g, existing_only=False)
+        p = save_paths[0] if save_paths else g.get("save_path", "")
         if p and os.path.isdir(p):
             if sys.platform == "win32":
                 os.startfile(p)
@@ -5852,7 +6580,8 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(f"还原此存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore this save?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
             try:
-                restore_backup(b["path"], game["save_path"])
+                targets = get_game_save_paths(game, existing_only=False)
+                restore_backup(b["path"], targets if len(targets) > 1 else (targets[0] if targets else game.get("save_path", "")))
                 self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 self._show_game_detail(self._detail_idx)
             except Exception as e:
@@ -5912,7 +6641,10 @@ class SteamSaveManager(ctk.CTk):
         all_b = []
         for g in targets:
             for b in get_backups(g["name"]):
-                b["game"] = g["name"]; b["save_path"] = g["save_path"]
+                b["game"] = g["name"]
+                save_paths = get_game_save_paths(g, existing_only=False)
+                b["save_path"] = save_paths[0] if save_paths else g.get("save_path", "")
+                b["save_paths"] = save_paths
                 all_b.append(b)
         all_b.sort(key=lambda x: x["timestamp"], reverse=True)
 
@@ -5946,7 +6678,10 @@ class SteamSaveManager(ctk.CTk):
         if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
                 self.bi(f"还原「{b['game']}」的存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore the save for {b['game']}?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
-            try: restore_backup(b["path"], b["save_path"]); self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+            try:
+                targets = b.get("save_paths", [])
+                restore_backup(b["path"], targets if len(targets) > 1 else (targets[0] if targets else b.get("save_path", "")))
+                self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
             except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
 
     def _del_bk(self, b):
@@ -6495,10 +7230,11 @@ class SteamSaveManager(ctk.CTk):
         for g in self.cfg.get("games", []):
             if not g.get("auto_backup", True):
                 continue
-            if os.path.isdir(g["save_path"]):
+            for save_path in get_game_save_paths(g, existing_only=True):
                 obs = Observer()
-                obs.schedule(SaveChangeHandler(g, cd), g["save_path"], recursive=True)
-                obs.start(); self._watchers.append(obs)
+                obs.schedule(SaveChangeHandler(g, cd), save_path, recursive=True)
+                obs.start()
+                self._watchers.append(obs)
 
     def _stop_watchers(self):
         for obs in self._watchers: obs.stop()
@@ -6621,7 +7357,14 @@ if __name__ == "__main__":
     if not acquire_lock():
         # 已有实例在运行，弹出提示后退出
         root = ctk.CTk()
-        root.withdraw()
+        root.overrideredirect(True)
+        root.attributes("-alpha", 0.0)
+        root.update_idletasks()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        root.geometry(f"1x1+{max(sw//2, 0)}+{max(sh//2, 0)}")
+        root.deiconify()
+        root.lift()
         messagebox.showinfo("提示", "Steam 存档管家已在运行中，请勿重复启动。", parent=root)
         root.destroy()
         sys.exit(0)
