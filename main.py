@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.3 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.4 — 通用版"""
 
 import os
 import sys
@@ -39,13 +39,6 @@ try:
 except ImportError:
     HAS_TRAY = False
 
-try:
-    import py7zr
-    HAS_PY7ZR = True
-except ImportError:
-    py7zr = None
-    HAS_PY7ZR = False
-
 if HAS_TRAY and sys.platform == "win32":
     from pystray._util import win32 as _pystray_win32
 
@@ -76,7 +69,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -154,7 +147,7 @@ TRANSLATIONS = {
         "sync_mode_bidirectional": "双向同步",
         "sync_mode_upload": "仅上传",
         "sync_mode_download": "仅下载",
-        "sync_hint": "智能云存档（推荐）：检测到游戏启动时自动下载并解压云端 7z，游戏关闭后自动打包为 7z 上传\n双向同步：基于上次同步快照判断单边改动；两边都改时弹出冲突处理，失败任务会自动重试",
+        "sync_hint": "智能云存档（推荐）：检测到游戏启动时自动下载并解压云端 ZIP，游戏关闭后自动打包为 ZIP 上传\n双向同步：基于上次同步快照判断单边改动；两边都改时弹出冲突处理，失败任务会自动重试",
         "sync_notify": "同步完成后发送 Windows 桌面通知",
         "minimize_tray": "关闭时最小化到托盘",
         "minimize_tray_desc": "关闭窗口时最小化到系统托盘后台运行",
@@ -245,7 +238,7 @@ TRANSLATIONS = {
         "sync_mode_bidirectional": "Bidirectional",
         "sync_mode_upload": "Upload Only",
         "sync_mode_download": "Download Only",
-        "sync_hint": "Smart Cloud Save (recommended): download and extract the latest cloud 7z when a game starts, then package local saves into a 7z archive after it closes.\nBidirectional mode uses the last sync snapshot to detect one-sided changes; if both sides changed, you'll get a conflict dialog and failed tasks will retry automatically.",
+        "sync_hint": "Smart Cloud Save (recommended): download and extract the latest cloud ZIP when a game starts, then package local saves into a ZIP archive after it closes.\nBidirectional mode uses the last sync snapshot to detect one-sided changes; if both sides changed, you'll get a conflict dialog and failed tasks will retry automatically.",
         "sync_notify": "Send a Windows desktop notification after sync completes",
         "minimize_tray": "Close to System Tray",
         "minimize_tray_desc": "When closing the window, keep the app running in the tray",
@@ -2954,15 +2947,13 @@ def _iter_sync_payload_files(save_paths: list[str]):
 
 def create_sync_archive(game: dict, sync_game_dir: Path,
                         save_paths: list[str], snapshot: dict) -> tuple[Path, Path]:
-    if not HAS_PY7ZR:
-        raise RuntimeError("py7zr is not installed")
     now = datetime.datetime.now()
     month_dir = get_sync_archive_root(sync_game_dir) / now.strftime("%Y-%m")
     month_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = month_dir / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.7z"
-    with py7zr.SevenZipFile(archive_path, "w") as archive:
+    archive_path = month_dir / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for abs_f, arcname in _iter_sync_payload_files(save_paths):
-            archive.write(str(abs_f), arcname)
+            archive.write(abs_f, arcname)
     meta = {
         "version": 1,
         "game": game.get("name", ""),
@@ -2986,7 +2977,7 @@ def get_latest_sync_archive(sync_game_dir: Path) -> Optional[dict]:
     if not archive_root.is_dir():
         return None
     archives = sorted(
-        archive_root.rglob("*.7z"),
+        archive_root.rglob("*.zip"),
         key=lambda p: (p.stat().st_mtime, p.name.lower()),
         reverse=True,
     )
@@ -3040,8 +3031,6 @@ def get_remote_sync_payload(sync_game_dir: Path, path_count: int) -> Optional[di
 
 
 def extract_sync_archive(archive_path: Path, target_paths: list[str]):
-    if not HAS_PY7ZR:
-        raise RuntimeError("py7zr is not installed")
     targets = _normalize_unique_paths(target_paths)
     if not targets:
         return
@@ -3050,7 +3039,7 @@ def extract_sync_archive(archive_path: Path, target_paths: list[str]):
     temp_root = temp_parent / f"steam_sync_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     temp_root.mkdir(parents=True, exist_ok=True)
     try:
-        with py7zr.SevenZipFile(archive_path, "r") as archive:
+        with zipfile.ZipFile(archive_path, "r") as archive:
             archive.extractall(path=temp_root)
         multi_root = temp_root / "_paths"
         if multi_root.is_dir():
@@ -3471,7 +3460,6 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             "hash": "",
             "latest_mtime": 0.0,
         }
-
     def _mirror(src: str, dst: str):
         """将 src 目录完整镜像到 dst（兼容 OneDrive/Dropbox 等云盘锁定）"""
         dst_p = Path(dst)
@@ -3553,8 +3541,8 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         _record_synced(local_hash, "upload")
         return bilingual_text(
             lang,
-            f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
-            f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
+            f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
+            f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
         )
     if mode == "download":
         if remote_count == 0:
@@ -3566,7 +3554,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         _download_remote_payload()
         create_backup(game, sync_tag)
         _record_synced(remote_hash, "download")
-        return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
+        return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
     if mode == "bidirectional":
         if local_count == 0 and remote_count == 0:
             _record_current()
@@ -3576,15 +3564,15 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             _download_remote_payload()
             create_backup(game, sync_tag)
             _record_synced(remote_hash, "download")
-            return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
+            return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
         if remote_count == 0:
             _create_remote_archive()
             create_backup(game, sync_tag)
             _record_synced(local_hash, "upload")
             return bilingual_text(
                 lang,
-                f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
-                f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
+                f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
+                f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
             )
         if local_hash == remote_hash:
             _record_current()
@@ -3599,15 +3587,15 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                 _record_synced(local_hash, "upload")
                 return bilingual_text(
                     lang,
-                    f"↑ 已上传 7z（本地 → 云端），共 {local_count} 个文件",
-                    f"↑ Uploaded 7z archive (local → cloud), {local_count} files",
+                    f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
+                    f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
                 )
             if remote_changed and not local_changed:
                 create_backup(game, pre_sync_backup_tag)
                 _download_remote_payload()
                 create_backup(game, sync_tag)
                 _record_synced(remote_hash, "download")
-                return bilingual_text(lang, "↓ 已下载并解压 7z（云端 → 本地）", "↓ Downloaded and extracted 7z archive (cloud → local)")
+                return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
             if local_changed and remote_changed:
                 if local_hash == remote_hash:
                     _record_current()
