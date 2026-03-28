@@ -1,6 +1,6 @@
 {
-  "version": "1.2.4",
-  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.2.4/SteamSaveManager.exe",
-  "sha256": "ca256ed05390ce26b4eeccd17310a3912f64d255c61fc51079a4edba2dd6fdaa",
-  "notes": "1. 云同步由 7z 方案调整为 ZIP 归档方案\n2. 上传时按时间生成 ZIP 归档并上传到云端\n3. 下载时自动提取最新 ZIP 归档到本地\n4. 多路径存档游戏继续支持打包到同一个 ZIP 并按路径顺序还原\n5. 移除 py7zr 运行时依赖\n6. 清理打包配置中的 py7zr 相关设置\n7. 更新同步说明文案，使其与当前 ZIP 同步逻辑保持一致"
+  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.2.5/SteamSaveManager.exe",
+  "version": "1.2.5",
+  "sha256": "7f1567666eaeb923002dd74b82e455c7c3998d9e4d54a0e112db834884d4437c",
+  "notes": "1. 新增对游戏根目录存档的精准识别与处理能力\n2. 本地 appinfo.vdf 解析现已支持读取 UFS 的 pattern 与 recursive 规则\n3. 针对 root 为 Game Install 且 pattern 为 *.sav 的游戏，可识别为文件级存档规则\n4. 新增 save_specs 数据结构，用于描述存档目录与文件匹配规则\n5. 扫描添加时会保留精确文件规则，不再只保存粗粒度目录路径\n6. 备份与云同步现已支持按规则筛选文件，避免把整个游戏根目录一起打包\n7. 云同步下载与备份恢复改为仅替换规则命中的文件，不会清空整个游戏根目录\n8. 同步摘要、哈希计算和落盘稳定性检测已适配 save_specs\n9. 新增云端同步包保留数量设置，默认最多保留最近 3 个同步包\n10. 设置中可自定义保留数量，修改后会立即对现有同步包执行轮转清理\n11. 保持对原有 save_path / save_paths 配置的兼容，不影响普通目录型存档游戏"
 }
