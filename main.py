@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.4 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.5 — 通用版"""
 
 import os
 import sys
@@ -13,6 +13,7 @@ import datetime
 import zipfile
 import glob
 import hashlib
+import fnmatch
 import queue
 import time
 import locale
@@ -69,7 +70,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -148,6 +149,8 @@ TRANSLATIONS = {
         "sync_mode_upload": "仅上传",
         "sync_mode_download": "仅下载",
         "sync_hint": "智能云存档（推荐）：检测到游戏启动时自动下载并解压云端 ZIP，游戏关闭后自动打包为 ZIP 上传\n双向同步：基于上次同步快照判断单边改动；两边都改时弹出冲突处理，失败任务会自动重试",
+        "sync_archive_keep": "云端同步包保留数量",
+        "sync_archive_keep_suffix": "个最新 ZIP（0 = 不限）",
         "sync_notify": "同步完成后发送 Windows 桌面通知",
         "minimize_tray": "关闭时最小化到托盘",
         "minimize_tray_desc": "关闭窗口时最小化到系统托盘后台运行",
@@ -239,6 +242,8 @@ TRANSLATIONS = {
         "sync_mode_upload": "Upload Only",
         "sync_mode_download": "Download Only",
         "sync_hint": "Smart Cloud Save (recommended): download and extract the latest cloud ZIP when a game starts, then package local saves into a ZIP archive after it closes.\nBidirectional mode uses the last sync snapshot to detect one-sided changes; if both sides changed, you'll get a conflict dialog and failed tasks will retry automatically.",
+        "sync_archive_keep": "Cloud Sync Archive Retention",
+        "sync_archive_keep_suffix": "latest ZIP archives (0 = unlimited)",
         "sync_notify": "Send a Windows desktop notification after sync completes",
         "minimize_tray": "Close to System Tray",
         "minimize_tray_desc": "When closing the window, keep the app running in the tray",
@@ -1199,7 +1204,7 @@ _SAVE_DETECTION_CACHE: dict[str, list[dict]] = {}
 _STEAMDB_UFS_CACHE: dict[str, list[str]] = {}
 _STEAMDB_UFS_LOCK = threading.Lock()
 _STEAMDB_UFS_SEMAPHORE = threading.Semaphore(2)
-_APPINFO_UFS_CACHE: dict[str, list[str]] = {}
+_APPINFO_UFS_CACHE: dict[str, list[dict]] = {}
 _APPINFO_LOADED = False
 _APPINFO_DATA: dict[str, list[dict]] = {}
 
@@ -1436,10 +1441,40 @@ def _get_steam_library_root(install_dir: str = "", steam_path: str = "") -> str:
     return ""
 
 
-def parse_appinfo_ufs(steam_path: str, appid: str) -> list[str]:
+def _split_ufs_path_and_patterns(path_value: str, pattern_value: str) -> tuple[str, list[str]]:
+    raw_path = str(path_value or "").replace("\\", "/").strip().strip("/")
+    raw_pattern = str(pattern_value or "").replace("\\", "/").strip().strip("/")
+    includes = []
+    clean_path = raw_path
+
+    tail = raw_path.rsplit("/", 1)[-1] if raw_path else ""
+    if any(ch in tail for ch in "*?"):
+        clean_path = raw_path.rsplit("/", 1)[0] if "/" in raw_path else ""
+        includes.append(tail)
+    elif tail and "." in tail and "/" not in tail and not raw_pattern:
+        clean_path = raw_path.rsplit("/", 1)[0] if "/" in raw_path else ""
+        includes.append(tail)
+
+    if raw_pattern and raw_pattern not in {"*", "*.*"}:
+        includes.append(raw_pattern)
+    elif raw_pattern in {"*", "*.*"}:
+        includes = []
+
+    deduped = []
+    seen = set()
+    for item in includes:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return clean_path, deduped
+
+
+def parse_appinfo_ufs_entries(steam_path: str, appid: str) -> list[dict]:
     """
-    从本地 appinfo.vdf 中提取指定 appid 的 UFS savefiles 路径模板。
-    返回与 expand_steamdb_template 兼容的路径模板列表。
+    从本地 appinfo.vdf 中提取指定 appid 的 UFS savefiles 条目。
+    返回带模板和文件匹配规则的结构，便于精准识别根目录中的存档文件。
     """
     appid = str(appid or "").strip()
     if not appid or not steam_path:
@@ -1457,34 +1492,42 @@ def parse_appinfo_ufs(steam_path: str, appid: str) -> list[str]:
     for entry in savefiles:
         root = str(entry.get("root", "0"))
         path_pattern = entry.get("path", "")
-        if not path_pattern:
-            continue
+        file_pattern = entry.get("pattern", "")
         # 只取 Windows 相关条目
         platforms = str(entry.get("platforms", entry.get("platform", "")))
         if platforms and "windows" not in platforms.lower() and "all" not in platforms.lower():
             continue
 
-        # 去掉通配符，取目录部分
-        clean_path = path_pattern.replace("\\", "/")
-        # 去掉文件通配 (如 "saves/*.sav" → "saves")
-        if "*" in clean_path:
-            parts = clean_path.split("/")
-            dir_parts = [p for p in parts if "*" not in p and p]
-            clean_path = "/".join(dir_parts)
-        if not clean_path:
-            continue
+        clean_path, includes = _split_ufs_path_and_patterns(path_pattern, file_pattern)
 
         root_prefix = _APPINFO_ROOT_MAP.get(root)
         if root_prefix is None:
             continue
-        template = f"{root_prefix}/{clean_path}"
-
-        if template not in seen:
-            seen.add(template)
-            templates.append(template)
+        template = f"{root_prefix}/{clean_path}" if clean_path else root_prefix
+        recursive_value = entry.get("recursive", None)
+        if recursive_value is None or str(recursive_value).strip() == "":
+            recursive = not (includes and not clean_path)
+        else:
+            recursive_raw = str(recursive_value).strip().lower()
+            recursive = recursive_raw not in {"0", "false", "no"}
+        key = (template, tuple(p.lower() for p in includes), recursive)
+        if key not in seen:
+            seen.add(key)
+            templates.append({
+                "template": template,
+                "includes": includes,
+                "recursive": recursive,
+            })
 
     _APPINFO_UFS_CACHE[appid] = templates
     return list(templates)
+
+
+def parse_appinfo_ufs(steam_path: str, appid: str) -> list[str]:
+    """
+    兼容旧调用：仅返回路径模板列表。
+    """
+    return [item["template"] for item in parse_appinfo_ufs_entries(steam_path, appid)]
 
 
 def expand_path(template: str, install_dir: str = "") -> str:
@@ -1659,26 +1702,211 @@ def _normalize_unique_paths(paths: list[str]) -> list[str]:
     return normalized
 
 
+def _normalize_save_spec(spec: dict) -> Optional[dict]:
+    if not isinstance(spec, dict):
+        return None
+    base = str(spec.get("base", "") or "").strip()
+    if not base:
+        return None
+    includes = spec.get("includes", [])
+    if isinstance(includes, str):
+        includes = [includes]
+    normalized_includes = []
+    seen = set()
+    for pattern in includes if isinstance(includes, list) else []:
+        if not isinstance(pattern, str):
+            continue
+        clean = pattern.replace("\\", "/").strip().lstrip("./")
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_includes.append(clean)
+    return {
+        "base": os.path.normpath(base),
+        "includes": normalized_includes,
+        "recursive": bool(spec.get("recursive", True)),
+    }
+
+
+def _normalize_unique_save_specs(specs: list[dict]) -> list[dict]:
+    normalized = []
+    seen = set()
+    for spec in specs:
+        clean = _normalize_save_spec(spec)
+        if not clean:
+            continue
+        key = (
+            os.path.normcase(clean["base"]),
+            tuple(p.lower() for p in clean["includes"]),
+            clean["recursive"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(clean)
+    return normalized
+
+
+def _default_save_spec(path: str) -> dict:
+    return {
+        "base": os.path.normpath(path),
+        "includes": [],
+        "recursive": True,
+    }
+
+
+def get_game_save_specs(game: Optional[dict], existing_only: bool = False) -> list[dict]:
+    if not isinstance(game, dict):
+        return []
+    raw_specs = game.get("save_specs", [])
+    specs = _normalize_unique_save_specs(raw_specs if isinstance(raw_specs, list) else [])
+    if not specs:
+        specs = [_default_save_spec(path) for path in get_game_save_paths(game, existing_only=False)]
+    if existing_only:
+        specs = [spec for spec in specs if os.path.isdir(spec["base"])]
+    return specs
+
+
 def get_game_save_paths(game: Optional[dict], existing_only: bool = False) -> list[str]:
     if not isinstance(game, dict):
         return []
-    paths = []
-    raw_paths = game.get("save_paths", [])
-    if isinstance(raw_paths, list):
-        paths.extend(raw_paths)
-    primary = game.get("save_path", "")
-    if isinstance(primary, str) and primary.strip():
-        paths.append(primary)
-    result = _normalize_unique_paths(paths)
+    raw_specs = game.get("save_specs", [])
+    normalized_specs = _normalize_unique_save_specs(raw_specs if isinstance(raw_specs, list) else [])
+    if normalized_specs:
+        result = _normalize_unique_paths([spec.get("base", "") for spec in normalized_specs])
+    else:
+        paths = []
+        raw_paths = game.get("save_paths", [])
+        if isinstance(raw_paths, list):
+            paths.extend(raw_paths)
+        primary = game.get("save_path", "")
+        if isinstance(primary, str) and primary.strip():
+            paths.append(primary)
+        result = _normalize_unique_paths(paths)
     if existing_only:
         result = [p for p in result if os.path.isdir(p)]
     return result
 
 
+def set_game_save_specs(game: dict, specs: list[dict]):
+    normalized_specs = _normalize_unique_save_specs(specs)
+    game["save_specs"] = normalized_specs
+    bases = _normalize_unique_paths([spec["base"] for spec in normalized_specs])
+    game["save_paths"] = bases
+    game["save_path"] = bases[0] if bases else ""
+
+
 def set_game_save_paths(game: dict, paths: list[str]):
     normalized = _normalize_unique_paths(paths)
-    game["save_paths"] = normalized
-    game["save_path"] = normalized[0] if normalized else ""
+    existing_specs = get_game_save_specs(game, existing_only=False)
+    grouped: dict[str, list[dict]] = {}
+    for spec in existing_specs:
+        grouped.setdefault(os.path.normcase(spec["base"]), []).append(spec)
+    rebuilt_specs = []
+    for path in normalized:
+        specs_for_base = grouped.get(os.path.normcase(path), [])
+        if specs_for_base:
+            rebuilt_specs.extend(specs_for_base)
+        else:
+            rebuilt_specs.append(_default_save_spec(path))
+    set_game_save_specs(game, rebuilt_specs)
+
+
+def _save_spec_covers_entire_dir(spec: dict) -> bool:
+    includes = spec.get("includes", [])
+    return bool(spec.get("recursive", True)) and not includes
+
+
+def _save_spec_match_relpath(spec: dict, rel_path: str) -> bool:
+    rel_norm = rel_path.replace("\\", "/").lstrip("./")
+    includes = spec.get("includes", [])
+    recursive = bool(spec.get("recursive", True))
+    if not includes:
+        return recursive or "/" not in rel_norm
+    if not recursive and "/" in rel_norm:
+        return False
+    rel_name = rel_norm.rsplit("/", 1)[-1]
+    for pattern in includes:
+        pat = pattern.replace("\\", "/").lstrip("./")
+        if not recursive and "/" in pat:
+            if fnmatch.fnmatch(rel_norm, pat):
+                return True
+            continue
+        if recursive:
+            if fnmatch.fnmatch(rel_norm, pat) or fnmatch.fnmatch(rel_name, pat):
+                return True
+        elif fnmatch.fnmatch(rel_name, pat) or fnmatch.fnmatch(rel_norm, pat):
+            return True
+    return False
+
+
+def iter_save_spec_files(specs: list[dict]):
+    for idx, spec in enumerate(_normalize_unique_save_specs(specs), start=1):
+        base = Path(spec["base"])
+        if not base.is_dir():
+            continue
+        for root, dirs, files in os.walk(base):
+            rel_root = os.path.relpath(root, base)
+            if not spec.get("recursive", True) and rel_root != ".":
+                dirs[:] = []
+                continue
+            for file_name in files:
+                abs_f = Path(root) / file_name
+                rel = abs_f.relative_to(base).as_posix()
+                if _save_spec_match_relpath(spec, rel):
+                    yield idx, spec, abs_f, rel
+
+
+def compute_save_spec_hash(specs: list[dict]) -> str:
+    h = hashlib.md5()
+    all_files = []
+    for idx, spec, abs_f, rel in iter_save_spec_files(specs):
+        all_files.append((idx, spec["base"], rel, str(abs_f)))
+    all_files.sort(key=lambda item: (item[0], item[2].lower(), item[3].lower()))
+    for idx, base, rel, file_path in all_files:
+        h.update(f"{idx}:{os.path.normcase(base)}:{rel}".encode("utf-8", errors="ignore"))
+        try:
+            with open(file_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except (OSError, PermissionError):
+            h.update(b"__UNREADABLE__")
+    return h.hexdigest()
+
+
+def compute_save_spec_file_count(specs: list[dict]) -> int:
+    return sum(1 for _ in iter_save_spec_files(specs))
+
+
+def compute_save_spec_latest_mtime(specs: list[dict]) -> float:
+    latest = 0.0
+    for _, _, abs_f, _ in iter_save_spec_files(specs):
+        try:
+            latest = max(latest, abs_f.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def _remove_matching_spec_files(spec: dict):
+    base = Path(spec["base"])
+    if not base.is_dir():
+        return
+    if _save_spec_covers_entire_dir(spec):
+        _remove_tree_contents(base)
+        return
+    for _, _, abs_f, _ in list(iter_save_spec_files([spec])):
+        try:
+            abs_f.unlink()
+        except Exception:
+            pass
+
 
 
 def _steam64_from_accountid(accountid: str) -> str:
@@ -2444,7 +2672,7 @@ def detect_save_candidates(appid: str, game_name: str,
     scored: dict[str, dict] = {}
     blacklist = get_recognition_blacklist(cfg, appid, game_name)
 
-    def _add(path: str, score: int, source: str):
+    def _add(path: str, score: int, source: str, save_specs: Optional[list[dict]] = None):
         norm = os.path.normpath(path)
         if not norm or norm in blacklist or not os.path.exists(norm):
             return
@@ -2460,8 +2688,12 @@ def detect_save_candidates(appid: str, game_name: str,
             "confidence": detail["confidence"],
             "reasons": [source] + detail["reasons"],
         }
+        if save_specs:
+            entry["save_specs"] = _normalize_unique_save_specs(save_specs)
         if existing is None or total > existing["score"]:
             scored[norm] = entry
+        elif save_specs and not existing.get("save_specs"):
+            existing["save_specs"] = _normalize_unique_save_specs(save_specs)
 
     steamdb_enabled = bool(cfg and cfg.get("steamdb_detection_enabled"))
 
@@ -2493,9 +2725,15 @@ def detect_save_candidates(appid: str, game_name: str,
 
     # 1a) 本地 appinfo.vdf UFS 线索（离线，无需联网）
     if str(appid or "").strip() and steam_path:
-        for template in parse_appinfo_ufs(steam_path, appid):
+        for appinfo_entry in parse_appinfo_ufs_entries(steam_path, appid):
+            template = appinfo_entry.get("template", "")
             for path in expand_steamdb_template(template, appid, install_dir, steam_path):
-                _add(path, 94, "appinfo")
+                save_specs = [{
+                    "base": path,
+                    "includes": list(appinfo_entry.get("includes", [])),
+                    "recursive": appinfo_entry.get("recursive", True),
+                }]
+                _add(path, 94, "appinfo", save_specs=save_specs)
 
     # 1b) SteamDB Cloud Save / UFS 线索（可选，需联网，优先模式）
     if steamdb_enabled and str(appid or "").strip():
@@ -2505,6 +2743,16 @@ def detect_save_candidates(appid: str, game_name: str,
 
         if steamdb_candidates:
             merged_candidates = list(steamdb_candidates.values())
+            scored_by_path = {
+                item["path"]: item
+                for item in scored.values()
+                if item.get("path")
+            }
+            for item in merged_candidates:
+                matched = scored_by_path.get(item["path"])
+                if matched and matched.get("save_specs") and not item.get("save_specs"):
+                    item["save_specs"] = _normalize_unique_save_specs(matched.get("save_specs", []))
+                    item["reasons"] = list(dict.fromkeys(list(item.get("reasons", [])) + list(matched.get("reasons", []))))
             confirmed_entry = None
             if confirmed_path:
                 confirmed_entry = scored.get(os.path.normpath(confirmed_path))
@@ -2610,6 +2858,7 @@ def load_config() -> dict:
         "sync_folder": "",
         "sync_interval": 10,
         "sync_mode": "smart",
+        "sync_archive_keep": 3,
         "steamdb_detection_enabled": False,
         "sync_state": {},
         "sync_retry_queue": [],
@@ -2642,9 +2891,14 @@ def load_config() -> dict:
             if not isinstance(game, dict):
                 continue
             old_primary = game.get("save_path", "")
-            normalized = get_game_save_paths(game, existing_only=False)
-            set_game_save_paths(game, normalized)
-            if game.get("save_path", "") != old_primary or "save_paths" not in game:
+            old_specs = list(game.get("save_specs", [])) if isinstance(game.get("save_specs", []), list) else []
+            normalized_specs = get_game_save_specs(game, existing_only=False)
+            set_game_save_specs(game, normalized_specs)
+            if (
+                game.get("save_path", "") != old_primary
+                or "save_paths" not in game
+                or old_specs != normalized_specs
+            ):
                 changed = True
 
     detected_lang = normalize_language(cfg.get("language") or detect_system_language())
@@ -2916,6 +3170,69 @@ def get_sync_archive_meta_path(archive_path: Path) -> Path:
     return Path(str(archive_path) + ".meta.json")
 
 
+def enforce_sync_archive_limits(sync_game_dir: Path, keep_count: int = 3):
+    if keep_count <= 0:
+        return
+    archive_root = get_sync_archive_root(sync_game_dir)
+    if not archive_root.is_dir():
+        return
+    archives = sorted(
+        archive_root.rglob("*.zip"),
+        key=lambda p: (p.stat().st_mtime, p.name.lower()),
+        reverse=True,
+    )
+    for archive_path in archives[keep_count:]:
+        meta_path = get_sync_archive_meta_path(archive_path)
+        try:
+            archive_path.unlink()
+        except Exception:
+            pass
+        try:
+            if meta_path.exists():
+                meta_path.unlink()
+        except Exception:
+            pass
+    for folder in sorted(archive_root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if folder.is_dir():
+            try:
+                next(folder.iterdir())
+            except StopIteration:
+                try:
+                    folder.rmdir()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+
+def enforce_all_sync_archive_limits(cfg: Optional[dict]):
+    if not cfg:
+        return
+    sync_folder = str(cfg.get("sync_folder", "") or "").strip()
+    if not sync_folder or not os.path.isdir(sync_folder):
+        return
+    try:
+        keep_count = max(0, int(cfg.get("sync_archive_keep", 3)))
+    except Exception:
+        keep_count = 3
+    games = cfg.get("games", [])
+    if not isinstance(games, list):
+        return
+    seen_dirs = set()
+    for game in games:
+        if not isinstance(game, dict):
+            continue
+        game_name = str(game.get("name", "") or "").strip()
+        if not game_name:
+            continue
+        sync_game_dir = get_sync_game_dir(sync_folder, game_name)
+        dir_key = str(sync_game_dir).lower()
+        if dir_key in seen_dirs:
+            continue
+        seen_dirs.add(dir_key)
+        enforce_sync_archive_limits(sync_game_dir, keep_count)
+
+
 def _remove_tree_contents(path: Path):
     if not path.exists():
         path.mkdir(parents=True, exist_ok=True)
@@ -2930,29 +3247,23 @@ def _remove_tree_contents(path: Path):
             pass
 
 
-def _iter_sync_payload_files(save_paths: list[str]):
-    multi = len(save_paths) > 1
-    for idx, save_path in enumerate(save_paths, start=1):
-        base = Path(save_path)
-        if not base.is_dir():
-            continue
+def _iter_sync_payload_files(save_specs: list[dict]):
+    multi = len(save_specs) > 1
+    for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
         prefix = Path("_paths") / f"p{idx}" if multi else Path()
-        for root, _, files in os.walk(base):
-            for file_name in files:
-                abs_f = Path(root) / file_name
-                rel = abs_f.relative_to(base)
-                arcname = prefix / rel if multi else rel
-                yield abs_f, arcname.as_posix()
+        arcname = prefix / Path(rel)
+        yield idx, abs_f, arcname.as_posix()
 
 
 def create_sync_archive(game: dict, sync_game_dir: Path,
-                        save_paths: list[str], snapshot: dict) -> tuple[Path, Path]:
+                        save_specs: list[dict], snapshot: dict,
+                        keep_count: int = 3) -> tuple[Path, Path]:
     now = datetime.datetime.now()
     month_dir = get_sync_archive_root(sync_game_dir) / now.strftime("%Y-%m")
     month_dir.mkdir(parents=True, exist_ok=True)
     archive_path = month_dir / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.zip"
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for abs_f, arcname in _iter_sync_payload_files(save_paths):
+        for _, abs_f, arcname in _iter_sync_payload_files(save_specs):
             archive.write(abs_f, arcname)
     meta = {
         "version": 1,
@@ -2963,12 +3274,14 @@ def create_sync_archive(game: dict, sync_game_dir: Path,
         "hash": snapshot.get("hash", ""),
         "file_count": snapshot.get("file_count", 0),
         "latest_mtime": snapshot.get("latest_mtime", 0.0),
-        "path_count": len(save_paths),
-        "paths": [os.path.normpath(p) for p in save_paths],
+        "path_count": len(save_specs),
+        "paths": [os.path.normpath(spec["base"]) for spec in save_specs],
+        "save_specs": _normalize_unique_save_specs(save_specs),
     }
     meta_path = get_sync_archive_meta_path(archive_path)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    enforce_sync_archive_limits(sync_game_dir, keep_count)
     return archive_path, meta_path
 
 
@@ -3030,9 +3343,13 @@ def get_remote_sync_payload(sync_game_dir: Path, path_count: int) -> Optional[di
     return get_legacy_sync_snapshot(sync_game_dir, path_count)
 
 
-def extract_sync_archive(archive_path: Path, target_paths: list[str]):
-    targets = _normalize_unique_paths(target_paths)
-    if not targets:
+def extract_sync_archive(archive_path: Path, target_specs_or_paths):
+    if isinstance(target_specs_or_paths, list) and target_specs_or_paths and isinstance(target_specs_or_paths[0], dict):
+        target_specs = get_game_save_specs({"save_specs": target_specs_or_paths}, existing_only=False)
+    else:
+        targets = target_specs_or_paths if isinstance(target_specs_or_paths, list) else [target_specs_or_paths]
+        target_specs = [_default_save_spec(str(t)) for t in _normalize_unique_paths([str(t) for t in targets if t])]
+    if not target_specs:
         return
     temp_parent = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / ".sync_extract_tmp"
     temp_parent.mkdir(parents=True, exist_ok=True)
@@ -3043,13 +3360,13 @@ def extract_sync_archive(archive_path: Path, target_paths: list[str]):
             archive.extractall(path=temp_root)
         multi_root = temp_root / "_paths"
         if multi_root.is_dir():
-            for idx, target_path in enumerate(targets, start=1):
+            for idx, spec in enumerate(target_specs, start=1):
                 source_dir = multi_root / f"p{idx}"
                 if not source_dir.exists():
                     continue
-                target_dir = Path(target_path)
+                target_dir = Path(spec["base"])
                 target_dir.mkdir(parents=True, exist_ok=True)
-                _remove_tree_contents(target_dir)
+                _remove_matching_spec_files(spec)
                 for item in source_dir.iterdir():
                     dest = target_dir / item.name
                     if item.is_dir():
@@ -3057,9 +3374,10 @@ def extract_sync_archive(archive_path: Path, target_paths: list[str]):
                     else:
                         shutil.copy2(item, dest)
             return
-        target_dir = Path(targets[0])
+        spec = target_specs[0]
+        target_dir = Path(spec["base"])
         target_dir.mkdir(parents=True, exist_ok=True)
-        _remove_tree_contents(target_dir)
+        _remove_matching_spec_files(spec)
         for item in temp_root.iterdir():
             if item.name == "_paths":
                 continue
@@ -3183,6 +3501,31 @@ def snapshot_sync_paths(paths: list[str], label: str) -> dict:
     }
 
 
+def snapshot_sync_specs(specs: list[dict], label: str) -> dict:
+    existing = get_game_save_specs({"save_specs": specs}, existing_only=True)
+    if not existing:
+        return {
+            "path": label,
+            "file_count": 0,
+            "hash": "",
+            "latest_mtime": 0.0,
+        }
+    hash_parts = []
+    total_files = 0
+    latest_mtime = 0.0
+    for idx, spec in enumerate(existing, start=1):
+        file_count = compute_save_spec_file_count([spec])
+        total_files += file_count
+        latest_mtime = max(latest_mtime, compute_save_spec_latest_mtime([spec]))
+        hash_parts.append((f"{idx}:{spec['base']}", compute_save_spec_hash([spec]) if file_count else ""))
+    return {
+        "path": label,
+        "file_count": total_files,
+        "hash": combine_sync_hash(hash_parts),
+        "latest_mtime": latest_mtime,
+    }
+
+
 def format_sync_time(timestamp: float) -> str:
     if not timestamp:
         return "—"
@@ -3193,11 +3536,18 @@ def get_game_sync_key(game: dict) -> str:
     """为游戏生成稳定的同步状态键。"""
     appid = str(game.get("appid", "")).strip() or "-"
     name = sanitize(game.get("name", "")).lower() or "-"
-    paths = get_game_save_paths(game, existing_only=False)
-    if not paths:
-        paths = [str(game.get("save_path", "") or "")]
-    path_sig = "|".join(os.path.normcase(os.path.normpath(p)) for p in paths if p)
-    return f"appid:{appid}|name:{name}|paths:{path_sig}"
+    specs = get_game_save_specs(game, existing_only=False)
+    if specs:
+        spec_sig = "|".join(
+            f"{os.path.normcase(spec['base'])}::{','.join(p.lower() for p in spec.get('includes', []))}::{int(bool(spec.get('recursive', True)))}"
+            for spec in specs
+        )
+    else:
+        paths = get_game_save_paths(game, existing_only=False)
+        if not paths:
+            paths = [str(game.get("save_path", "") or "")]
+        spec_sig = "|".join(os.path.normcase(os.path.normpath(p)) for p in paths if p)
+    return f"appid:{appid}|name:{name}|paths:{spec_sig}"
 
 
 def get_game_sync_state(cfg: Optional[dict], game: dict) -> dict:
@@ -3413,10 +3763,12 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     if mode == "smart":
         mode = "bidirectional"
 
-    configured_paths = get_game_save_paths(game, existing_only=False)
+    configured_specs = get_game_save_specs(game, existing_only=False)
+    configured_paths = [spec["base"] for spec in configured_specs]
     if not configured_paths:
         fallback = str(game.get("save_path", "") or "").strip()
-        configured_paths = [os.path.normpath(fallback)] if fallback else []
+        configured_specs = [_default_save_spec(fallback)] if fallback else []
+        configured_paths = [spec["base"] for spec in configured_specs]
     if not configured_paths:
         return bilingual_text(lang, "跳过：存档路径不存在", "Skipped: save path does not exist")
     if not sync_folder or not os.path.isdir(sync_folder):
@@ -3425,19 +3777,12 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     dest_dir = get_sync_game_dir(sync_folder, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    local_hash_parts = []
-    local_count = 0
-    for idx, local_path in enumerate(configured_paths, start=1):
-        local_files = compute_dir_file_count(local_path) if os.path.isdir(local_path) else 0
-        local_count += local_files
-        local_hash_parts.append((f"{idx}:{local_path}", compute_dir_hash(local_path) if local_files else ""))
-
-    local_hash = combine_sync_hash(local_hash_parts) if local_count else ""
+    local_info = snapshot_sync_specs(configured_specs, configured_paths[0] if len(configured_paths) == 1 else bilingual_text(lang, f"{len(configured_paths)} 个本地目录", f"{len(configured_paths)} local folders"))
+    local_count = int(local_info.get("file_count", 0) or 0)
+    local_hash = local_info.get("hash", "") if local_count else ""
     state = get_game_sync_state(cfg, game)
     base_local = state.get("local_hash", "")
     base_remote = state.get("remote_hash", "")
-    local_label = configured_paths[0] if len(configured_paths) == 1 else bilingual_text(lang, f"{len(configured_paths)} 个本地目录", f"{len(configured_paths)} local folders")
-    local_info = snapshot_sync_paths(configured_paths, local_label)
     remote_payload = get_remote_sync_payload(dest_dir, len(configured_paths))
     remote_hash = remote_payload.get("hash", "") if remote_payload else ""
     remote_count = int(remote_payload.get("file_count", 0) or 0) if remote_payload else 0
@@ -3495,7 +3840,15 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                         pass
 
     def _create_remote_archive():
-        archive_path, _ = create_sync_archive(game, dest_dir, configured_paths, local_info)
+        keep_count = 3
+        if cfg:
+            try:
+                keep_count = max(0, int(cfg.get("sync_archive_keep", 3)))
+            except Exception:
+                keep_count = 3
+        archive_path, _ = create_sync_archive(
+            game, dest_dir, configured_specs, local_info, keep_count=keep_count
+        )
         return archive_path
 
     def _download_remote_payload():
@@ -3503,7 +3856,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         if not current_remote:
             return
         if current_remote.get("kind") == "archive":
-            extract_sync_archive(Path(current_remote["archive_path"]), configured_paths)
+            extract_sync_archive(Path(current_remote["archive_path"]), configured_specs)
             return
         if len(configured_paths) == 1:
             legacy_pairs = [(configured_paths[0], str(dest_dir))]
@@ -3658,28 +4011,25 @@ def fmt_size(size: int) -> str:
 
 
 def create_backup(game: dict, note: str = "") -> Optional[str]:
-    save_paths = get_game_save_paths(game, existing_only=True)
-    if not save_paths:
+    save_specs = get_game_save_specs(game, existing_only=True)
+    if not save_specs:
         return None
+    save_paths = [spec["base"] for spec in save_specs]
     game_dir = BACKUP_ROOT / sanitize(game["name"])
     game_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = game_dir / f"{ts}.zip"
-    is_multi = len(save_paths) > 1
+    is_multi = len(save_specs) > 1
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for idx, save_path in enumerate(save_paths, start=1):
-            base = Path(save_path)
+        for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
             arc_prefix = Path("__multi__") / f"p{idx}" if is_multi else Path()
-            for root, _, files in os.walk(base):
-                for file in files:
-                    abs_f = Path(root) / file
-                    rel = abs_f.relative_to(base)
-                    arcname = arc_prefix / rel if is_multi else rel
-                    zf.write(abs_f, arcname)
+            arcname = arc_prefix / Path(rel) if is_multi else Path(rel)
+            zf.write(abs_f, arcname)
     meta = {
         "game": game["name"], "appid": game.get("appid", ""),
         "timestamp": ts, "note": note,
         "source": str(save_paths[0]), "sources": save_paths,
+        "save_specs": _normalize_unique_save_specs(save_specs),
         "multi_path": is_multi,
         "size": zip_path.stat().st_size,
     }
@@ -3770,13 +4120,17 @@ def migrate_backups(old_root: Path, new_root: Path) -> int:
 
 
 def restore_backup(zip_path: str, target_dir):
-    targets = target_dir if isinstance(target_dir, list) else [target_dir]
-    target_paths = _normalize_unique_paths([str(t) for t in targets if t])
-    if not target_paths:
+    if isinstance(target_dir, list) and target_dir and isinstance(target_dir[0], dict):
+        target_specs = get_game_save_specs({"save_specs": target_dir}, existing_only=False)
+    else:
+        targets = target_dir if isinstance(target_dir, list) else [target_dir]
+        target_paths = _normalize_unique_paths([str(t) for t in targets if t])
+        target_specs = [_default_save_spec(path) for path in target_paths]
+    if not target_specs:
         return
 
-    for item in target_paths:
-        target = Path(item)
+    for spec in target_specs:
+        target = Path(spec["base"])
         if target.exists():
             safety = target.parent / (
                 target.name + "_pre_restore_" +
@@ -3789,9 +4143,13 @@ def restore_backup(zip_path: str, target_dir):
         names = [n for n in zf.namelist() if n and not n.endswith("/")]
         is_multi = any(n.startswith("__multi__/p") for n in names)
         if not is_multi:
-            zf.extractall(Path(target_paths[0]))
+            spec = target_specs[0]
+            if not _save_spec_covers_entire_dir(spec):
+                _remove_matching_spec_files(spec)
+            zf.extractall(Path(spec["base"]))
             return
 
+        prepared_targets = set()
         for member in names:
             match = re.match(r"^__multi__/p(\d+)/(.*)$", member)
             if not match:
@@ -3802,8 +4160,12 @@ def restore_backup(zip_path: str, target_dir):
                 continue
             if idx < 0:
                 continue
-            target_idx = idx if idx < len(target_paths) else 0
-            dest = Path(target_paths[target_idx]) / rel
+            target_idx = idx if idx < len(target_specs) else 0
+            spec = target_specs[target_idx]
+            if target_idx not in prepared_targets and not _save_spec_covers_entire_dir(spec):
+                _remove_matching_spec_files(spec)
+                prepared_targets.add(target_idx)
+            dest = Path(spec["base"]) / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as src, open(dest, "wb") as dst:
                 shutil.copyfileobj(src, dst)
@@ -3887,17 +4249,13 @@ class GameProcessMonitor:
         返回实际等待秒数。
         """
         save_paths = get_game_save_paths(game, existing_only=True)
-        if not save_paths:
+        save_specs = get_game_save_specs(game, existing_only=True)
+        if not save_specs:
             return 0.0
 
         def _sig():
-            hash_parts = []
-            file_count = 0
-            for idx, save_path in enumerate(save_paths, start=1):
-                count = compute_dir_file_count(save_path)
-                file_count += count
-                hash_parts.append((f"{idx}:{save_path}", compute_dir_hash(save_path) if count else ""))
-            return (file_count, combine_sync_hash(hash_parts))
+            snapshot = snapshot_sync_specs(save_specs, save_paths[0] if save_paths else "")
+            return (int(snapshot.get("file_count", 0) or 0), snapshot.get("hash", ""))
 
         start = time.monotonic()
         deadline = start + max(0.0, timeout)
@@ -5199,6 +5557,36 @@ class SteamSaveManager(ctk.CTk):
                 return merged
         return [selected_norm]
 
+    def _collect_scan_add_specs(self, appid: str, selected_path: str) -> list[dict]:
+        selected_norm = os.path.normpath(selected_path) if selected_path else ""
+        if not selected_norm:
+            return []
+        result = next((r for r in self._scan_results if r.get("appid") == appid), None)
+        if not result:
+            return []
+        candidates = result.get("save_candidates", [])
+        selected_candidate = next(
+            (c for c in candidates if os.path.normpath(c.get("path", "")) == selected_norm),
+            None,
+        )
+        if not selected_candidate:
+            return []
+        if selected_candidate.get("source") in {"steamdb", "appinfo"}:
+            merged_specs = []
+            for candidate in candidates:
+                if candidate.get("source") != selected_candidate.get("source"):
+                    continue
+                if candidate.get("save_specs"):
+                    merged_specs.extend(candidate.get("save_specs", []))
+                else:
+                    merged_specs.append(_default_save_spec(candidate.get("path", "")))
+            specs = _normalize_unique_save_specs(merged_specs)
+            if specs:
+                return specs
+        if selected_candidate.get("save_specs"):
+            return _normalize_unique_save_specs(selected_candidate.get("save_specs", []))
+        return []
+
     def _add_from_scan(self, appid, name, save_path):
         games = self.cfg.setdefault("games", [])
         if any(g.get("appid") == appid for g in games):
@@ -5206,7 +5594,11 @@ class SteamSaveManager(ctk.CTk):
             return
         save_paths = self._collect_scan_add_paths(appid, save_path)
         game = {"appid": appid, "name": name}
-        set_game_save_paths(game, save_paths if save_paths else [save_path])
+        save_specs = self._collect_scan_add_specs(appid, save_path)
+        if save_specs:
+            set_game_save_specs(game, save_specs)
+        else:
+            set_game_save_paths(game, save_paths if save_paths else [save_path])
         games.append(game)
         remember_recognition_path(self.cfg, appid, name, game.get("save_path", ""))
         save_config(self.cfg)
@@ -5236,7 +5628,11 @@ class SteamSaveManager(ctk.CTk):
             selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
             save_paths = self._collect_scan_add_paths(appid, selected)
             game = {"appid": appid, "name": result["name"]}
-            set_game_save_paths(game, save_paths if save_paths else [selected])
+            save_specs = self._collect_scan_add_specs(appid, selected)
+            if save_specs:
+                set_game_save_specs(game, save_specs)
+            else:
+                set_game_save_paths(game, save_paths if save_paths else [selected])
             games.append(game)
             remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
             existing.add(appid)
@@ -5628,8 +6024,8 @@ class SteamSaveManager(ctk.CTk):
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             if self._ask_yes_no(self.bi("导入成功", "Import Complete"), self.bi("已导入为备份！\n是否立即还原？", "Imported as a backup.\nRestore it now?")):
                 try:
-                    targets = get_game_save_paths(g, existing_only=False)
-                    restore_backup(str(dest), targets if len(targets) > 1 else (targets[0] if targets else g.get("save_path", "")))
+                    targets = get_game_save_specs(g, existing_only=False)
+                    restore_backup(str(dest), targets if targets else g.get("save_path", ""))
                     self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
         else:
@@ -5650,8 +6046,8 @@ class SteamSaveManager(ctk.CTk):
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             if self._ask_yes_no(self.bi("导入成功", "Import Complete"), self.bi("已打包为备份！\n是否立即还原？", "Packed as a backup.\nRestore it now?")):
                 try:
-                    targets = get_game_save_paths(g, existing_only=False)
-                    restore_backup(str(zp), targets if len(targets) > 1 else (targets[0] if targets else g.get("save_path", "")))
+                    targets = get_game_save_specs(g, existing_only=False)
+                    restore_backup(str(zp), targets if targets else g.get("save_path", ""))
                     self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
 
@@ -5960,8 +6356,8 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(f"还原 {self._fmt_ts(backup['timestamp'])} 的备份？\n当前存档将被自动备份后覆盖",
                         f"Restore the backup from {self._fmt_ts(backup['timestamp'])}?\nYour current save will be backed up automatically before being overwritten.")):
             try:
-                targets = get_game_save_paths(game, existing_only=False)
-                restore_backup(backup["path"], targets if len(targets) > 1 else (targets[0] if targets else game.get("save_path", "")))
+                targets = get_game_save_specs(game, existing_only=False)
+                restore_backup(backup["path"], targets if targets else game.get("save_path", ""))
                 self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
                 dialog.destroy()
                 self._show_game_detail(self._detail_idx)
@@ -6568,8 +6964,8 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(f"还原此存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore this save?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
             try:
-                targets = get_game_save_paths(game, existing_only=False)
-                restore_backup(b["path"], targets if len(targets) > 1 else (targets[0] if targets else game.get("save_path", "")))
+                targets = get_game_save_specs(game, existing_only=False)
+                restore_backup(b["path"], targets if targets else game.get("save_path", ""))
                 self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 self._show_game_detail(self._detail_idx)
             except Exception as e:
@@ -6631,8 +7027,10 @@ class SteamSaveManager(ctk.CTk):
             for b in get_backups(g["name"]):
                 b["game"] = g["name"]
                 save_paths = get_game_save_paths(g, existing_only=False)
+                save_specs = get_game_save_specs(g, existing_only=False)
                 b["save_path"] = save_paths[0] if save_paths else g.get("save_path", "")
                 b["save_paths"] = save_paths
+                b["save_specs"] = save_specs
                 all_b.append(b)
         all_b.sort(key=lambda x: x["timestamp"], reverse=True)
 
@@ -6667,8 +7065,8 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(f"还原「{b['game']}」的存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore the save for {b['game']}?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
             try:
-                targets = b.get("save_paths", [])
-                restore_backup(b["path"], targets if len(targets) > 1 else (targets[0] if targets else b.get("save_path", "")))
+                targets = b.get("save_specs", []) or [_default_save_spec(path) for path in b.get("save_paths", [])]
+                restore_backup(b["path"], targets if targets else b.get("save_path", ""))
                 self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
             except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
 
@@ -6828,10 +7226,19 @@ class SteamSaveManager(ctk.CTk):
                      text_color=C_SUBTLE_TEXT, wraplength=760,
                      justify="left").grid(row=13, column=0, padx=22, pady=(6, 0), sticky="w")
 
+        sync_keep_row = ctk.CTkFrame(automation, fg_color="transparent")
+        sync_keep_row.grid(row=14, column=0, padx=22, pady=(10, 0), sticky="w")
+        ctk.CTkLabel(sync_keep_row, text=self.t("sync_archive_keep"), font=font(12)).pack(side="left")
+        self._sync_archive_keep_e = ctk.CTkEntry(sync_keep_row, width=64, font=font(12))
+        self._sync_archive_keep_e.insert(0, str(self.cfg.get("sync_archive_keep", 3)))
+        self._sync_archive_keep_e.pack(side="left", padx=6)
+        self._bind_entry_apply(self._sync_archive_keep_e, self._apply_sync_archive_keep)
+        ctk.CTkLabel(sync_keep_row, text=self.t("sync_archive_keep_suffix"), font=font(12)).pack(side="left")
+
         self._sync_notify_var = ctk.StringVar(value="on" if self.cfg.get("sync_notify", True) else "off")
         ctk.CTkSwitch(automation, text=self.t("sync_notify"),
                       variable=self._sync_notify_var, onvalue="on", offvalue="off",
-                      font=font(12), command=self._toggle_sync_notify).grid(row=14, column=0, padx=22, pady=(12, 18), sticky="w")
+                      font=font(12), command=self._toggle_sync_notify).grid(row=15, column=0, padx=22, pady=(12, 18), sticky="w")
 
         # System
         _label(system, 2, "minimize_tray")
@@ -6982,6 +7389,16 @@ class SteamSaveManager(ctk.CTk):
     def _apply_sync_folder(self):
         self.cfg["sync_folder"] = self._sync_folder_e.get().strip()
         save_config(self.cfg)
+
+    def _apply_sync_archive_keep(self):
+        try:
+            value = max(0, int(self._sync_archive_keep_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("sync_archive_keep", 3))
+        self._set_entry_value(self._sync_archive_keep_e, value)
+        self.cfg["sync_archive_keep"] = value
+        save_config(self.cfg)
+        enforce_all_sync_archive_limits(self.cfg)
 
     def _on_sync_mode_change(self, _value=None):
         self.cfg["sync_mode"] = self._sync_mode_code(self._sync_mode_var.get())
