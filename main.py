@@ -3894,6 +3894,19 @@ def _webdav_try_variants(func, remote_path: str):
     raise RuntimeError("invalid_webdav_path")
 
 
+def _webdav_find_existing_variant(client, remote_path: str) -> str:
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            if client.check(candidate):
+                return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise FileNotFoundError(remote_path)
+
+
 def _webdav_upload_with_variants(client, remote_path: str, local_path: str):
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
@@ -3928,7 +3941,7 @@ def _webdav_ensure_remote_dir(client, remote_dir: str):
     for part in [p for p in normalized.split("/") if p]:
         current = f"{current}/{part}" if current else part
         try:
-            _webdav_try_variants(lambda path: client.check(path), current)
+            _webdav_find_existing_variant(client, current)
             continue
         except Exception:
             pass
@@ -3985,7 +3998,7 @@ def webdav_list_archives(cfg: dict, game_name: str) -> list:
     try:
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         try:
-            archive_dir, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
+            archive_dir = _webdav_find_existing_variant(client, archive_dir)
         except Exception:
             return []
         items = client.list(archive_dir)
@@ -4010,7 +4023,7 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
             return None
         latest_name = archives[-1]
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        archive_dir, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
+        archive_dir = _webdav_find_existing_variant(client, archive_dir)
 
         # 解析时间戳 -> 本地 YYYY-MM 子目录
         ts_part = latest_name.replace(".zip", "")
