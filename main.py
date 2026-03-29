@@ -3950,26 +3950,34 @@ def _webdav_ensure_remote_dir(client, remote_dir: str):
     current = ""
     for part in [p for p in normalized.split("/") if p]:
         current = f"{current}/{part}" if current else part
-        try:
-            _webdav_find_existing_variant(client, current)
-            continue
-        except Exception:
-            pass
-        try:
-            _webdav_try_variants(lambda path: client.mkdir(path), current)
-        except Exception:
-            err_text = str(sys.exc_info()[1] or "").lower()
-            if any(token in err_text for token in (
-                "already exists",
-                "file exists",
-                "405",
-                "301",
-                "302",
-                "method not allowed",
-                "conflict",
-            )):
-                continue
-            raise
+        last_error = None
+        created = False
+        for candidate in _webdav_path_variants(current):
+            try:
+                result = client.mkdir(candidate)
+                if result is False:
+                    last_error = RuntimeError(f"mkdir returned False for {candidate}")
+                    continue
+                created = True
+                break
+            except Exception as e:
+                err_text = str(e).lower()
+                if any(token in err_text for token in (
+                    "already exists",
+                    "file exists",
+                    "405",
+                    "301",
+                    "302",
+                    "method not allowed",
+                    "conflict",
+                )):
+                    created = True
+                    break
+                last_error = e
+        if not created:
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"unable to create remote directory: {current}")
 
 
 def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> tuple[bool, str]:
