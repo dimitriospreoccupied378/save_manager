@@ -3894,6 +3894,32 @@ def _webdav_try_variants(func, remote_path: str):
     raise RuntimeError("invalid_webdav_path")
 
 
+def _webdav_upload_with_variants(client, remote_path: str, local_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            client.upload_sync(remote_path=candidate, local_path=local_path)
+            return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_upload_path")
+
+
+def _webdav_download_with_variants(client, remote_path: str, local_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            client.download_sync(remote_path=candidate, local_path=local_path)
+            return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_download_path")
+
+
 def _webdav_ensure_remote_dir(client, remote_dir: str):
     normalized = str(remote_dir or "").strip().strip("/")
     if not normalized:
@@ -3931,16 +3957,19 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
     try:
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         _webdav_ensure_remote_dir(client, archive_dir)
-        archive_dir_variant, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
-        client.upload_sync(
-            remote_path=f"{archive_dir_variant.rstrip('/')}/{zip_name}",
-            local_path=local_zip)
+        archive_dir_variant = _webdav_upload_with_variants(
+            client,
+            f"{archive_dir.rstrip('/')}/{zip_name}",
+            local_zip,
+        ).rsplit("/", 1)[0]
         try:
-            client.upload_sync(
-                remote_path=f"{archive_dir_variant.rstrip('/')}/{meta_name}",
-                local_path=local_meta)
+            _webdav_upload_with_variants(
+                client,
+                f"{archive_dir_variant.rstrip('/')}/{meta_name}",
+                local_meta,
+            )
         except Exception:
             pass
         return True, ""
@@ -3994,14 +4023,15 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
             return None  # 已经是最新
 
         remote_zip = f"{archive_dir.rstrip('/')}/{latest_name}"
-        client.download_sync(remote_path=remote_zip, local_path=str(local_zip))
+        _webdav_download_with_variants(client, remote_zip, str(local_zip))
 
         # 也下载 meta 文件
         meta_name = latest_name + ".meta.json"
         try:
-            client.download_sync(
-                remote_path=f"{archive_dir.rstrip('/')}/{meta_name}",
-                local_path=str(month_dir / meta_name))
+            _webdav_download_with_variants(
+                client,
+                f"{archive_dir.rstrip('/')}/{meta_name}",
+                str(month_dir / meta_name))
         except Exception:
             pass
         return str(local_zip)
