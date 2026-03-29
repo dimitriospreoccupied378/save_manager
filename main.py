@@ -3514,8 +3514,8 @@ def enforce_sync_archive_limits(sync_game_dir: Path, keep_count: int = 3):
 def enforce_all_sync_archive_limits(cfg: Optional[dict]):
     if not cfg:
         return
-    sync_folder = str(cfg.get("sync_folder", "") or "").strip()
-    if not sync_folder or not os.path.isdir(sync_folder):
+    sync_folder = get_effective_sync_root(str(cfg.get("sync_folder", "") or "").strip(), cfg, ensure=True)
+    if not sync_folder:
         return
     try:
         keep_count = max(0, int(cfg.get("sync_archive_keep", 3)))
@@ -3735,6 +3735,43 @@ def _webdav_base_path(cfg: Optional[dict]) -> str:
     if not raw.startswith("/"):
         raw = "/" + raw
     return raw.rstrip("/") or "/SteamSaveSync"
+
+
+def webdav_is_ready(cfg: Optional[dict]) -> bool:
+    if not cfg or not HAS_WEBDAV or not cfg.get("webdav_enabled"):
+        return False
+    return bool(str(cfg.get("webdav_url", "") or "").strip())
+
+
+def get_effective_sync_root(sync_folder: str, cfg: Optional[dict] = None,
+                            ensure: bool = False) -> str:
+    local_root = str(sync_folder or "").strip()
+    if local_root and os.path.isdir(local_root):
+        return local_root
+    if webdav_is_ready(cfg):
+        cache_root = CONFIG_DIR / "webdav_sync_cache"
+        if ensure:
+            cache_root.mkdir(parents=True, exist_ok=True)
+        return str(cache_root)
+    return ""
+
+
+def has_sync_backend(sync_folder: str, cfg: Optional[dict] = None) -> bool:
+    return bool(get_effective_sync_root(sync_folder, cfg, ensure=False))
+
+
+def get_sync_backend_issue(sync_folder: str, cfg: Optional[dict] = None) -> str:
+    local_root = str(sync_folder or "").strip()
+    if local_root and os.path.isdir(local_root):
+        return ""
+    if cfg and cfg.get("webdav_enabled"):
+        if not HAS_WEBDAV:
+            return "webdav_component_missing"
+        if not str(cfg.get("webdav_url", "") or "").strip():
+            return "webdav_url_missing"
+    if local_root:
+        return "sync_folder_missing"
+    return "not_configured"
 
 
 def webdav_test_connection(url: str, username: str, password: str) -> tuple:
@@ -4126,7 +4163,8 @@ def clear_sync_retry(cfg: Optional[dict], game: dict, mode: Optional[str] = None
 def run_sync_retries(cfg: Optional[dict], sync_folder: str,
                      log_cb=None) -> list[tuple[str, str]]:
     """重试此前排队的自动同步任务。"""
-    if not cfg or not sync_folder or not os.path.isdir(sync_folder):
+    effective_root = get_effective_sync_root(sync_folder, cfg, ensure=True)
+    if not cfg or not effective_root:
         return []
     q = list(get_sync_retry_queue(cfg))
     if not q:
@@ -4141,7 +4179,7 @@ def run_sync_retries(cfg: Optional[dict], sync_folder: str,
             continue
         mode = item.get("mode", "upload")
         try:
-            result = sync_game_save(game, sync_folder, mode, auto=True, cfg=cfg)
+            result = sync_game_save(game, effective_root, mode, auto=True, cfg=cfg)
             results.append((game["name"], result))
             if log_cb:
                 log_cb(bilingual_cfg(
@@ -4226,13 +4264,31 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     if not configured_paths:
         fallback = str(game.get("save_path", "") or "").strip()
         configured_specs = [_default_save_spec(fallback)] if fallback else []
-        configured_paths = [spec["base"] for spec in configured_specs]
+    configured_paths = [spec["base"] for spec in configured_specs]
     if not configured_paths:
         return bilingual_text(lang, "跳过：存档路径不存在", "Skipped: save path does not exist")
-    if not sync_folder or not os.path.isdir(sync_folder):
-        return bilingual_text(lang, "跳过：同步文件夹不存在", "Skipped: sync folder does not exist")
+    effective_sync_root = get_effective_sync_root(sync_folder, cfg, ensure=True)
+    if not effective_sync_root:
+        issue = get_sync_backend_issue(sync_folder, cfg)
+        if issue == "webdav_component_missing":
+            return bilingual_text(
+                lang,
+                "跳过：WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件",
+                "Skipped: WebDAV is enabled, but webdavclient3 is unavailable in the current runtime",
+            )
+        if issue == "webdav_url_missing":
+            return bilingual_text(
+                lang,
+                "跳过：WebDAV 已启用，但服务器地址为空",
+                "Skipped: WebDAV is enabled, but the server URL is empty",
+            )
+        return bilingual_text(
+            lang,
+            "跳过：同步目录与 WebDAV 均不可用",
+            "Skipped: neither a sync folder nor WebDAV is available",
+        )
 
-    dest_dir = get_sync_game_dir(sync_folder, game["name"])
+    dest_dir = get_sync_game_dir(effective_sync_root, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # WebDAV: 同步前从远程拉取最新存档到本地缓存
@@ -5037,21 +5093,21 @@ class GameProcessMonitor:
             g.get("appid"): g
             for g in self.cfg.get("games", []) if g.get("appid")
         }
-        sync_folder = self.cfg.get("sync_folder", "")
+        sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
         def _log(msg: str):
             _ts_log = datetime.datetime.now().strftime("%H:%M:%S")
             self.sync_log.append(f"[{_ts_log}] {msg}")
             self.sync_log = self.sync_log[-50:]
 
-        run_sync_retries(self.cfg, sync_folder, log_cb=_log)
+        run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
 
         # 初始扫描，记录已在运行的游戏并立即触发一次下载同步
         self._running_games = self._find_running_games()
         _ts = datetime.datetime.now().strftime("%H:%M:%S")
         self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
             self.cfg,
-            f"📂 同步目录: {sync_folder or '未设置'}",
-            f"📂 Sync folder: {sync_folder or 'Not set'}",
+            f"📂 同步后端: {sync_folder or '未设置'}",
+            f"📂 Sync backend: {sync_folder or 'Not set'}",
         ))
         if self._running_games:
             _names = [game_by_appid.get(a, {}).get("name", a) for a in self._running_games]
@@ -5100,10 +5156,10 @@ class GameProcessMonitor:
                 break
 
             # 重新加载配置（可能有新游戏添加）
-            sync_folder = self.cfg.get("sync_folder", "")
+            sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
             if not sync_folder:
                 continue
-            run_sync_retries(self.cfg, sync_folder, log_cb=_log)
+            run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
             game_by_appid = {
                 g.get("appid"): g
                 for g in self.cfg.get("games", []) if g.get("appid")
@@ -6908,7 +6964,8 @@ class SteamSaveManager(ctk.CTk):
         try:
             sync_enabled = self.cfg.get("sync_enabled", False)
             sync_mode = self.cfg.get("sync_mode", "")
-            sync_folder = self.cfg.get("sync_folder", "")
+            sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=False)
+            sync_issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
             if not sync_enabled:
                 self._detail_sync_monitor_status.configure(text=self.bi("同步功能未启用，请在设置中开启", "Sync is disabled. Enable it in Settings."))
                 self._detail_sync_badge.configure(
@@ -6928,7 +6985,13 @@ class SteamSaveManager(ctk.CTk):
                 self._detail_sync_badge.configure(
                     text=self.bi("⏸ 非智能", "⏸ Non-smart"), text_color=("#d97706", "#fbbf24"))
             elif not sync_folder:
-                self._detail_sync_monitor_status.configure(text=self.bi("同步目录与 WebDAV 均未配置，请在设置中启用其中一种", "Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
+                if sync_issue == "webdav_component_missing":
+                    status_text = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+                elif sync_issue == "webdav_url_missing":
+                    status_text = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+                else:
+                    status_text = self.bi("同步目录与 WebDAV 均未配置，请在设置中启用其中一种", "Neither a sync folder nor WebDAV is configured. Enable one in Settings.")
+                self._detail_sync_monitor_status.configure(text=status_text)
                 self._detail_sync_badge.configure(
                     text=self.bi("⚠ 未配置", "⚠ Not Configured"), text_color=("#dc2626", "#fca5a5"))
             elif self._game_monitor and self._game_monitor._thread and self._game_monitor._thread.is_alive():
@@ -7049,7 +7112,7 @@ class SteamSaveManager(ctk.CTk):
         try:
             result = sync_game_save(
                 game,
-                self.cfg.get("sync_folder", ""),
+                get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True),
                 mode,
                 cfg=self.cfg
             )
@@ -7094,9 +7157,15 @@ class SteamSaveManager(ctk.CTk):
                 lines.append(self.bi(f"⚠ 当前同步模式为「{self.cfg.get('sync_mode', '?')}」，",
                                      f"⚠ Current sync mode is \"{self.cfg.get('sync_mode', '?')}\","))
                 lines.append(self.bi("   智能云存档需要设为「smart」模式。", "   Smart Cloud Save requires the \"smart\" mode."))
-            elif not self.cfg.get("sync_folder"):
+            elif not has_sync_backend(self.cfg.get("sync_folder", ""), self.cfg):
                 lines.append("")
-                lines.append(self.bi("⚠ 同步目录与 WebDAV 均未配置，请在设置中启用其中一种。", "⚠ Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
+                issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+                if issue == "webdav_component_missing":
+                    lines.append(self.bi("⚠ WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件。", "⚠ WebDAV is enabled, but webdavclient3 is unavailable in the current runtime."))
+                elif issue == "webdav_url_missing":
+                    lines.append(self.bi("⚠ WebDAV 已启用，但服务器地址为空。", "⚠ WebDAV is enabled, but the server URL is empty."))
+                else:
+                    lines.append(self.bi("⚠ 同步目录与 WebDAV 均未配置，请在设置中启用其中一种。", "⚠ Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
             elif not self._game_monitor:
                 lines.append("")
                 lines.append(self.bi("⚠ 同步监控未启动，请尝试重启应用。", "⚠ Sync monitoring is not running. Try restarting the app."))
@@ -8462,9 +8531,16 @@ class SteamSaveManager(ctk.CTk):
         if self._io_busy: return
         sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
         if not sf:
+            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+            if issue == "webdav_component_missing":
+                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+            elif issue == "webdav_url_missing":
+                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+            else:
+                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
             self._show_warning(
                 self.bi("提示", "Notice"),
-                self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync"),
+                msg,
             )
             return
         games = self.cfg.get("games", [])
@@ -8501,9 +8577,16 @@ class SteamSaveManager(ctk.CTk):
         g = dict(self.cfg["games"][idx])
         sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
         if not sf:
+            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+            if issue == "webdav_component_missing":
+                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+            elif issue == "webdav_url_missing":
+                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+            else:
+                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
             self._show_warning(
                 self.bi("提示", "Notice"),
-                self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync"),
+                msg,
             )
             return
         mode = self.cfg.get("sync_mode", "bidirectional")
@@ -8585,8 +8668,7 @@ class SteamSaveManager(ctk.CTk):
             if self._sync_stop.is_set():
                 break
             try:
-                sf = self.cfg.get("sync_folder", "")
-                run_sync_retries(self.cfg, sf)
+                run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""))
                 results = sync_all_games(self.cfg, auto=True)
                 for game in self.cfg.get("games", []):
                     state = get_game_sync_state(self.cfg, game)
