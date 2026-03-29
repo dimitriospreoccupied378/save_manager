@@ -1,6 +1,6 @@
 {
-  "sha256": "f41cdd52f5989e2bc5669507c1261233ce2873724cce7a3a93c245193db8f123",
   "url": "https://github.com/Kiowx/save_manager/releases/download/v1.2.7/SteamSaveManager.exe",
   "notes": "1. 支持将存档自动同步到任意 WebDAV 兼容的云存储服务（如NAS、坚果云、NextCloud、Synology 等），实现多设备间的存档同步，同时与同步文件夹不冲突，开启方法：设置 - WebDev远程同步\n2. 修复WebDev与本地映射同步文件夹冲突的问题\n3. 新增WebDev自定义同步目录\n4. 持续修复部分steamdb模式存档识别问题\n5. 修复设置页拖动时出现的拖影问题\n6. 修复博德之门 3 存档路径丢失问题，合并 PlayerProfiles 与根目录两条路径；删除只狼冗余重复条目\n7. 备份、还原、删除备份、同步等 11 个 IO 操作全部移入后台线程，操作期间界面保持响应\n8. 一键备份时窗口标题实时显示进度（如 \"备份中 3/10...\"）\n9. 将 compute_save_spec_hash 和 compute_dir_hash 中重复的 64KB 分块哈希逻辑合并为 _streaming_file_hash 公共函数\n10. 新增 _io_busy 防重复触发机制，防止 IO 操作进行中重复点击",
+  "sha256": "8cdbbcb23fb9639cf7861debc365977387ee9f9f0703847c3021090842d50f2e",
   "version": "1.2.7"
 }
