@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """Steam 游戏存档备份管理器 v1.2.6 — 通用版"""
 
-
 import os
 import sys
 import json
@@ -70,8 +69,10 @@ except ImportError:
 try:
     from webdav3.client import Client as WebDAVClient
     HAS_WEBDAV = True
-except ImportError:
+    WEBDAV_IMPORT_ERROR = ""
+except ImportError as exc:
     HAS_WEBDAV = False
+    WEBDAV_IMPORT_ERROR = str(exc)
 #  常量与路径
 # ══════════════════════════════════════════════
 
@@ -167,7 +168,7 @@ TRANSLATIONS = {
         "webdav_testing": "正在测试连接…",
         "webdav_test_ok": "连接成功！",
         "webdav_test_fail": "连接失败",
-        "webdav_missing": "未安装 webdavclient3，请运行 pip install webdavclient3",
+        "webdav_missing": "WebDAV 组件不可用，请运行 pip install webdavclient3",
         "minimize_tray": "关闭时最小化到托盘",
         "minimize_tray_desc": "关闭窗口时最小化到系统托盘后台运行",
         "tray_missing": "⚠ 未安装 pystray，pip install pystray",
@@ -270,7 +271,7 @@ TRANSLATIONS = {
         "webdav_testing": "Testing connection...",
         "webdav_test_ok": "Connection successful!",
         "webdav_test_fail": "Connection failed",
-        "webdav_missing": "webdavclient3 not installed. Run: pip install webdavclient3",
+        "webdav_missing": "WebDAV component unavailable. Run: pip install webdavclient3",
         "minimize_tray": "Close to System Tray",
         "minimize_tray_desc": "When closing the window, keep the app running in the tray",
         "tray_missing": "⚠ pystray is not installed. Run: pip install pystray",
@@ -3725,7 +3726,7 @@ def _webdav_make_client(cfg: dict):
 def webdav_test_connection(url: str, username: str, password: str) -> tuple:
     """测试 WebDAV 连接，返回 (success: bool, message: str)"""
     if not HAS_WEBDAV:
-        return False, "webdavclient3 not installed"
+        return False, f"WebDAV import failed: {WEBDAV_IMPORT_ERROR or 'webdavclient3 not installed'}"
     try:
         client = WebDAVClient({
             "webdav_hostname": url.strip().rstrip("/"),
