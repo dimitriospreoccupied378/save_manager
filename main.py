@@ -89,6 +89,15 @@ LANGUAGE_NAMES = {
     "zh-CN": "简体中文",
     "en": "English",
 }
+WEBDAV_PRESET_OPTIONS = ("generic", "synology", "qnap", "truenas", "nextcloud", "openmediavault")
+WEBDAV_PRESET_SUFFIXES = {
+    "generic": "",
+    "synology": "/webdav",
+    "qnap": "/webdav",
+    "truenas": "/dav",
+    "nextcloud": "",
+    "openmediavault": "",
+}
 TRANSLATIONS = {
     "zh-CN": {
         "product_title": "Steam 存档管家",
@@ -160,12 +169,22 @@ TRANSLATIONS = {
         "sync_archive_keep_suffix": "个最新 ZIP（0 = 不限）",
         "sync_notify": "同步完成后发送 Windows 桌面通知",
         "webdav_enable": "WebDAV 远程同步",
+        "webdav_preset": "NAS / WebDAV 预设",
+        "webdav_preset_generic": "通用 WebDAV",
+        "webdav_preset_synology": "群晖 Synology",
+        "webdav_preset_qnap": "威联通 QNAP",
+        "webdav_preset_truenas": "TrueNAS",
+        "webdav_preset_nextcloud": "Nextcloud",
+        "webdav_preset_openmediavault": "OpenMediaVault",
+        "webdav_preset_hint": "常见地址：{hint}",
         "webdav_url": "WebDAV 服务器地址",
         "webdav_url_ph": "https://your-server.com/dav",
         "webdav_base_path": "WebDAV 远端目录",
         "webdav_base_path_ph": "/SteamSaveSync",
         "webdav_username": "用户名",
         "webdav_password": "密码",
+        "webdav_verify_ssl": "证书校验",
+        "webdav_verify_ssl_desc": "开启 HTTPS 证书校验；NAS 使用自签名证书时可关闭",
         "webdav_test": "测试连接",
         "webdav_testing": "正在测试连接…",
         "webdav_test_ok": "连接成功！",
@@ -265,12 +284,22 @@ TRANSLATIONS = {
         "sync_archive_keep_suffix": "latest ZIP archives (0 = unlimited)",
         "sync_notify": "Send a Windows desktop notification after sync completes",
         "webdav_enable": "WebDAV Remote Sync",
+        "webdav_preset": "NAS / WebDAV Preset",
+        "webdav_preset_generic": "Generic WebDAV",
+        "webdav_preset_synology": "Synology",
+        "webdav_preset_qnap": "QNAP",
+        "webdav_preset_truenas": "TrueNAS",
+        "webdav_preset_nextcloud": "Nextcloud",
+        "webdav_preset_openmediavault": "OpenMediaVault",
+        "webdav_preset_hint": "Typical endpoint: {hint}",
         "webdav_url": "Server URL",
         "webdav_url_ph": "https://your-server.com/dav",
         "webdav_base_path": "Remote Folder",
         "webdav_base_path_ph": "/SteamSaveSync",
         "webdav_username": "Username",
         "webdav_password": "Password",
+        "webdav_verify_ssl": "Certificate Verification",
+        "webdav_verify_ssl_desc": "Enable HTTPS certificate verification; disable this for self-signed NAS certificates",
         "webdav_test": "Test Connection",
         "webdav_testing": "Testing connection...",
         "webdav_test_ok": "Connection successful!",
@@ -3158,10 +3187,12 @@ def load_config() -> dict:
         "minimize_to_tray": True,
         "sync_notify": True,
         "webdav_enabled": False,
+        "webdav_preset": "generic",
         "webdav_url": "",
         "webdav_base_path": "/SteamSaveSync",
         "webdav_username": "",
         "webdav_password": "",
+        "webdav_verify_ssl": True,
         "max_backups_per_game": 20,
         "max_backup_size_gb": 10.0,
         "backup_path": "",
@@ -3718,14 +3749,20 @@ def _webdav_decode_password(encoded: str) -> str:
 def _webdav_make_client(cfg: dict):
     if not HAS_WEBDAV or not cfg.get("webdav_enabled"):
         return None
-    url = str(cfg.get("webdav_url", "") or "").strip().rstrip("/")
+    url = _webdav_normalize_url(
+        str(cfg.get("webdav_url", "") or "").strip(),
+        str(cfg.get("webdav_preset", "generic") or "generic").strip(),
+        str(cfg.get("webdav_username", "") or "").strip(),
+    )
     if not url:
         return None
-    return WebDAVClient({
+    client = WebDAVClient({
         "webdav_hostname": url,
         "webdav_login": str(cfg.get("webdav_username", "") or "").strip(),
         "webdav_password": _webdav_decode_password(cfg.get("webdav_password", "")),
     })
+    _webdav_apply_client_options(client, cfg)
+    return client
 
 
 def _webdav_base_path(cfg: Optional[dict]) -> str:
@@ -3735,6 +3772,42 @@ def _webdav_base_path(cfg: Optional[dict]) -> str:
     if not raw.startswith("/"):
         raw = "/" + raw
     return raw.rstrip("/") or "/SteamSaveSync"
+
+
+def _webdav_normalize_url(url: str, preset: str = "generic", username: str = "") -> str:
+    raw = str(url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except Exception:
+        return raw
+    if not parts.scheme or not parts.netloc:
+        return raw
+    path = parts.path or ""
+    preset_key = preset if preset in WEBDAV_PRESET_OPTIONS else "generic"
+    if not path or path == "/":
+        suffix = WEBDAV_PRESET_SUFFIXES.get(preset_key, "")
+        if preset_key in ("nextcloud", "openmediavault") and username:
+            suffix = f"/remote.php/dav/files/{urllib.parse.quote(username)}"
+        if suffix:
+            parts = parts._replace(path=suffix)
+            return urllib.parse.urlunsplit(parts).rstrip("/")
+    return raw
+
+
+def _webdav_apply_client_options(client, cfg: Optional[dict]):
+    verify_ssl = bool((cfg or {}).get("webdav_verify_ssl", True))
+    try:
+        client.verify = verify_ssl
+    except Exception:
+        pass
+    try:
+        session = getattr(client, "session", None)
+        if session is not None:
+            session.verify = verify_ssl
+    except Exception:
+        pass
 
 
 def webdav_is_ready(cfg: Optional[dict]) -> bool:
@@ -3774,16 +3847,18 @@ def get_sync_backend_issue(sync_folder: str, cfg: Optional[dict] = None) -> str:
     return "not_configured"
 
 
-def webdav_test_connection(url: str, username: str, password: str) -> tuple:
+def webdav_test_connection(url: str, username: str, password: str,
+                           preset: str = "generic", verify_ssl: bool = True) -> tuple:
     """测试 WebDAV 连接，返回 (success: bool, message: str)"""
     if not HAS_WEBDAV:
         return False, f"WebDAV import failed: {WEBDAV_IMPORT_ERROR or 'webdavclient3 not installed'}"
     try:
         client = WebDAVClient({
-            "webdav_hostname": url.strip().rstrip("/"),
+            "webdav_hostname": _webdav_normalize_url(url.strip(), preset, username),
             "webdav_login": username.strip(),
             "webdav_password": password,
         })
+        _webdav_apply_client_options(client, {"webdav_verify_ssl": verify_ssl})
         client.check()
         return True, "OK"
     except Exception as e:
@@ -8214,46 +8289,73 @@ class SteamSaveManager(ctk.CTk):
         self._webdav_fields.grid(row=18, column=0, padx=22, pady=(6, 18), sticky="ew")
         self._webdav_fields.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_url"), font=font(12, "bold")).grid(
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_preset"), font=font(12, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 2))
+        self._webdav_preset_var = ctk.StringVar(
+            value=self._webdav_preset_display(self.cfg.get("webdav_preset", "generic")))
+        self._webdav_preset_menu = ctk.CTkOptionMenu(
+            self._webdav_fields,
+            variable=self._webdav_preset_var,
+            values=[self._webdav_preset_display(code) for code in WEBDAV_PRESET_OPTIONS],
+            width=220, font=font(12), command=self._on_webdav_preset_change)
+        self._webdav_preset_menu.grid(row=1, column=0, sticky="w", pady=(0, 6))
+        self._webdav_preset_hint = ctk.CTkLabel(
+            self._webdav_fields,
+            text="",
+            font=font(11),
+            text_color=C_SUBTLE_TEXT)
+        self._webdav_preset_hint.grid(row=2, column=0, sticky="w", pady=(0, 8))
+
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_url"), font=font(12, "bold")).grid(
+            row=3, column=0, sticky="w", pady=(0, 2))
         self._webdav_url_e = ctk.CTkEntry(
             self._webdav_fields, font=font(12),
             placeholder_text=self.t("webdav_url_ph"))
         self._webdav_url_e.insert(0, self.cfg.get("webdav_url", ""))
-        self._webdav_url_e.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_url_e.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_url_e, self._apply_webdav_url)
 
         ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_base_path"), font=font(12, "bold")).grid(
-            row=2, column=0, sticky="w", pady=(0, 2))
+            row=5, column=0, sticky="w", pady=(0, 2))
         self._webdav_base_path_e = ctk.CTkEntry(
             self._webdav_fields, font=font(12),
             placeholder_text=self.t("webdav_base_path_ph"))
         self._webdav_base_path_e.insert(0, self.cfg.get("webdav_base_path", "/SteamSaveSync"))
-        self._webdav_base_path_e.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_base_path_e.grid(row=6, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_base_path_e, self._apply_webdav_base_path)
 
         ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_username"), font=font(12, "bold")).grid(
-            row=4, column=0, sticky="w", pady=(0, 2))
+            row=7, column=0, sticky="w", pady=(0, 2))
         self._webdav_user_e = ctk.CTkEntry(self._webdav_fields, font=font(12))
         self._webdav_user_e.insert(0, self.cfg.get("webdav_username", ""))
-        self._webdav_user_e.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_user_e.grid(row=8, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_user_e, self._apply_webdav_user)
 
         ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_password"), font=font(12, "bold")).grid(
-            row=6, column=0, sticky="w", pady=(0, 2))
+            row=9, column=0, sticky="w", pady=(0, 2))
         self._webdav_pass_e = ctk.CTkEntry(self._webdav_fields, font=font(12), show="*")
         self._webdav_pass_e.insert(0, _webdav_decode_password(self.cfg.get("webdav_password", "")))
-        self._webdav_pass_e.grid(row=7, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_pass_e.grid(row=10, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_pass_e, self._apply_webdav_pass)
 
+        self._webdav_verify_ssl_var = ctk.StringVar(
+            value="on" if self.cfg.get("webdav_verify_ssl", True) else "off")
+        ctk.CTkSwitch(
+            self._webdav_fields,
+            text=self.t("webdav_verify_ssl_desc"),
+            variable=self._webdav_verify_ssl_var, onvalue="on", offvalue="off",
+            font=font(12), command=self._toggle_webdav_verify_ssl
+        ).grid(row=11, column=0, sticky="w", pady=(0, 10))
+
         webdav_btn_row = _row(self._webdav_fields)
-        webdav_btn_row.grid(row=8, column=0, sticky="w")
+        webdav_btn_row.grid(row=12, column=0, sticky="w")
         ctk.CTkButton(webdav_btn_row, text=self.t("webdav_test"), width=120, font=font(12),
                       fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
                       command=self._test_webdav_connection).pack(side="left")
         self._webdav_status = ctk.CTkLabel(
             webdav_btn_row, text="", font=font(11), text_color=C_SUBTLE_TEXT)
         self._webdav_status.pack(side="left", padx=(10, 0))
+        self._refresh_webdav_preset_hint()
 
         if not self.cfg.get("webdav_enabled"):
             self._webdav_fields.grid_remove()
@@ -8429,6 +8531,43 @@ class SteamSaveManager(ctk.CTk):
         save_config(self.cfg)
 
     # ─── WebDAV 设置 ───
+    def _webdav_preset_display(self, preset_code: str) -> str:
+        code = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
+        return self.t(f"webdav_preset_{code}")
+
+    def _webdav_preset_code(self, display_text: str) -> str:
+        for code in WEBDAV_PRESET_OPTIONS:
+            if display_text == self._webdav_preset_display(code):
+                return code
+        return "generic"
+
+    def _webdav_hint_for_preset(self, preset_code: str, username: str = "") -> str:
+        preset = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
+        if preset == "synology":
+            return "https://nas:5006/webdav"
+        if preset == "qnap":
+            return "https://nas:5006/webdav"
+        if preset == "truenas":
+            return "https://nas/dav"
+        if preset == "nextcloud":
+            if username:
+                return f"https://cloud.example.com/remote.php/dav/files/{username}"
+            return "https://cloud.example.com/remote.php/dav/files/<username>"
+        if preset == "openmediavault":
+            if username:
+                return f"https://nas/remote.php/dav/files/{username}"
+            return "https://nas/remote.php/dav/files/<username>"
+        return "https://your-server.com/dav"
+
+    def _refresh_webdav_preset_hint(self):
+        if not hasattr(self, "_webdav_preset_hint"):
+            return
+        preset = str(self.cfg.get("webdav_preset", "generic") or "generic")
+        username = str(self.cfg.get("webdav_username", "") or "").strip()
+        self._webdav_preset_hint.configure(
+            text=self.t("webdav_preset_hint", hint=self._webdav_hint_for_preset(preset, username))
+        )
+
     def _toggle_webdav(self):
         en = self._webdav_var.get() == "on"
         self.cfg["webdav_enabled"] = en
@@ -8438,8 +8577,23 @@ class SteamSaveManager(ctk.CTk):
         else:
             self._webdav_fields.grid_remove()
 
+    def _on_webdav_preset_change(self, display_text):
+        self.cfg["webdav_preset"] = self._webdav_preset_code(display_text)
+        if hasattr(self, "_webdav_url_e"):
+            self._apply_webdav_url()
+        self._refresh_webdav_preset_hint()
+        save_config(self.cfg)
+
     def _apply_webdav_url(self):
-        self.cfg["webdav_url"] = self._webdav_url_e.get().strip()
+        normalized = _webdav_normalize_url(
+            self._webdav_url_e.get().strip(),
+            str(self.cfg.get("webdav_preset", "generic") or "generic"),
+            str(self.cfg.get("webdav_username", "") or "").strip(),
+        )
+        self.cfg["webdav_url"] = normalized
+        if hasattr(self, "_webdav_url_e"):
+            self._webdav_url_e.delete(0, "end")
+            self._webdav_url_e.insert(0, normalized)
         save_config(self.cfg)
 
     def _apply_webdav_base_path(self):
@@ -8453,10 +8607,17 @@ class SteamSaveManager(ctk.CTk):
 
     def _apply_webdav_user(self):
         self.cfg["webdav_username"] = self._webdav_user_e.get().strip()
+        if hasattr(self, "_webdav_url_e"):
+            self._apply_webdav_url()
+        self._refresh_webdav_preset_hint()
         save_config(self.cfg)
 
     def _apply_webdav_pass(self):
         self.cfg["webdav_password"] = _webdav_encode_password(self._webdav_pass_e.get())
+        save_config(self.cfg)
+
+    def _toggle_webdav_verify_ssl(self):
+        self.cfg["webdav_verify_ssl"] = self._webdav_verify_ssl_var.get() == "on"
         save_config(self.cfg)
 
     def _test_webdav_connection(self):
@@ -8471,7 +8632,11 @@ class SteamSaveManager(ctk.CTk):
         self._webdav_status.configure(
             text=self.t("webdav_testing"), text_color=C_SUBTLE_TEXT)
         def _worker():
-            ok, msg = webdav_test_connection(url, user, password)
+            ok, msg = webdav_test_connection(
+                url, user, password,
+                preset=str(self.cfg.get("webdav_preset", "generic") or "generic"),
+                verify_ssl=bool(self.cfg.get("webdav_verify_ssl", True)),
+            )
             self.after(0, lambda: self._on_webdav_test_result(ok, msg))
         threading.Thread(target=_worker, daemon=True).start()
 
