@@ -3802,17 +3802,20 @@ def _webdav_ensure_remote_dir(client, remote_dir: str):
     for part in [p for p in normalized.split("/") if p]:
         current += f"/{part}"
         try:
-            client.check(current)
-            continue
-        except Exception:
-            pass
-        try:
             client.mkdir(current)
         except Exception:
-            try:
-                client.check(current)
-            except Exception:
-                raise
+            err_text = str(sys.exc_info()[1] or "").lower()
+            if any(token in err_text for token in (
+                "already exists",
+                "file exists",
+                "405",
+                "301",
+                "302",
+                "method not allowed",
+                "conflict",
+            )):
+                continue
+            raise
 
 
 def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> tuple[bool, str]:
