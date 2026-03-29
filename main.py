@@ -3794,14 +3794,35 @@ def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
     return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
 
 
-def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> bool:
-    """上传 ZIP + meta.json 到 WebDAV"""
+def _webdav_ensure_remote_dir(client, remote_dir: str):
+    normalized = "/" + str(remote_dir or "").strip().strip("/")
+    if normalized == "/":
+        return
+    current = ""
+    for part in [p for p in normalized.split("/") if p]:
+        current += f"/{part}"
+        try:
+            client.check(current)
+            continue
+        except Exception:
+            pass
+        try:
+            client.mkdir(current)
+        except Exception:
+            try:
+                client.check(current)
+            except Exception:
+                raise
+
+
+def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> tuple[bool, str]:
+    """上传 ZIP + meta.json 到 WebDAV，返回 (success, message)。"""
     client = _webdav_make_client(cfg)
     if not client:
-        return False
+        return False, "client_unavailable"
     try:
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        client.mkdir(archive_dir)
+        _webdav_ensure_remote_dir(client, archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
         client.upload_sync(
@@ -3813,9 +3834,9 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
                 local_path=local_meta)
         except Exception:
             pass
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def webdav_list_archives(cfg: dict, game_name: str) -> list:
@@ -4290,6 +4311,18 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
 
     dest_dir = get_sync_game_dir(effective_sync_root, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
+    webdav_active = bool(cfg and cfg.get("webdav_enabled"))
+    webdav_error = ""
+
+    def _with_webdav_status(message: str) -> str:
+        nonlocal webdav_error
+        if not webdav_error:
+            return message
+        return message + bilingual_text(
+            lang,
+            f"；但 WebDAV 上传失败（{webdav_error}）",
+            f"; however, WebDAV upload failed ({webdav_error})",
+        )
 
     # WebDAV: 同步前从远程拉取最新存档到本地缓存
     if cfg and cfg.get("webdav_enabled") and HAS_WEBDAV:
@@ -4361,6 +4394,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                         pass
 
     def _create_remote_archive():
+        nonlocal webdav_error
         keep_count = 3
         if cfg:
             try:
@@ -4371,11 +4405,15 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             game, dest_dir, configured_specs, local_info, keep_count=keep_count
         )
         # WebDAV: 上传存档到远程
-        if cfg and cfg.get("webdav_enabled") and HAS_WEBDAV and archive_path:
-            try:
-                webdav_upload_archive(cfg, str(archive_path), str(meta_path), game["name"])
-            except Exception:
-                pass
+        if webdav_active and archive_path:
+            if not HAS_WEBDAV:
+                webdav_error = WEBDAV_IMPORT_ERROR or "webdavclient3 not installed"
+            else:
+                ok, upload_msg = webdav_upload_archive(cfg, str(archive_path), str(meta_path), game["name"])
+                if not ok:
+                    webdav_error = upload_msg or "upload_failed"
+                else:
+                    webdav_error = ""
         return archive_path
 
     def _download_remote_payload():
@@ -4419,11 +4457,11 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         _create_remote_archive()
         create_backup(game, sync_tag)
         _record_synced(local_hash, "upload")
-        return bilingual_text(
+        return _with_webdav_status(bilingual_text(
             lang,
             f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
             f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
-        )
+        ))
     if mode == "download":
         if remote_count == 0:
             return bilingual_text(lang, "跳过：同步文件夹中无存档", "Skipped: no save files were found in the sync folder")
@@ -4449,11 +4487,11 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             _create_remote_archive()
             create_backup(game, sync_tag)
             _record_synced(local_hash, "upload")
-            return bilingual_text(
+            return _with_webdav_status(bilingual_text(
                 lang,
                 f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
                 f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
-            )
+            ))
         if local_hash == remote_hash:
             _record_current()
             return bilingual_text(lang, "跳过：两端存档已一致", "Skipped: both sides are already identical")
@@ -4465,11 +4503,11 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                 _create_remote_archive()
                 create_backup(game, sync_tag)
                 _record_synced(local_hash, "upload")
-                return bilingual_text(
+                return _with_webdav_status(bilingual_text(
                     lang,
                     f"↑ 已上传 ZIP（本地 → 云端），共 {local_count} 个文件",
                     f"↑ Uploaded ZIP archive (local → cloud), {local_count} files",
-                )
+                ))
             if remote_changed and not local_changed:
                 create_backup(game, pre_sync_backup_tag)
                 _download_remote_payload()
