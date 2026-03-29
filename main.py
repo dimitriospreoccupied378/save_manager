@@ -3709,6 +3709,52 @@ def get_remote_sync_payload(sync_game_dir: Path, path_count: int) -> Optional[di
     return get_legacy_sync_snapshot(sync_game_dir, path_count)
 
 
+def _prune_webdav_cache_payload(sync_game_dir: Path, latest_name: Optional[str] = None):
+    """仅在 WebDAV 独立缓存模式下使用，使本地缓存贴近远端实际状态。"""
+    archive_root = get_sync_archive_root(sync_game_dir)
+    keep_names = set()
+    if latest_name:
+        keep_names.add(latest_name)
+        keep_names.add(f"{latest_name}.meta.json")
+
+    if archive_root.exists():
+        for item in list(archive_root.rglob("*")):
+            if item.is_dir():
+                continue
+            if keep_names and item.name in keep_names:
+                continue
+            try:
+                item.unlink()
+            except Exception:
+                pass
+        for folder in sorted(
+            [p for p in archive_root.rglob("*") if p.is_dir()],
+            key=lambda p: len(p.parts),
+            reverse=True,
+        ):
+            try:
+                if not any(folder.iterdir()):
+                    folder.rmdir()
+            except Exception:
+                pass
+        try:
+            if archive_root.exists() and not any(archive_root.iterdir()):
+                archive_root.rmdir()
+        except Exception:
+            pass
+
+    for item in list(sync_game_dir.iterdir()) if sync_game_dir.exists() else []:
+        if item.name == "archives":
+            continue
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception:
+            pass
+
+
 def extract_sync_archive(archive_path: Path, target_specs_or_paths):
     if isinstance(target_specs_or_paths, list) and target_specs_or_paths and isinstance(target_specs_or_paths[0], dict):
         target_specs = get_game_save_specs({"save_specs": target_specs_or_paths}, existing_only=False)
@@ -4161,7 +4207,8 @@ def webdav_list_archives(cfg: dict, game_name: str) -> list:
         return []
 
 
-def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path) -> str | None:
+def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
+                           cache_mirror_remote: bool = False) -> str | None:
     """从 WebDAV 下载最新存档到本地缓存，返回本地 ZIP 路径或 None"""
     client = _webdav_make_client(cfg)
     if not client:
@@ -4169,8 +4216,12 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
     try:
         archives = webdav_list_archives(cfg, game_name)
         if not archives:
+            if cache_mirror_remote:
+                _prune_webdav_cache_payload(local_sync_game_dir, None)
             return None
         latest_name = archives[-1]
+        if cache_mirror_remote:
+            _prune_webdav_cache_payload(local_sync_game_dir, latest_name)
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         archive_dir = _webdav_find_existing_variant(client, archive_dir)
         remote_meta_info = {}
@@ -4669,6 +4720,8 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     dest_dir = get_sync_game_dir(effective_sync_root, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
     webdav_active = bool(cfg and cfg.get("webdav_enabled"))
+    webdav_cache_root = (CONFIG_DIR / "webdav_sync_cache")
+    using_webdav_cache = Path(effective_sync_root).resolve() == webdav_cache_root.resolve()
     webdav_error = ""
 
     def _with_webdav_status(message: str) -> str:
@@ -4684,7 +4737,12 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     # WebDAV: 同步前从远程拉取最新存档到本地缓存
     if cfg and cfg.get("webdav_enabled") and HAS_WEBDAV:
         try:
-            webdav_download_latest(cfg, game["name"], dest_dir)
+            webdav_download_latest(
+                cfg,
+                game["name"],
+                dest_dir,
+                cache_mirror_remote=using_webdav_cache,
+            )
         except Exception:
             pass
 
