@@ -5142,7 +5142,7 @@ class GameProcessMonitor:
                     self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                         self.cfg,
                         f"⚠ {g['name']} 启动，但同步目录未设置",
-                        f"⚠ {g['name']} started, but no sync folder is configured",
+                        f"⚠ {g['name']} started, but no sync backend is available",
                     ))
                 self.sync_log = self.sync_log[-50:]
 
@@ -5184,7 +5184,7 @@ class GameProcessMonitor:
                     self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                         self.cfg,
                         f"⚠ {g['name']} 关闭，但同步目录未设置",
-                        f"⚠ {g['name']} closed, but no sync folder is configured",
+                        f"⚠ {g['name']} closed, but no sync backend is available",
                     ))
                 self.sync_log = self.sync_log[-50:]
 
@@ -6928,7 +6928,7 @@ class SteamSaveManager(ctk.CTk):
                 self._detail_sync_badge.configure(
                     text=self.bi("⏸ 非智能", "⏸ Non-smart"), text_color=("#d97706", "#fbbf24"))
             elif not sync_folder:
-                self._detail_sync_monitor_status.configure(text=self.bi("同步文件夹未设置，请在设置中配置", "No sync folder is configured. Set one in Settings."))
+                self._detail_sync_monitor_status.configure(text=self.bi("同步目录与 WebDAV 均未配置，请在设置中启用其中一种", "Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
                 self._detail_sync_badge.configure(
                     text=self.bi("⚠ 未配置", "⚠ Not Configured"), text_color=("#dc2626", "#fca5a5"))
             elif self._game_monitor and self._game_monitor._thread and self._game_monitor._thread.is_alive():
@@ -7096,7 +7096,7 @@ class SteamSaveManager(ctk.CTk):
                 lines.append(self.bi("   智能云存档需要设为「smart」模式。", "   Smart Cloud Save requires the \"smart\" mode."))
             elif not self.cfg.get("sync_folder"):
                 lines.append("")
-                lines.append(self.bi("⚠ 同步文件夹未设置，请在设置中配置。", "⚠ No sync folder is configured. Set one in Settings."))
+                lines.append(self.bi("⚠ 同步目录与 WebDAV 均未配置，请在设置中启用其中一种。", "⚠ Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
             elif not self._game_monitor:
                 lines.append("")
                 lines.append(self.bi("⚠ 同步监控未启动，请尝试重启应用。", "⚠ Sync monitoring is not running. Try restarting the app."))
@@ -8460,9 +8460,13 @@ class SteamSaveManager(ctk.CTk):
 
     def _manual_sync_all(self):
         if self._io_busy: return
-        sf = self.cfg.get("sync_folder", "")
+        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
         if not sf:
-            self._show_warning("提示", "请先在设置中配置同步文件夹"); return
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync"),
+            )
+            return
         games = self.cfg.get("games", [])
         if not games:
             self._show_info("提示", "请先添加游戏"); return
@@ -8495,9 +8499,13 @@ class SteamSaveManager(ctk.CTk):
     def _manual_sync_one(self, idx):
         if self._io_busy: return
         g = dict(self.cfg["games"][idx])
-        sf = self.cfg.get("sync_folder", "")
+        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
         if not sf:
-            self._show_warning("提示", "请先在设置中配置同步文件夹"); return
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync"),
+            )
+            return
         mode = self.cfg.get("sync_mode", "bidirectional")
         game_name = g.get("name", "")
         self._set_io_busy(True)
