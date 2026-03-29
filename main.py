@@ -3756,8 +3756,10 @@ def _webdav_make_client(cfg: dict):
     )
     if not url:
         return None
+    hostname, root = _webdav_split_url(url)
     client = WebDAVClient({
-        "webdav_hostname": url,
+        "webdav_hostname": hostname,
+        "webdav_root": root,
         "webdav_login": str(cfg.get("webdav_username", "") or "").strip(),
         "webdav_password": _webdav_decode_password(cfg.get("webdav_password", "")),
     })
@@ -3794,6 +3796,19 @@ def _webdav_normalize_url(url: str, preset: str = "generic", username: str = "")
             parts = parts._replace(path=suffix)
             return urllib.parse.urlunsplit(parts).rstrip("/")
     return raw
+
+
+def _webdav_split_url(url: str) -> tuple[str, str]:
+    raw = str(url or "").strip()
+    parts = urllib.parse.urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return raw.rstrip("/"), "/"
+    hostname = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+    root = parts.path or "/"
+    if not root.startswith("/"):
+        root = "/" + root
+    root = root.rstrip("/") or "/"
+    return hostname, root
 
 
 def _webdav_apply_client_options(client, cfg: Optional[dict]):
@@ -3853,8 +3868,11 @@ def webdav_test_connection(url: str, username: str, password: str,
     if not HAS_WEBDAV:
         return False, f"WebDAV import failed: {WEBDAV_IMPORT_ERROR or 'webdavclient3 not installed'}"
     try:
+        normalized_url = _webdav_normalize_url(url.strip(), preset, username)
+        hostname, root = _webdav_split_url(normalized_url)
         client = WebDAVClient({
-            "webdav_hostname": _webdav_normalize_url(url.strip(), preset, username),
+            "webdav_hostname": hostname,
+            "webdav_root": root,
             "webdav_login": username.strip(),
             "webdav_password": password,
         })
