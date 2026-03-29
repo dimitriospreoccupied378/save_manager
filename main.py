@@ -17,6 +17,7 @@ import base64
 import fnmatch
 import queue
 import time
+import tempfile
 import locale
 import subprocess
 import urllib.request
@@ -3507,6 +3508,28 @@ def get_sync_archive_meta_path(archive_path: Path) -> Path:
     return Path(str(archive_path) + ".meta.json")
 
 
+def compute_file_sha256(file_path: Path | str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
+
+
+def validate_zip_archive(zip_path: Path | str) -> tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            bad_member = zf.testzip()
+        if bad_member:
+            return False, f"zip_crc_failed:{bad_member}"
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def enforce_sync_archive_limits(sync_game_dir: Path, keep_count: int = 3):
     if keep_count <= 0:
         return
@@ -3602,6 +3625,8 @@ def create_sync_archive(game: dict, sync_game_dir: Path,
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for _, abs_f, arcname in _iter_sync_payload_files(save_specs):
             archive.write(abs_f, arcname)
+    archive_size = int(archive_path.stat().st_size) if archive_path.exists() else 0
+    archive_sha256 = compute_file_sha256(archive_path) if archive_size else ""
     meta = {
         "version": 1,
         "game": game.get("name", ""),
@@ -3614,6 +3639,8 @@ def create_sync_archive(game: dict, sync_game_dir: Path,
         "path_count": len(save_specs),
         "paths": [os.path.normpath(spec["base"]) for spec in save_specs],
         "save_specs": _normalize_unique_save_specs(save_specs),
+        "archive_size": archive_size,
+        "archive_sha256": archive_sha256,
     }
     meta_path = get_sync_archive_meta_path(archive_path)
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -3645,6 +3672,8 @@ def get_latest_sync_archive(sync_game_dir: Path) -> Optional[dict]:
             "archive_path": archive_path,
             "meta_path": meta_path if meta_path.exists() else None,
             "hash": str(meta.get("hash", "") or ""),
+            "archive_size": int(meta.get("archive_size", archive_path.stat().st_size) or 0),
+            "archive_sha256": str(meta.get("archive_sha256", "") or "").lower(),
             "file_count": int(meta.get("file_count", 0) or 0),
             "latest_mtime": float(meta.get("latest_mtime", 0.0) or 0.0),
             "timestamp": float(meta.get("timestamp", archive_path.stat().st_mtime)),
@@ -3869,10 +3898,12 @@ def get_sync_backend_issue(sync_folder: str, cfg: Optional[dict] = None) -> str:
 
 
 def webdav_test_connection(url: str, username: str, password: str,
-                           preset: str = "generic", verify_ssl: bool = True) -> tuple:
-    """测试 WebDAV 连接，返回 (success: bool, message: str)"""
+                           preset: str = "generic", verify_ssl: bool = True,
+                           base_path: str = "/SteamSaveSync") -> tuple:
+    """测试 WebDAV 连接与写权限，返回 (success: bool, message: str)。"""
     if not HAS_WEBDAV:
         return False, f"WebDAV import failed: {WEBDAV_IMPORT_ERROR or 'webdavclient3 not installed'}"
+    temp_file_path = ""
     try:
         normalized_url = _webdav_normalize_url(url.strip(), preset, username)
         hostname, root = _webdav_split_url(normalized_url)
@@ -3882,11 +3913,35 @@ def webdav_test_connection(url: str, username: str, password: str,
             "webdav_login": username.strip(),
             "webdav_password": password,
         })
-        _webdav_apply_client_options(client, {"webdav_verify_ssl": verify_ssl})
-        client.check()
+        _webdav_apply_client_options(client, {
+            "webdav_verify_ssl": verify_ssl,
+            "webdav_preset": preset,
+        })
+
+        base_dir = _webdav_base_path({"webdav_base_path": base_path})
+        _webdav_ensure_remote_dir(client, base_dir)
+
+        probe_name = f".ssm_probe_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        probe_dir = f"{base_dir.rstrip('/')}/{probe_name}"
+        probe_file = f"{probe_dir}/probe.txt"
+        _webdav_ensure_remote_dir(client, probe_dir)
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as tmp:
+            tmp.write("Steam Save Manager WebDAV probe")
+            temp_file_path = tmp.name
+
+        _webdav_upload_with_variants(client, probe_file, temp_file_path)
+        _webdav_clean_with_variants(client, probe_file)
+        _webdav_clean_with_variants(client, probe_dir)
         return True, "OK"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+    finally:
+        if temp_file_path:
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 
 def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
@@ -3967,6 +4022,31 @@ def _webdav_download_with_variants(client, remote_path: str, local_path: str):
     raise RuntimeError("invalid_webdav_download_path")
 
 
+def _webdav_clean_with_variants(client, remote_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            client.clean(candidate)
+            return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_clean_path")
+
+
+def _webdav_info_with_variants(client, remote_path: str) -> dict:
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            return client.info(candidate)
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_info_path")
+
+
 def _webdav_ensure_remote_dir(client, remote_dir: str):
     normalized = str(remote_dir or "").strip().strip("/")
     if not normalized:
@@ -4004,6 +4084,20 @@ def _webdav_ensure_remote_dir(client, remote_dir: str):
             raise RuntimeError(f"unable to create remote directory: {current}")
 
 
+def _webdav_verify_remote_file(client, remote_path: str, expected_size: int = 0) -> tuple[bool, str]:
+    try:
+        info = _webdav_info_with_variants(client, remote_path)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    try:
+        remote_size = int(info.get("size", 0) or 0)
+    except Exception:
+        remote_size = 0
+    if expected_size and remote_size and remote_size != expected_size:
+        return False, f"remote_size_mismatch:{remote_size}!={expected_size}"
+    return True, ""
+
+
 def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> tuple[bool, str]:
     """上传 ZIP + meta.json 到 WebDAV，返回 (success, message)。"""
     client = _webdav_make_client(cfg)
@@ -4014,17 +4108,30 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
         _webdav_ensure_remote_dir(client, archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
+        expected_zip_size = int(Path(local_zip).stat().st_size) if Path(local_zip).exists() else 0
         archive_dir_variant = _webdav_upload_with_variants(
             client,
             f"{archive_dir.rstrip('/')}/{zip_name}",
             local_zip,
         ).rsplit("/", 1)[0]
+        remote_zip = f"{archive_dir_variant.rstrip('/')}/{zip_name}"
+        ok, verify_msg = _webdav_verify_remote_file(client, remote_zip, expected_zip_size)
+        if not ok:
+            return False, verify_msg or "remote_zip_verify_failed"
         try:
             _webdav_upload_with_variants(
                 client,
                 f"{archive_dir_variant.rstrip('/')}/{meta_name}",
                 local_meta,
             )
+            expected_meta_size = int(Path(local_meta).stat().st_size) if Path(local_meta).exists() else 0
+            ok, verify_msg = _webdav_verify_remote_file(
+                client,
+                f"{archive_dir_variant.rstrip('/')}/{meta_name}",
+                expected_meta_size,
+            )
+            if not ok:
+                return False, verify_msg or "remote_meta_verify_failed"
         except Exception:
             pass
         return True, ""
@@ -4066,6 +4173,15 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
         latest_name = archives[-1]
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         archive_dir = _webdav_find_existing_variant(client, archive_dir)
+        remote_meta_info = {}
+        meta_name = latest_name + ".meta.json"
+        try:
+            remote_meta_info = _webdav_info_with_variants(
+                client,
+                f"{archive_dir.rstrip('/')}/{meta_name}",
+            ) or {}
+        except Exception:
+            remote_meta_info = {}
 
         # 解析时间戳 -> 本地 YYYY-MM 子目录
         ts_part = latest_name.replace(".zip", "")
@@ -4073,22 +4189,68 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
         month_dir = get_sync_archive_root(local_sync_game_dir) / month_str
         month_dir.mkdir(parents=True, exist_ok=True)
         local_zip = month_dir / latest_name
+        local_meta = month_dir / meta_name
 
         if local_zip.exists():
-            return None  # 已经是最新
+            local_meta_data = {}
+            if local_meta.exists():
+                try:
+                    with open(local_meta, "r", encoding="utf-8") as fh:
+                        local_meta_data = json.load(fh)
+                except Exception:
+                    local_meta_data = {}
+            expected_size = int(local_meta_data.get("archive_size", 0) or 0)
+            expected_sha256 = str(local_meta_data.get("archive_sha256", "") or "").lower()
+            if expected_size and local_zip.stat().st_size == expected_size:
+                ok, zip_msg = validate_zip_archive(local_zip)
+                if ok:
+                    if not expected_sha256 or compute_file_sha256(local_zip) == expected_sha256:
+                        return None  # 已缓存且校验通过
 
         remote_zip = f"{archive_dir.rstrip('/')}/{latest_name}"
         _webdav_download_with_variants(client, remote_zip, str(local_zip))
 
         # 也下载 meta 文件
-        meta_name = latest_name + ".meta.json"
         try:
             _webdav_download_with_variants(
                 client,
                 f"{archive_dir.rstrip('/')}/{meta_name}",
-                str(month_dir / meta_name))
+                str(local_meta))
         except Exception:
             pass
+        meta_data = {}
+        if local_meta.exists():
+            try:
+                with open(local_meta, "r", encoding="utf-8") as fh:
+                    meta_data = json.load(fh)
+            except Exception:
+                meta_data = {}
+        expected_size = int(meta_data.get("archive_size", 0) or 0)
+        expected_sha256 = str(meta_data.get("archive_sha256", "") or "").lower()
+        if not expected_size and remote_meta_info.get("size"):
+            try:
+                expected_size = int(remote_meta_info.get("size", 0) or 0)
+            except Exception:
+                expected_size = 0
+        if expected_size and int(local_zip.stat().st_size) != expected_size:
+            try:
+                local_zip.unlink()
+            except Exception:
+                pass
+            return None
+        ok, zip_msg = validate_zip_archive(local_zip)
+        if not ok:
+            try:
+                local_zip.unlink()
+            except Exception:
+                pass
+            return None
+        if expected_sha256 and compute_file_sha256(local_zip) != expected_sha256:
+            try:
+                local_zip.unlink()
+            except Exception:
+                pass
+            return None
         return str(local_zip)
     except Exception:
         return None
@@ -8721,6 +8883,7 @@ class SteamSaveManager(ctk.CTk):
                 url, user, password,
                 preset=str(self.cfg.get("webdav_preset", "generic") or "generic"),
                 verify_ssl=bool(self.cfg.get("webdav_verify_ssl", True)),
+                base_path=str(self.cfg.get("webdav_base_path", "/SteamSaveSync") or "/SteamSaveSync"),
             )
             self.after(0, lambda: self._on_webdav_test_result(ok, msg))
         threading.Thread(target=_worker, daemon=True).start()
