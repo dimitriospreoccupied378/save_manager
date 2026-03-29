@@ -92,7 +92,7 @@ LANGUAGE_NAMES = {
 WEBDAV_PRESET_OPTIONS = ("generic", "synology", "qnap", "truenas", "nextcloud", "openmediavault")
 WEBDAV_PRESET_SUFFIXES = {
     "generic": "",
-    "synology": "/webdav",
+    "synology": "",
     "qnap": "/webdav",
     "truenas": "/dav",
     "nextcloud": "",
@@ -8629,7 +8629,7 @@ class SteamSaveManager(ctk.CTk):
     def _webdav_hint_for_preset(self, preset_code: str, username: str = "") -> str:
         preset = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
         if preset == "synology":
-            return "https://nas:5006/webdav"
+            return "http://nas:5005  或  https://nas:5006"
         if preset == "qnap":
             return "https://nas:5006/webdav"
         if preset == "truenas":
