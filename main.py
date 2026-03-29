@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.6 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.7 — 通用版"""
 
 import os
 import sys
@@ -77,7 +77,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.6"
+VERSION = "1.2.7"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -162,6 +162,8 @@ TRANSLATIONS = {
         "webdav_enable": "WebDAV 远程同步",
         "webdav_url": "WebDAV 服务器地址",
         "webdav_url_ph": "https://your-server.com/dav",
+        "webdav_base_path": "WebDAV 远端目录",
+        "webdav_base_path_ph": "/SteamSaveSync",
         "webdav_username": "用户名",
         "webdav_password": "密码",
         "webdav_test": "测试连接",
@@ -265,6 +267,8 @@ TRANSLATIONS = {
         "webdav_enable": "WebDAV Remote Sync",
         "webdav_url": "Server URL",
         "webdav_url_ph": "https://your-server.com/dav",
+        "webdav_base_path": "Remote Folder",
+        "webdav_base_path_ph": "/SteamSaveSync",
         "webdav_username": "Username",
         "webdav_password": "Password",
         "webdav_test": "Test Connection",
@@ -3155,6 +3159,7 @@ def load_config() -> dict:
         "sync_notify": True,
         "webdav_enabled": False,
         "webdav_url": "",
+        "webdav_base_path": "/SteamSaveSync",
         "webdav_username": "",
         "webdav_password": "",
         "max_backups_per_game": 20,
@@ -3723,6 +3728,15 @@ def _webdav_make_client(cfg: dict):
     })
 
 
+def _webdav_base_path(cfg: Optional[dict]) -> str:
+    raw = str((cfg or {}).get("webdav_base_path", "") or "").strip().replace("\\", "/")
+    if not raw:
+        raw = "/SteamSaveSync"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw.rstrip("/") or "/SteamSaveSync"
+
+
 def webdav_test_connection(url: str, username: str, password: str) -> tuple:
     """测试 WebDAV 连接，返回 (success: bool, message: str)"""
     if not HAS_WEBDAV:
@@ -3739,8 +3753,8 @@ def webdav_test_connection(url: str, username: str, password: str) -> tuple:
         return False, f"{type(e).__name__}: {e}"
 
 
-def _webdav_remote_archive_dir(game_name: str) -> str:
-    return f"/SteamSaveSync/{sanitize(game_name)}/archives"
+def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
+    return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
 
 
 def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> bool:
@@ -3749,7 +3763,7 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
     if not client:
         return False
     try:
-        archive_dir = _webdav_remote_archive_dir(game_name)
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         client.mkdir(archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
@@ -3773,7 +3787,7 @@ def webdav_list_archives(cfg: dict, game_name: str) -> list:
     if not client:
         return []
     try:
-        archive_dir = _webdav_remote_archive_dir(game_name)
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         try:
             client.check(archive_dir)
         except Exception:
@@ -3799,7 +3813,7 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
         if not archives:
             return None
         latest_name = archives[-1]
-        archive_dir = _webdav_remote_archive_dir(game_name)
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
 
         # 解析时间戳 -> 本地 YYYY-MM 子目录
         ts_part = latest_name.replace(".zip", "")
@@ -8067,22 +8081,31 @@ class SteamSaveManager(ctk.CTk):
         self._webdav_url_e.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_url_e, self._apply_webdav_url)
 
-        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_username"), font=font(12, "bold")).grid(
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_base_path"), font=font(12, "bold")).grid(
             row=2, column=0, sticky="w", pady=(0, 2))
+        self._webdav_base_path_e = ctk.CTkEntry(
+            self._webdav_fields, font=font(12),
+            placeholder_text=self.t("webdav_base_path_ph"))
+        self._webdav_base_path_e.insert(0, self.cfg.get("webdav_base_path", "/SteamSaveSync"))
+        self._webdav_base_path_e.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self._bind_entry_apply(self._webdav_base_path_e, self._apply_webdav_base_path)
+
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_username"), font=font(12, "bold")).grid(
+            row=4, column=0, sticky="w", pady=(0, 2))
         self._webdav_user_e = ctk.CTkEntry(self._webdav_fields, font=font(12))
         self._webdav_user_e.insert(0, self.cfg.get("webdav_username", ""))
-        self._webdav_user_e.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_user_e.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_user_e, self._apply_webdav_user)
 
         ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_password"), font=font(12, "bold")).grid(
-            row=4, column=0, sticky="w", pady=(0, 2))
+            row=6, column=0, sticky="w", pady=(0, 2))
         self._webdav_pass_e = ctk.CTkEntry(self._webdav_fields, font=font(12), show="*")
         self._webdav_pass_e.insert(0, _webdav_decode_password(self.cfg.get("webdav_password", "")))
-        self._webdav_pass_e.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        self._webdav_pass_e.grid(row=7, column=0, sticky="ew", pady=(0, 8))
         self._bind_entry_apply(self._webdav_pass_e, self._apply_webdav_pass)
 
         webdav_btn_row = _row(self._webdav_fields)
-        webdav_btn_row.grid(row=6, column=0, sticky="w")
+        webdav_btn_row.grid(row=8, column=0, sticky="w")
         ctk.CTkButton(webdav_btn_row, text=self.t("webdav_test"), width=120, font=font(12),
                       fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
                       command=self._test_webdav_connection).pack(side="left")
@@ -8275,6 +8298,15 @@ class SteamSaveManager(ctk.CTk):
 
     def _apply_webdav_url(self):
         self.cfg["webdav_url"] = self._webdav_url_e.get().strip()
+        save_config(self.cfg)
+
+    def _apply_webdav_base_path(self):
+        self.cfg["webdav_base_path"] = _webdav_base_path({
+            "webdav_base_path": self._webdav_base_path_e.get().strip()
+        })
+        if hasattr(self, "_webdav_base_path_e"):
+            self._webdav_base_path_e.delete(0, "end")
+            self._webdav_base_path_e.insert(0, self.cfg["webdav_base_path"])
         save_config(self.cfg)
 
     def _apply_webdav_user(self):
