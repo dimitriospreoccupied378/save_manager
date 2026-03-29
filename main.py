@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.5 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.6 — 通用版"""
 
 import os
 import sys
@@ -13,6 +13,7 @@ import datetime
 import zipfile
 import glob
 import hashlib
+import base64
 import fnmatch
 import queue
 import time
@@ -22,6 +23,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import html
+import tkinter
 from pathlib import Path
 from typing import Optional
 
@@ -64,13 +66,16 @@ try:
 except ImportError:
     HAS_WATCHDOG = False
 
-
-# ══════════════════════════════════════════════
+try:
+    from webdav3.client import Client as WebDAVClient
+    HAS_WEBDAV = True
+except ImportError:
+    HAS_WEBDAV = False
 #  常量与路径
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.5"
+VERSION = "1.2.6"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -152,6 +157,16 @@ TRANSLATIONS = {
         "sync_archive_keep": "云端同步包保留数量",
         "sync_archive_keep_suffix": "个最新 ZIP（0 = 不限）",
         "sync_notify": "同步完成后发送 Windows 桌面通知",
+        "webdav_enable": "WebDAV 远程同步",
+        "webdav_url": "WebDAV 服务器地址",
+        "webdav_url_ph": "https://your-server.com/dav",
+        "webdav_username": "用户名",
+        "webdav_password": "密码",
+        "webdav_test": "测试连接",
+        "webdav_testing": "正在测试连接…",
+        "webdav_test_ok": "连接成功！",
+        "webdav_test_fail": "连接失败",
+        "webdav_missing": "未安装 webdavclient3，请运行 pip install webdavclient3",
         "minimize_tray": "关闭时最小化到托盘",
         "minimize_tray_desc": "关闭窗口时最小化到系统托盘后台运行",
         "tray_missing": "⚠ 未安装 pystray，pip install pystray",
@@ -245,6 +260,16 @@ TRANSLATIONS = {
         "sync_archive_keep": "Cloud Sync Archive Retention",
         "sync_archive_keep_suffix": "latest ZIP archives (0 = unlimited)",
         "sync_notify": "Send a Windows desktop notification after sync completes",
+        "webdav_enable": "WebDAV Remote Sync",
+        "webdav_url": "Server URL",
+        "webdav_url_ph": "https://your-server.com/dav",
+        "webdav_username": "Username",
+        "webdav_password": "Password",
+        "webdav_test": "Test Connection",
+        "webdav_testing": "Testing connection...",
+        "webdav_test_ok": "Connection successful!",
+        "webdav_test_fail": "Connection failed",
+        "webdav_missing": "webdavclient3 not installed. Run: pip install webdavclient3",
         "minimize_tray": "Close to System Tray",
         "minimize_tray_desc": "When closing the window, keep the app running in the tray",
         "tray_missing": "⚠ pystray is not installed. Run: pip install pystray",
@@ -437,7 +462,8 @@ KNOWN_SAVE_PATHS: dict[str, list[str]] = {
     # --- 开放世界 / RPG ---
     "1091500": ["{SAVED}/CD Projekt Red/Cyberpunk 2077"],             # Cyberpunk 2077
     "292030":  ["{DOCS}/The Witcher 3"],                              # The Witcher 3
-    "489830":  ["{LOCAL}/Larian Studios/Baldur's Gate 3/PlayerProfiles"], # BG3
+    "489830":  ["{LOCAL}/Larian Studios/Baldur's Gate 3/PlayerProfiles",
+                "{LOCAL}/Larian Studios/Baldur's Gate 3"],                  # BG3
     "1174180": ["{SAVED}/Red Dead Redemption 2/Profiles"],            # RDR2
     "1593500": ["{LOCAL}/Nimble Giant/GTA V/Profiles"],               # GTA V (single)
     "271590":  ["{DOCS}/Rockstar Games/GTA V/Profiles"],              # GTA V
@@ -445,7 +471,6 @@ KNOWN_SAVE_PATHS: dict[str, list[str]] = {
     "611670":  ["{DOCS}/My Games/Starfield/Saves"],                   # Starfield
     "22380":   ["{DOCS}/My Games/FalloutNV/Saves"],                   # Fallout NV
     "22330":   ["{DOCS}/My Games/Oblivion/Saves"],                    # Oblivion
-    "489830":  ["{LOCAL}/Larian Studios/Baldur's Gate 3"],             # BG3
     "72850":   ["{DOCS}/My Games/Skyrim/Saves",
                 "{DOCS}/My Games/Skyrim Special Edition/Saves"],       # Skyrim
     "1716740": ["{LOCAL}/Elden Ring Nightreign"],                     # Nightreign
@@ -457,7 +482,6 @@ KNOWN_SAVE_PATHS: dict[str, list[str]] = {
                 "{DOCS}/My Games/Terraria/Players"],                   # Terraria
     "1145360": ["{APPDATA}/Hades II"],                                # Hades II
     "1100600": ["{APPDATA}/SupergiantGames/Hades"],                   # Hades
-    "814380":  ["{APPDATA}/Sekiro"],                                  # Sekiro
     "251570":  ["{HOME}/.klei/DoNotStarve"],                          # Don't Starve
     "322330":  ["{HOME}/.klei/DoNotStarveTogether"],                  # Don't Starve Together
     "460950":  ["{APPDATA}/Katana ZERO"],                             # Katana ZERO
@@ -1202,11 +1226,14 @@ _STEAM_AUTOCLOUD_CACHE: Optional[list[dict]] = None
 _STORAGE_KIND_CACHE: dict[str, str] = {}
 _SAVE_DETECTION_CACHE: dict[str, list[dict]] = {}
 _STEAMDB_UFS_CACHE: dict[str, list[str]] = {}
+_STEAMDB_UFS_ENTRY_CACHE: dict[str, list[dict]] = {}
 _STEAMDB_UFS_LOCK = threading.Lock()
 _STEAMDB_UFS_SEMAPHORE = threading.Semaphore(2)
 _APPINFO_UFS_CACHE: dict[str, list[dict]] = {}
 _APPINFO_LOADED = False
+_APPINFO_LOADED_PATH = ""
 _APPINFO_DATA: dict[str, list[dict]] = {}
+_INSTALLED_GAME_INFO_CACHE: dict[str, dict[str, dict]] = {}
 
 
 def _load_appinfo_vdf(steam_path: str):
@@ -1219,10 +1246,14 @@ def _load_appinfo_vdf(steam_path: str):
       record: appid(4B) + size(4B) + state(4B) + last_updated(4B) + token(8B)
               + sha1(20B) + change_number(4B) + sha1_2(20B) + binary_kv_data
     """
-    global _APPINFO_LOADED, _APPINFO_DATA
-    if _APPINFO_LOADED:
+    global _APPINFO_LOADED, _APPINFO_DATA, _APPINFO_UFS_CACHE, _APPINFO_LOADED_PATH
+    normalized_steam_path = os.path.normpath(steam_path) if steam_path else ""
+    if _APPINFO_LOADED and normalized_steam_path == _APPINFO_LOADED_PATH:
         return
+    _APPINFO_DATA = {}
+    _APPINFO_UFS_CACHE.clear()
     _APPINFO_LOADED = True
+    _APPINFO_LOADED_PATH = normalized_steam_path
 
     appinfo_path = os.path.join(steam_path, "appcache", "appinfo.vdf")
     if not os.path.isfile(appinfo_path):
@@ -1372,7 +1403,7 @@ def _extract_ufs_savefiles(record_data: bytes) -> list[dict]:
                     pos[0] += 4
                 else:
                     break
-            if "root" in entry and "path" in entry:
+            if "root" in entry and ("path" in entry or "pattern" in entry):
                 return entry
             return None
 
@@ -1407,9 +1438,15 @@ _STEAM_TEMPLATE_PATH_HINTS = tuple(token.lower() for token in (
 ))
 
 
-def _get_steam_library_root(install_dir: str = "", steam_path: str = "") -> str:
+def _get_steam_library_root(install_dir: str = "", steam_path: str = "",
+                            library_path: str = "") -> str:
     candidates = []
     seen = set()
+
+    norm_library = os.path.normpath(library_path) if library_path else ""
+    if norm_library and norm_library not in seen and os.path.isdir(norm_library):
+        seen.add(norm_library)
+        candidates.append(norm_library)
 
     norm_install = os.path.normpath(install_dir) if install_dir else ""
     if norm_install:
@@ -1747,6 +1784,19 @@ def _normalize_unique_save_specs(specs: list[dict]) -> list[dict]:
             continue
         seen.add(key)
         normalized.append(clean)
+    filtered_bases = {
+        os.path.normcase(spec["base"])
+        for spec in normalized
+        if spec.get("includes")
+    }
+    if filtered_bases:
+        normalized = [
+            spec for spec in normalized
+            if not (
+                os.path.normcase(spec["base"]) in filtered_bases
+                and not spec.get("includes")
+            )
+        ]
     return normalized
 
 
@@ -1860,6 +1910,19 @@ def iter_save_spec_files(specs: list[dict]):
                     yield idx, spec, abs_f, rel
 
 
+def _streaming_file_hash(file_path: str, hasher) -> None:
+    """以 64KB 分块读取文件并更新 hasher；读取失败时写入哨兵值。"""
+    try:
+        with open(file_path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except (OSError, PermissionError):
+        hasher.update(b"__UNREADABLE__")
+
+
 def compute_save_spec_hash(specs: list[dict]) -> str:
     h = hashlib.md5()
     all_files = []
@@ -1868,15 +1931,7 @@ def compute_save_spec_hash(specs: list[dict]) -> str:
     all_files.sort(key=lambda item: (item[0], item[2].lower(), item[3].lower()))
     for idx, base, rel, file_path in all_files:
         h.update(f"{idx}:{os.path.normcase(base)}:{rel}".encode("utf-8", errors="ignore"))
-        try:
-            with open(file_path, "rb") as fh:
-                while True:
-                    chunk = fh.read(65536)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        except (OSError, PermissionError):
-            h.update(b"__UNREADABLE__")
+        _streaming_file_hash(file_path, h)
     return h.hexdigest()
 
 
@@ -1908,6 +1963,110 @@ def _remove_matching_spec_files(spec: dict):
             pass
 
 
+def get_installed_game_info(steam_path: str, appid: str) -> Optional[dict]:
+    appid = str(appid or "").strip()
+    if not appid or not steam_path:
+        return None
+    norm_steam_path = os.path.normpath(steam_path)
+    cached = _INSTALLED_GAME_INFO_CACHE.get(norm_steam_path)
+    if cached is None:
+        cached = {}
+        for game in scan_installed_games(steam_path):
+            game_appid = str(game.get("appid", "") or "").strip()
+            if game_appid:
+                cached[game_appid] = game
+        _INSTALLED_GAME_INFO_CACHE[norm_steam_path] = cached
+    return cached.get(appid)
+
+
+def _resolve_metadata_entry_specs(entry: dict, appid: str, primary_path: str,
+                                  install_dir: str, steam_path: str,
+                                  library_path: str = "") -> list[dict]:
+    includes = list(entry.get("includes", []))
+    if not includes:
+        return []
+    template = str(entry.get("template", "") or "").strip()
+    if not template:
+        return []
+    expanded_paths = expand_steamdb_template(template, appid, install_dir, steam_path, library_path)
+    if not expanded_paths:
+        inferred_install = infer_install_dir_from_steamdb_template(template, install_dir, library_path)
+        if inferred_install:
+            expanded_paths = [inferred_install]
+    primary_norm = os.path.normcase(os.path.normpath(primary_path))
+    resolved = []
+    for path in expanded_paths:
+        if os.path.normcase(os.path.normpath(path)) != primary_norm:
+            continue
+        resolved.append({
+            "base": primary_path,
+            "includes": includes,
+            "recursive": entry.get("recursive", True),
+        })
+    return _normalize_unique_save_specs(resolved)
+
+
+def _infer_precise_metadata_specs_for_game(game: Optional[dict], steam_path: str,
+                                           cfg: Optional[dict] = None) -> list[dict]:
+    if not isinstance(game, dict):
+        return []
+    appid = str(game.get("appid", "") or "").strip()
+    if not appid or not steam_path:
+        return []
+    current_specs = get_game_save_specs(game, existing_only=False)
+    if not current_specs:
+        return []
+    current_paths = get_game_save_paths(game, existing_only=False)
+    if not current_paths:
+        return []
+    primary_path = current_paths[0]
+    installed_game = get_installed_game_info(steam_path, appid)
+    install_dir = str(installed_game.get("install_dir", "") or "").strip() if installed_game else ""
+    library_path = str(
+        game.get("library_path", "")
+        or (installed_game.get("library_path", "") if installed_game else "")
+        or ""
+    ).strip()
+    if not install_dir:
+        return []
+    if os.path.normcase(os.path.normpath(primary_path)) != os.path.normcase(os.path.normpath(install_dir)):
+        return []
+    candidate_specs = []
+    for entry in parse_appinfo_ufs_entries(steam_path, appid):
+        candidate_specs.extend(
+            _resolve_metadata_entry_specs(entry, appid, primary_path, install_dir, steam_path, library_path)
+        )
+    if cfg and cfg.get("steamdb_detection_enabled"):
+        for entry in fetch_steamdb_ufs_entries(appid):
+            candidate_specs.extend(
+                _resolve_metadata_entry_specs(entry, appid, primary_path, install_dir, steam_path, library_path)
+            )
+    candidate_specs = _normalize_unique_save_specs(candidate_specs)
+    if candidate_specs:
+        return [
+            spec for spec in candidate_specs
+            if compute_save_spec_file_count([spec]) > 0
+        ]
+    return []
+
+
+def try_upgrade_game_save_specs_from_appinfo(game: Optional[dict], steam_path: str,
+                                             cfg: Optional[dict] = None) -> bool:
+    if not isinstance(game, dict):
+        return False
+    current_paths = get_game_save_paths(game, existing_only=False)
+    if not current_paths:
+        return False
+    candidate_specs = _infer_precise_metadata_specs_for_game(game, steam_path, cfg)
+    if candidate_specs:
+        rebuilt_specs = list(candidate_specs)
+        for extra_path in current_paths[1:]:
+            rebuilt_specs.append(_default_save_spec(extra_path))
+        set_game_save_specs(game, rebuilt_specs)
+        return True
+    return False
+
+
 
 def _steam64_from_accountid(accountid: str) -> str:
     try:
@@ -1930,25 +2089,61 @@ def _extract_steamdb_path_strings(text: str) -> list[str]:
         line = raw_line.strip().strip("`").strip()
         if not line:
             continue
-        if " likely means save files are in " in line.lower():
-            match = re.search(r"(?i)likely means save files are in (.+?) folder", line)
-            if match:
-                line = match.group(1).strip()
-        line_lower = line.lower()
-        if not any(token in line_lower for token in _STEAM_TEMPLATE_PATH_HINTS):
-            continue
-        if line not in seen:
-            seen.add(line)
-            results.append(line)
+        pieces = [line]
+        if "|" in line:
+            cells = [cell.strip().strip("`").strip() for cell in line.split("|")]
+            pieces = [cell for cell in cells if cell]
+        for piece in pieces:
+            candidate = piece
+            if " likely means save files are in " in candidate.lower():
+                match = re.search(r"(?i)likely means save files are in (.+?) folder", candidate)
+                if match:
+                    candidate = match.group(1).strip()
+            candidate_lower = candidate.lower()
+            if candidate_lower in {"path", "pattern", "platform", "all oses", "windows"}:
+                continue
+            if not any(token in candidate_lower for token in _STEAM_TEMPLATE_PATH_HINTS):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                results.append(candidate)
     return results
 
 
-def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
+def _steamdb_cells_to_entry(cells: list[str]) -> Optional[dict]:
+    path_cell = ""
+    pattern_cell = ""
+    for cell in cells:
+        cell_clean = str(cell or "").strip().strip("`").strip()
+        if not cell_clean:
+            continue
+        lower = cell_clean.lower()
+        if not path_cell and any(token in lower for token in _STEAM_TEMPLATE_PATH_HINTS):
+            path_cell = cell_clean
+            continue
+        if not pattern_cell and any(ch in cell_clean for ch in "*?") and not any(token in lower for token in _STEAM_TEMPLATE_PATH_HINTS):
+            pattern_cell = cell_clean
+    if not path_cell:
+        return None
+    clean_path, includes = _split_ufs_path_and_patterns(path_cell, pattern_cell)
+    template = clean_path or path_cell
+    recursive = not (
+        includes
+        and all("/" not in pattern.replace("\\", "/") for pattern in includes)
+    )
+    return {
+        "template": template,
+        "includes": includes,
+        "recursive": recursive,
+    }
+
+
+def fetch_steamdb_ufs_entries(appid: str) -> list[dict]:
     appid = str(appid or "").strip()
     if not appid:
         return []
     with _STEAMDB_UFS_LOCK:
-        cached = _STEAMDB_UFS_CACHE.get(appid)
+        cached = _STEAMDB_UFS_ENTRY_CACHE.get(appid)
         if cached is not None:
             return list(cached)
 
@@ -1958,13 +2153,14 @@ def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     req = urllib.request.Request(url, headers=headers)
-    templates: list[str] = []
+    entries: list[dict] = []
     try:
         with _STEAMDB_UFS_SEMAPHORE:
             with urllib.request.urlopen(req, timeout=4) as resp:
                 html_text = resp.read().decode("utf-8", errors="ignore")
     except Exception:
         with _STEAMDB_UFS_LOCK:
+            _STEAMDB_UFS_ENTRY_CACHE[appid] = []
             _STEAMDB_UFS_CACHE[appid] = []
         return []
 
@@ -1976,31 +2172,51 @@ def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
         row_text = " | ".join(cells).lower()
         if not any(token in row_text for token in ("windows", "all oses", "all operating systems", "all platforms")):
             continue
-        for cell in cells:
-            templates.extend(_extract_steamdb_path_strings(cell))
+        entry = _steamdb_cells_to_entry(cells)
+        if entry:
+            entries.append(entry)
 
-    if not templates:
+    if not entries:
         full_text = _steamdb_strip_html(html_text)
-        templates.extend(_extract_steamdb_path_strings(full_text))
+        for template in _extract_steamdb_path_strings(full_text):
+            entries.append({
+                "template": template,
+                "includes": [],
+                "recursive": True,
+            })
 
     deduped = []
     seen = set()
-    for item in templates:
-        norm = item.strip()
-        if norm and norm not in seen:
-            seen.add(norm)
-            deduped.append(norm)
+    for entry in entries:
+        template = str(entry.get("template", "") or "").strip()
+        includes = tuple(p.lower() for p in entry.get("includes", []) if isinstance(p, str))
+        recursive = bool(entry.get("recursive", True))
+        key = (template, includes, recursive)
+        if not template or key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "template": template,
+            "includes": list(entry.get("includes", [])),
+            "recursive": recursive,
+        })
 
     with _STEAMDB_UFS_LOCK:
-        _STEAMDB_UFS_CACHE[appid] = deduped
+        _STEAMDB_UFS_ENTRY_CACHE[appid] = deduped
+        _STEAMDB_UFS_CACHE[appid] = [item["template"] for item in deduped]
     return list(deduped)
 
 
+def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
+    return [item["template"] for item in fetch_steamdb_ufs_entries(appid)]
+
+
 def expand_steamdb_template(template: str, appid: str,
-                            install_dir: str = "", steam_path: str = "") -> list[str]:
+                            install_dir: str = "", steam_path: str = "",
+                            library_path: str = "") -> list[str]:
     if not template:
         return []
-    library_root = _get_steam_library_root(install_dir, steam_path)
+    library_root = _get_steam_library_root(install_dir, steam_path, library_path)
     values = {
         "%USERPROFILE%": str(USER_HOME),
         "%APPDATA%": str(APPDATA),
@@ -2081,6 +2297,37 @@ def expand_steamdb_template(template: str, appid: str,
             seen.add(norm)
             final.append(norm)
     return final
+
+
+def infer_install_dir_from_steamdb_template(template: str, install_dir: str = "",
+                                            library_path: str = "") -> str:
+    template = str(template or "").replace("\\", "/").strip().strip("/")
+    install_dir = os.path.normpath(install_dir or "")
+    library_path = os.path.normpath(library_path or "")
+    if not template:
+        return ""
+
+    lowered = template.lower()
+    if install_dir and os.path.isdir(install_dir):
+        install_name = os.path.basename(install_dir).lower()
+        install_norm = install_dir.replace("\\", "/").lower().strip("/")
+
+        if "[game install]" in lowered:
+            return install_dir
+        if install_name and lowered.endswith(f"/{install_name}"):
+            return install_dir
+        if install_name and f"/steamapps/common/{install_name}" in lowered:
+            return install_dir
+        if install_name and install_norm.endswith(install_name) and install_name in lowered:
+            return install_dir
+
+    if library_path and os.path.isdir(library_path) and "[steam library]" in lowered:
+        rel = re.sub(r"(?i)^.*?\[steam library\]\s*", "", template).lstrip("/").strip()
+        if rel:
+            candidate = os.path.normpath(os.path.join(library_path, *rel.replace("\\", "/").split("/")))
+            if os.path.isdir(candidate):
+                return candidate
+    return ""
 
 
 def get_steam_userdata_roots(steam_path: str) -> list[str]:
@@ -2348,6 +2595,15 @@ def inspect_save_candidate(path: str, game_name: str = "",
     }
 
 
+def has_install_root_save_files(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    signals = _gather_candidate_file_signals(path, max_depth=0, max_files=40)
+    strong_hits = int(signals.get("strong_names", 0)) + int(signals.get("strong_exts", 0))
+    weak_hits = int(signals.get("weak_names", 0)) + int(signals.get("weak_exts", 0))
+    return strong_hits >= 1 or (strong_hits == 0 and weak_hits >= 2)
+
+
 def score_autocloud_candidate(auto: dict, remotecache_entry: Optional[dict] = None,
                               game_name: str = "", install_dir: str = "") -> int:
     score = 82
@@ -2375,6 +2631,14 @@ def should_accept_candidate(source: str, base_score: int, detail: dict) -> bool:
 
     if source in {"confirmed", "known-path", "remotecache", "steam-autocloud", "steam-remote", "steam-app-root", "steamdb", "appinfo"}:
         return True
+
+    if source == "install-root-files":
+        return (
+            confidence != "low"
+            or int(signals.get("strong_exts", 0)) >= 1
+            or int(signals.get("strong_names", 0)) >= 1
+            or positive_hits >= 2
+        )
 
     if source == "cache":
         return (
@@ -2650,6 +2914,7 @@ def find_save_in_install_dir(install_dir: str) -> list[str]:
 
 def detect_save_candidates(appid: str, game_name: str,
                            install_dir: str, steam_path: str,
+                           library_path: str = "",
                            cfg: Optional[dict] = None) -> list[dict]:
     """
     综合检测某游戏的存档路径，返回按分数排序后的候选项。
@@ -2659,6 +2924,7 @@ def detect_save_candidates(appid: str, game_name: str,
         _normalize_recognition_name(game_name),
         os.path.normpath(install_dir or ""),
         os.path.normpath(steam_path or ""),
+        os.path.normpath(library_path or ""),
         "steamdb:on" if cfg and cfg.get("steamdb_detection_enabled") else "steamdb:off",
         get_cached_recognition_path(cfg, appid, game_name),
         "|".join(sorted(get_recognition_blacklist(cfg, appid, game_name))),
@@ -2704,7 +2970,7 @@ def detect_save_candidates(appid: str, game_name: str,
 
     steamdb_candidates: dict[str, dict] = {}
 
-    def _collect_steamdb_candidate(path: str, score: int = 92):
+    def _collect_steamdb_candidate(path: str, score: int = 92, save_specs: Optional[list[dict]] = None):
         norm = os.path.normpath(path)
         if not norm or norm in blacklist or not os.path.exists(norm):
             return
@@ -2720,14 +2986,18 @@ def detect_save_candidates(appid: str, game_name: str,
             "confidence": detail["confidence"],
             "reasons": ["steamdb"] + detail["reasons"],
         }
+        if save_specs:
+            entry["save_specs"] = _normalize_unique_save_specs(save_specs)
         if existing is None or total > existing["score"]:
             steamdb_candidates[norm] = entry
+        elif save_specs and not existing.get("save_specs"):
+            existing["save_specs"] = _normalize_unique_save_specs(save_specs)
 
     # 1a) 本地 appinfo.vdf UFS 线索（离线，无需联网）
     if str(appid or "").strip() and steam_path:
         for appinfo_entry in parse_appinfo_ufs_entries(steam_path, appid):
             template = appinfo_entry.get("template", "")
-            for path in expand_steamdb_template(template, appid, install_dir, steam_path):
+            for path in expand_steamdb_template(template, appid, install_dir, steam_path, library_path):
                 save_specs = [{
                     "base": path,
                     "includes": list(appinfo_entry.get("includes", [])),
@@ -2735,11 +3005,25 @@ def detect_save_candidates(appid: str, game_name: str,
                 }]
                 _add(path, 94, "appinfo", save_specs=save_specs)
 
+    if install_dir and has_install_root_save_files(install_dir):
+        _add(install_dir, 96 if steamdb_enabled else 90, "install-root-files")
+
     # 1b) SteamDB Cloud Save / UFS 线索（可选，需联网，优先模式）
     if steamdb_enabled and str(appid or "").strip():
-        for template in fetch_steamdb_ufs_templates(appid):
-            for path in expand_steamdb_template(template, appid, install_dir, steam_path):
-                _collect_steamdb_candidate(path)
+        for steamdb_entry in fetch_steamdb_ufs_entries(appid):
+            template = steamdb_entry.get("template", "")
+            expanded_paths = expand_steamdb_template(template, appid, install_dir, steam_path, library_path)
+            if not expanded_paths:
+                inferred_install = infer_install_dir_from_steamdb_template(template, install_dir, library_path)
+                if inferred_install:
+                    expanded_paths = [inferred_install]
+            for path in expanded_paths:
+                save_specs = [{
+                    "base": path,
+                    "includes": list(steamdb_entry.get("includes", [])),
+                    "recursive": steamdb_entry.get("recursive", True),
+                }]
+                _collect_steamdb_candidate(path, save_specs=save_specs)
 
         if steamdb_candidates:
             merged_candidates = list(steamdb_candidates.values())
@@ -2828,8 +3112,9 @@ def detect_save_candidates(appid: str, game_name: str,
 
 def detect_save_paths(appid: str, game_name: str,
                       install_dir: str, steam_path: str,
+                      library_path: str = "",
                       cfg: Optional[dict] = None) -> list[str]:
-    return [c["path"] for c in detect_save_candidates(appid, game_name, install_dir, steam_path, cfg)]
+    return [c["path"] for c in detect_save_candidates(appid, game_name, install_dir, steam_path, library_path, cfg)]
 
 
 # ══════════════════════════════════════════════
@@ -2866,6 +3151,10 @@ def load_config() -> dict:
         "recognition_excludes": {},
         "minimize_to_tray": True,
         "sync_notify": True,
+        "webdav_enabled": False,
+        "webdav_url": "",
+        "webdav_username": "",
+        "webdav_password": "",
         "max_backups_per_game": 20,
         "max_backup_size_gb": 10.0,
         "backup_path": "",
@@ -2911,6 +3200,13 @@ def load_config() -> dict:
         if detected:
             cfg["steam_path"] = detected
             changed = True
+    steam_path_for_upgrade = cfg.get("steam_path", "")
+    if isinstance(games, list) and steam_path_for_upgrade:
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            if try_upgrade_game_save_specs_from_appinfo(game, steam_path_for_upgrade, cfg):
+                changed = True
     # 如果 sync_folder 为空或不存在，自动检测云盘文件夹
     if not cfg.get("sync_folder") or not os.path.isdir(cfg.get("sync_folder", "")):
         cloud = detect_cloud_folder()
@@ -2935,15 +3231,18 @@ def save_config(cfg: dict):
 
 
 def clear_startup_caches(cfg: Optional[dict] = None):
-    global _STEAM_AUTOCLOUD_CACHE, _APPINFO_LOADED, _APPINFO_DATA
+    global _STEAM_AUTOCLOUD_CACHE, _APPINFO_LOADED, _APPINFO_DATA, _APPINFO_LOADED_PATH, _INSTALLED_GAME_INFO_CACHE
 
     _STEAM_AUTOCLOUD_CACHE = None
     _STORAGE_KIND_CACHE.clear()
     _SAVE_DETECTION_CACHE.clear()
     _STEAMDB_UFS_CACHE.clear()
+    _STEAMDB_UFS_ENTRY_CACHE.clear()
     _APPINFO_UFS_CACHE.clear()
     _APPINFO_LOADED = False
+    _APPINFO_LOADED_PATH = ""
     _APPINFO_DATA = {}
+    _INSTALLED_GAME_INFO_CACHE.clear()
     _REGISTRY_INSTALL_CACHE.clear()
 
     if cfg is not None:
@@ -3362,11 +3661,11 @@ def extract_sync_archive(archive_path: Path, target_specs_or_paths):
         if multi_root.is_dir():
             for idx, spec in enumerate(target_specs, start=1):
                 source_dir = multi_root / f"p{idx}"
-                if not source_dir.exists():
-                    continue
                 target_dir = Path(spec["base"])
                 target_dir.mkdir(parents=True, exist_ok=True)
                 _remove_matching_spec_files(spec)
+                if not source_dir.exists():
+                    continue
                 for item in source_dir.iterdir():
                     dest = target_dir / item.name
                     if item.is_dir():
@@ -3390,6 +3689,142 @@ def extract_sync_archive(archive_path: Path, target_specs_or_paths):
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+# ══════════════════════════════════════════════
+#  WebDAV 远程同步辅助函数
+# ══════════════════════════════════════════════
+
+def _webdav_encode_password(plain: str) -> str:
+    if not plain:
+        return ""
+    return base64.b64encode(plain.encode("utf-8")).decode("ascii")
+
+
+def _webdav_decode_password(encoded: str) -> str:
+    if not encoded:
+        return ""
+    try:
+        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _webdav_make_client(cfg: dict):
+    if not HAS_WEBDAV or not cfg.get("webdav_enabled"):
+        return None
+    url = str(cfg.get("webdav_url", "") or "").strip().rstrip("/")
+    if not url:
+        return None
+    return WebDAVClient({
+        "webdav_hostname": url,
+        "webdav_login": str(cfg.get("webdav_username", "") or "").strip(),
+        "webdav_password": _webdav_decode_password(cfg.get("webdav_password", "")),
+    })
+
+
+def webdav_test_connection(url: str, username: str, password: str) -> tuple:
+    """测试 WebDAV 连接，返回 (success: bool, message: str)"""
+    if not HAS_WEBDAV:
+        return False, "webdavclient3 not installed"
+    try:
+        client = WebDAVClient({
+            "webdav_hostname": url.strip().rstrip("/"),
+            "webdav_login": username.strip(),
+            "webdav_password": password,
+        })
+        client.check()
+        return True, "OK"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _webdav_remote_archive_dir(game_name: str) -> str:
+    return f"/SteamSaveSync/{sanitize(game_name)}/archives"
+
+
+def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> bool:
+    """上传 ZIP + meta.json 到 WebDAV"""
+    client = _webdav_make_client(cfg)
+    if not client:
+        return False
+    try:
+        archive_dir = _webdav_remote_archive_dir(game_name)
+        client.mkdir(archive_dir)
+        zip_name = Path(local_zip).name
+        meta_name = Path(local_meta).name
+        client.upload_sync(
+            remote_path=f"{archive_dir}/{zip_name}",
+            local_path=local_zip)
+        try:
+            client.upload_sync(
+                remote_path=f"{archive_dir}/{meta_name}",
+                local_path=local_meta)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def webdav_list_archives(cfg: dict, game_name: str) -> list:
+    """列出 WebDAV 上的 .zip 存档文件名（排序后）"""
+    client = _webdav_make_client(cfg)
+    if not client:
+        return []
+    try:
+        archive_dir = _webdav_remote_archive_dir(game_name)
+        try:
+            client.check(archive_dir)
+        except Exception:
+            return []
+        items = client.list(archive_dir)
+        names = []
+        for item in items:
+            name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
+            if name.endswith(".zip"):
+                names.append(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path) -> str | None:
+    """从 WebDAV 下载最新存档到本地缓存，返回本地 ZIP 路径或 None"""
+    client = _webdav_make_client(cfg)
+    if not client:
+        return None
+    try:
+        archives = webdav_list_archives(cfg, game_name)
+        if not archives:
+            return None
+        latest_name = archives[-1]
+        archive_dir = _webdav_remote_archive_dir(game_name)
+
+        # 解析时间戳 -> 本地 YYYY-MM 子目录
+        ts_part = latest_name.replace(".zip", "")
+        month_str = ts_part[:7].replace("_", "-", 1) if "_" in ts_part[:7] else ts_part[:4] + "-" + ts_part[4:6]
+        month_dir = get_sync_archive_root(local_sync_game_dir) / month_str
+        month_dir.mkdir(parents=True, exist_ok=True)
+        local_zip = month_dir / latest_name
+
+        if local_zip.exists():
+            return None  # 已经是最新
+
+        remote_zip = f"{archive_dir}/{latest_name}"
+        client.download_sync(remote_path=remote_zip, local_path=str(local_zip))
+
+        # 也下载 meta 文件
+        meta_name = latest_name + ".meta.json"
+        try:
+            client.download_sync(
+                remote_path=f"{archive_dir}/{meta_name}",
+                local_path=str(month_dir / meta_name))
+        except Exception:
+            pass
+        return str(local_zip)
+    except Exception:
+        return None
+
+
 def compute_dir_hash(directory: str) -> str:
     """
     递归计算目录内所有文件的内容 MD5 校验和。
@@ -3408,15 +3843,7 @@ def compute_dir_hash(directory: str) -> str:
         all_files.sort(key=lambda x: x[0])
         for rel, fp in all_files:
             h.update(rel.encode("utf-8"))
-            try:
-                with open(fp, "rb") as fh:
-                    while True:
-                        chunk = fh.read(65536)  # 64KB 分块读取
-                        if not chunk:
-                            break
-                        h.update(chunk)
-            except (OSError, PermissionError):
-                h.update(b"__UNREADABLE__")
+            _streaming_file_hash(fp, h)
     except OSError:
         pass
     return h.hexdigest()
@@ -3763,7 +4190,22 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     if mode == "smart":
         mode = "bidirectional"
 
-    configured_specs = get_game_save_specs(game, existing_only=False)
+    steam_path_for_upgrade = str(cfg.get("steam_path", "") or "").strip() if cfg else ""
+    effective_specs = []
+    if steam_path_for_upgrade:
+        precise_specs = _infer_precise_metadata_specs_for_game(game, steam_path_for_upgrade, cfg)
+        if precise_specs:
+            current_paths = get_game_save_paths(game, existing_only=False)
+            rebuilt_specs = list(precise_specs)
+            for extra_path in current_paths[1:]:
+                rebuilt_specs.append(_default_save_spec(extra_path))
+            rebuilt_specs = _normalize_unique_save_specs(rebuilt_specs)
+            effective_specs = rebuilt_specs
+            if rebuilt_specs != get_game_save_specs(game, existing_only=False):
+                set_game_save_specs(game, rebuilt_specs)
+                save_config(cfg)
+
+    configured_specs = effective_specs or get_game_save_specs(game, existing_only=False)
     configured_paths = [spec["base"] for spec in configured_specs]
     if not configured_paths:
         fallback = str(game.get("save_path", "") or "").strip()
@@ -3776,6 +4218,13 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
 
     dest_dir = get_sync_game_dir(sync_folder, game["name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # WebDAV: 同步前从远程拉取最新存档到本地缓存
+    if cfg and cfg.get("webdav_enabled") and HAS_WEBDAV:
+        try:
+            webdav_download_latest(cfg, game["name"], dest_dir)
+        except Exception:
+            pass
 
     local_info = snapshot_sync_specs(configured_specs, configured_paths[0] if len(configured_paths) == 1 else bilingual_text(lang, f"{len(configured_paths)} 个本地目录", f"{len(configured_paths)} local folders"))
     local_count = int(local_info.get("file_count", 0) or 0)
@@ -3846,9 +4295,15 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                 keep_count = max(0, int(cfg.get("sync_archive_keep", 3)))
             except Exception:
                 keep_count = 3
-        archive_path, _ = create_sync_archive(
+        archive_path, meta_path = create_sync_archive(
             game, dest_dir, configured_specs, local_info, keep_count=keep_count
         )
+        # WebDAV: 上传存档到远程
+        if cfg and cfg.get("webdav_enabled") and HAS_WEBDAV and archive_path:
+            try:
+                webdav_upload_archive(cfg, str(archive_path), str(meta_path), game["name"])
+            except Exception:
+                pass
         return archive_path
 
     def _download_remote_payload():
@@ -4819,6 +5274,7 @@ class SteamSaveManager(ctk.CTk):
         self._scan_storage_profile = "unknown"
         self._scan_start_btn = None
         self._scan_add_all_btn = None
+        self._io_busy = False
 
         self.title(self.t("product_title"))
         self.geometry("1080x720")
@@ -4896,6 +5352,7 @@ class SteamSaveManager(ctk.CTk):
         current = target_frame or getattr(self, "_current_frame", "home")
         detail_idx = getattr(self, "_detail_idx", None)
         self._stop_detail_refresh()
+        self.unbind_all("<MouseWheel>")
         for child in list(self.winfo_children()):
             child.destroy()
         self.title(self.t("product_title"))
@@ -5292,6 +5749,10 @@ class SteamSaveManager(ctk.CTk):
             )
             self._scan_add_all_btn.configure(state="normal" if can_add else "disabled")
 
+    def _set_io_busy(self, busy: bool):
+        """标记 IO 操作进行中，防止重复触发"""
+        self._io_busy = busy
+
     def _get_filtered_scan_results(self):
         search_text = self._scan_search_var.get().strip().lower() if hasattr(self, "_scan_search_var") else ""
         results = []
@@ -5477,7 +5938,7 @@ class SteamSaveManager(ctk.CTk):
             future_map = {
                 executor.submit(
                     detect_save_candidates,
-                    game["appid"], game["name"], game["install_dir"], steam_path, self.cfg
+                    game["appid"], game["name"], game["install_dir"], steam_path, game.get("library_path", ""), self.cfg
                 ): game
                 for game in installed
             }
@@ -5578,8 +6039,6 @@ class SteamSaveManager(ctk.CTk):
                     continue
                 if candidate.get("save_specs"):
                     merged_specs.extend(candidate.get("save_specs", []))
-                else:
-                    merged_specs.append(_default_save_spec(candidate.get("path", "")))
             specs = _normalize_unique_save_specs(merged_specs)
             if specs:
                 return specs
@@ -5599,6 +6058,9 @@ class SteamSaveManager(ctk.CTk):
             set_game_save_specs(game, save_specs)
         else:
             set_game_save_paths(game, save_paths if save_paths else [save_path])
+        result = next((r for r in self._scan_results if r.get("appid") == appid), None)
+        if result and result.get("library_path"):
+            game["library_path"] = result.get("library_path", "")
         games.append(game)
         remember_recognition_path(self.cfg, appid, name, game.get("save_path", ""))
         save_config(self.cfg)
@@ -5633,6 +6095,8 @@ class SteamSaveManager(ctk.CTk):
                 set_game_save_specs(game, save_specs)
             else:
                 set_game_save_paths(game, save_paths if save_paths else [selected])
+            if result.get("library_path"):
+                game["library_path"] = result.get("library_path", "")
             games.append(game)
             remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
             existing.add(appid)
@@ -6352,25 +6816,50 @@ class SteamSaveManager(ctk.CTk):
 
     def _restore_from_popup(self, backup, game, dialog):
         """从弹窗中还原备份"""
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
                 self.bi(f"还原 {self._fmt_ts(backup['timestamp'])} 的备份？\n当前存档将被自动备份后覆盖",
                         f"Restore the backup from {self._fmt_ts(backup['timestamp'])}?\nYour current save will be backed up automatically before being overwritten.")):
-            try:
-                targets = get_game_save_specs(game, existing_only=False)
-                restore_backup(backup["path"], targets if targets else game.get("save_path", ""))
-                self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
-                dialog.destroy()
-                self._show_game_detail(self._detail_idx)
-            except Exception as e:
-                self._show_error(self.bi("还原失败", "Restore Failed"), str(e))
+            backup_path = backup["path"]
+            game_copy = dict(game)
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    targets = get_game_save_specs(game_copy, existing_only=False)
+                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
+                    self.after(0, lambda: self._on_restore_popup_done(detail_idx, dialog))
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_popup_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_restore_popup_done(self, idx, dialog):
+        self._set_io_busy(False)
+        self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
+        dialog.destroy()
+        self._show_game_detail(idx)
+
+    def _on_restore_popup_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("还原失败", "Restore Failed"), err)
 
     def _del_bk_from_popup(self, backup, dialog):
         """从弹窗中删除备份"""
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("确定删除此备份？", "Delete this backup?")):
-            delete_backup(backup["path"])
-            dialog.destroy()
-            self._show_backup_history()  # 重新打开刷新
-            self._show_game_detail(self._detail_idx)  # 刷新详情页计数
+            backup_path = backup["path"]
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_popup_done(detail_idx, dialog))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_del_bk_popup_done(self, idx, dialog):
+        self._set_io_busy(False)
+        dialog.destroy()
+        self._show_backup_history()
+        self._show_game_detail(idx)
 
     def _refresh_proc_status(self):
         """检测当前游戏的进程运行状态和同步监控状态并更新 UI"""
@@ -6927,13 +7416,22 @@ class SteamSaveManager(ctk.CTk):
             self._detail_refresh_job = None
 
     def _backup_from_detail(self, idx):
-        g = self.cfg["games"][idx]
+        if self._io_busy: return
+        g = dict(self.cfg["games"][idx])
         note = self._input_dialog(
             title=self.bi("备注", "Note"),
             text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
-        r = create_backup(g, note)
-        if r:
-            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{r}", f"Backup complete!\n{r}"))
+        detail_idx = self._detail_idx
+        self._set_io_busy(True)
+        def _worker():
+            r = create_backup(g, note)
+            self.after(0, lambda: self._on_backup_detail_done(r, detail_idx))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_detail_done(self, result, idx):
+        self._set_io_busy(False)
+        if result:
+            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
             self._show_game_detail(idx)
         else:
             self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
@@ -6960,36 +7458,92 @@ class SteamSaveManager(ctk.CTk):
             self._show_frame("games")
 
     def _restore_from_detail(self, b, game):
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
                 self.bi(f"还原此存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore this save?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
-            try:
-                targets = get_game_save_specs(game, existing_only=False)
-                restore_backup(b["path"], targets if targets else game.get("save_path", ""))
-                self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
-                self._show_game_detail(self._detail_idx)
-            except Exception as e:
-                self._show_error(self.bi("失败", "Failed"), str(e))
+            backup_path = b["path"]
+            game_copy = dict(game)
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    targets = get_game_save_specs(game_copy, existing_only=False)
+                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
+                    self.after(0, lambda: self._on_restore_detail_done(detail_idx))
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_restore_detail_done(self, idx):
+        self._set_io_busy(False)
+        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+        self._show_game_detail(idx)
 
     def _del_bk_from_detail(self, b):
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
-            delete_backup(b["path"])
-            self._show_game_detail(self._detail_idx)
+            backup_path = b["path"]
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_detail_done(detail_idx))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_del_bk_detail_done(self, idx):
+        self._set_io_busy(False)
+        self._show_game_detail(idx)
 
     def _manual_backup(self, idx):
-        g = self.cfg["games"][idx]
+        if self._io_busy: return
+        g = dict(self.cfg["games"][idx])
         note = self._input_dialog(
             title=self.bi("备注", "Note"),
             text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
-        r = create_backup(g, note)
-        if r: self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{r}", f"Backup complete!\n{r}"))
-        else: self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
+        self._set_io_busy(True)
+        def _worker():
+            r = create_backup(g, note)
+            self.after(0, lambda: self._on_backup_done(r))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_done(self, result):
+        self._set_io_busy(False)
+        if result:
+            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
+        else:
+            self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
 
     def _backup_all(self):
+        if self._io_busy: return
         games = self.cfg.get("games", [])
         if not games: self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
-        ok = sum(1 for g in games if create_backup(g, self.bi("一键备份", "Back Up All")))
-        self._show_info(self.bi("完成", "Done"), self.bi(f"成功 {ok}/{len(games)}", f"Succeeded: {ok}/{len(games)}"))
+        game_copies = [dict(g) for g in games]
+        default_note = self.bi("一键备份", "Back Up All")
+        original_title = self.t("product_title")
+        progress_tpl = self.bi("备份中 {cur}/{total}...", "Backing up {cur}/{total}...")
+        done_title = self.bi("完成", "Done")
+        self._set_io_busy(True)
+        def _worker():
+            ok = 0
+            total = len(game_copies)
+            for i, g in enumerate(game_copies):
+                r = create_backup(g, default_note)
+                if r: ok += 1
+                label = progress_tpl.format(cur=i + 1, total=total)
+                self.after(0, lambda t=label: self.title(t))
+            self.after(0, lambda: self._on_backup_all_done(total, ok, original_title, done_title))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_all_done(self, total, ok, original_title, done_title):
+        self._set_io_busy(False)
+        self.title(original_title)
+        self._show_info(done_title, self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}"))
+
+    def _on_backup_all_done(self, total, ok, original_title):
+        self._set_io_busy(False)
+        self.title(original_title)
+        self._show_info(self.bi("完成", "Done"), self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}"))
 
     # ─── 备份记录 ───
     def _build_backup_frame(self):
@@ -7061,18 +7615,43 @@ class SteamSaveManager(ctk.CTk):
                           command=lambda bp=b: self._del_bk(bp)).pack(side="left", padx=2)
 
     def _restore(self, b):
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
                 self.bi(f"还原「{b['game']}」的存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
                         f"Restore the save for {b['game']}?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
-            try:
-                targets = b.get("save_specs", []) or [_default_save_spec(path) for path in b.get("save_paths", [])]
-                restore_backup(b["path"], targets if targets else b.get("save_path", ""))
-                self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
-            except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
+            backup_path = b["path"]
+            targets = b.get("save_specs", []) or [_default_save_spec(path) for path in b.get("save_paths", [])]
+            restore_target = targets if targets else b.get("save_path", "")
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    restore_backup(backup_path, restore_target)
+                    self.after(0, lambda: self._on_restore_done())
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_restore_done(self):
+        self._set_io_busy(False)
+        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+
+    def _on_restore_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("失败", "Failed"), err)
 
     def _del_bk(self, b):
+        if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
-            delete_backup(b["path"]); self._refresh_backup_list()
+            backup_path = b["path"]
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_done())
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_del_bk_done(self):
+        self._set_io_busy(False)
+        self._refresh_backup_list()
 
     # ─── 设置 ───
     def _build_settings_frame(self):
@@ -7089,14 +7668,232 @@ class SteamSaveManager(ctk.CTk):
         ctk.CTkLabel(hdr, text=self.t("settings_subtitle"), font=font(12),
                      text_color=C_SUBTLE_TEXT).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        # 让设置页可滚动
-        settings_scroll = ctk.CTkScrollableFrame(
-            frame, fg_color=C_MAIN_BG, corner_radius=0)
-        settings_scroll.grid(row=1, column=0, padx=0, sticky="nsew")
-        settings_scroll.grid_columnconfigure(0, weight=1)
+        settings_host = ctk.CTkFrame(frame, fg_color=C_MAIN_BG, corner_radius=0)
+        settings_host.grid(row=1, column=0, padx=0, pady=(0, 16), sticky="nsew")
+        settings_host.grid_columnconfigure(0, weight=1)
+        settings_host.grid_rowconfigure(0, weight=1)
 
-        def _section(title_key: str, subtitle_key: str):
-            card = ctk.CTkFrame(settings_scroll, fg_color=C_CARD_BG, corner_radius=16)
+        def _current_canvas_bg():
+            return C_MAIN_BG[0] if ctk.get_appearance_mode().lower() == "light" else C_MAIN_BG[1]
+
+        settings_canvas = tkinter.Canvas(
+            settings_host, bg=_current_canvas_bg(), highlightthickness=0, bd=0)
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+
+        def _apply_settings_moveto(fraction):
+            fraction = max(0.0, min(float(fraction), 1.0))
+            settings_canvas.yview_moveto(fraction)
+            settings_canvas.update_idletasks()
+
+        def _settings_canvas_yview(*args):
+            if args and args[0] == "moveto":
+                _apply_settings_moveto(args[1])
+                return
+            settings_canvas.yview(*args)
+            settings_canvas.update_idletasks()
+
+        # ── Scrollbar colors (theme-aware, update dynamically) ──
+        _SB_COLORS = {
+            "light": dict(bg=C_MAIN_BG[0], track="#e2e2e2", thumb="#c0c0c0",
+                          hover="#a0a0a0", press="#888888"),
+            "dark":  dict(bg=C_MAIN_BG[1], track="#333348", thumb="#555568",
+                          hover="#6e6e82", press="#8888a0"),
+        }
+
+        def _sb_colors():
+            mode = "light" if ctk.get_appearance_mode().lower() == "light" else "dark"
+            return _SB_COLORS[mode]
+
+        settings_scrollbar = tkinter.Canvas(
+            settings_host, width=12,
+            bg=_sb_colors()["bg"],
+            highlightthickness=0, bd=0, cursor="hand2")
+        settings_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
+
+        _settings_track_id = settings_scrollbar.create_line(
+            6, 8, 6, 42, fill=_sb_colors()["track"],
+            width=4, capstyle=tkinter.ROUND, state=tkinter.HIDDEN)
+        _settings_thumb_id = settings_scrollbar.create_line(
+            6, 8, 6, 42, fill=_sb_colors()["thumb"],
+            width=7, capstyle=tkinter.ROUND, state=tkinter.HIDDEN)
+
+        _settings_thumb_span = (0.0, 1.0)
+        _settings_dragging = False
+        _settings_drag_offset = 0.0
+        _settings_pending_moveto = None
+        _settings_drag_job = None
+        _settings_scrollbar_visible = False
+        _settings_hide_job = None
+        _settings_hovering = False
+
+        def _settings_show_scrollbar():
+            nonlocal _settings_scrollbar_visible, _settings_hide_job
+            if _settings_hide_job is not None:
+                settings_scrollbar.after_cancel(_settings_hide_job)
+                _settings_hide_job = None
+            if not _settings_scrollbar_visible:
+                _settings_scrollbar_visible = True
+                settings_scrollbar.itemconfigure(_settings_track_id, state=tkinter.NORMAL)
+                settings_scrollbar.itemconfigure(_settings_thumb_id, state=tkinter.NORMAL)
+
+        def _settings_schedule_hide():
+            nonlocal _settings_hide_job
+            if _settings_hide_job is not None:
+                settings_scrollbar.after_cancel(_settings_hide_job)
+            _settings_hide_job = settings_scrollbar.after(1200, _settings_hide_scrollbar)
+
+        def _settings_hide_scrollbar():
+            nonlocal _settings_scrollbar_visible, _settings_hide_job
+            _settings_hide_job = None
+            if _settings_dragging or _settings_hovering:
+                return
+            _settings_scrollbar_visible = False
+            settings_scrollbar.itemconfigure(_settings_track_id, state=tkinter.HIDDEN)
+            settings_scrollbar.itemconfigure(_settings_thumb_id, state=tkinter.HIDDEN)
+
+        def _settings_apply_thumb_color():
+            colors = _sb_colors()
+            if _settings_dragging:
+                fill = colors["press"]
+            elif _settings_hovering:
+                fill = colors["hover"]
+            else:
+                fill = colors["thumb"]
+            settings_scrollbar.itemconfigure(_settings_thumb_id, fill=fill)
+
+        def _draw_settings_thumb(first, last):
+            nonlocal _settings_thumb_span
+            start = max(0.0, min(float(first), 1.0))
+            end = max(start, min(float(last), 1.0))
+            _settings_thumb_span = (start, end)
+            if end - start >= 0.999:
+                settings_scrollbar.itemconfigure(_settings_track_id, state=tkinter.HIDDEN)
+                settings_scrollbar.itemconfigure(_settings_thumb_id, state=tkinter.HIDDEN)
+                _settings_scrollbar_visible = False
+                return
+            _settings_show_scrollbar()
+            _preview_settings_thumb(start)
+
+        def _preview_settings_thumb(start):
+            start = max(0.0, min(float(start), 1.0))
+            span = max(_settings_thumb_span[1] - _settings_thumb_span[0], 0.0)
+            height = max(settings_scrollbar.winfo_height(), 1)
+            track_top = 8
+            track_bottom = max(track_top + 1, height - 8)
+            track_height = max(track_bottom - track_top, 1)
+            thumb_min = 28
+            thumb_height = max(thumb_min, int(span * track_height))
+            thumb_height = min(thumb_height, track_height)
+            max_top = track_bottom - thumb_height
+            thumb_top = track_top + int(start * max(track_height - thumb_height, 0))
+            thumb_top = max(track_top, min(thumb_top, max_top))
+            thumb_bottom = thumb_top + thumb_height
+            settings_scrollbar.coords(_settings_track_id, 6, track_top, 6, track_bottom)
+            settings_scrollbar.coords(_settings_thumb_id, 6, thumb_top, 6, thumb_bottom)
+
+        def _settings_scrollbar_set(first, last):
+            _draw_settings_thumb(first, last)
+            _settings_schedule_hide()
+
+        settings_canvas.configure(yscrollcommand=_settings_scrollbar_set)
+
+        def _settings_thumb_fraction_from_y(y):
+            _x1, y1, _x2, y2 = settings_scrollbar.coords(_settings_thumb_id)
+            thumb_height = max(y2 - y1, 1)
+            height = max(settings_scrollbar.winfo_height(), 1)
+            track_top = 8
+            track_height = max(height - 16, 1)
+            movable = max(track_height - thumb_height, 1)
+            thumb_top = y - _settings_drag_offset
+            thumb_top = max(track_top, min(thumb_top, track_top + movable))
+            return (thumb_top - track_top) / movable
+
+        def _settings_scrollbar_press(event):
+            nonlocal _settings_dragging, _settings_drag_offset, _settings_pending_moveto, _settings_drag_job
+            _x1, y1, _x2, y2 = settings_scrollbar.coords(_settings_thumb_id)
+            if y1 <= event.y <= y2:
+                _settings_dragging = True
+                _settings_drag_offset = event.y - y1
+                _settings_pending_moveto = None
+                if _settings_drag_job is not None:
+                    settings_scrollbar.after_cancel(_settings_drag_job)
+                    _settings_drag_job = None
+                _settings_apply_thumb_color()
+            else:
+                _apply_settings_moveto(_settings_thumb_fraction_from_y(event.y))
+
+        def _flush_settings_drag():
+            nonlocal _settings_drag_job
+            _settings_drag_job = None
+            if _settings_dragging and _settings_pending_moveto is not None:
+                _apply_settings_moveto(_settings_pending_moveto)
+                _settings_drag_job = settings_scrollbar.after(16, _flush_settings_drag)
+
+        def _settings_scrollbar_drag(event):
+            nonlocal _settings_pending_moveto, _settings_drag_job
+            if not _settings_dragging:
+                return
+            _settings_pending_moveto = _settings_thumb_fraction_from_y(event.y)
+            _preview_settings_thumb(_settings_pending_moveto)
+            if _settings_drag_job is None:
+                _settings_drag_job = settings_scrollbar.after(16, _flush_settings_drag)
+
+        def _settings_scrollbar_release(_event):
+            nonlocal _settings_dragging, _settings_pending_moveto, _settings_drag_job
+            _settings_dragging = False
+            if _settings_drag_job is not None:
+                settings_scrollbar.after_cancel(_settings_drag_job)
+                _settings_drag_job = None
+            if _settings_pending_moveto is not None:
+                _apply_settings_moveto(_settings_pending_moveto)
+            _settings_pending_moveto = None
+            _settings_apply_thumb_color()
+            _settings_schedule_hide()
+
+        def _settings_scrollbar_enter(_event):
+            nonlocal _settings_hovering
+            _settings_hovering = True
+            _settings_show_scrollbar()
+            _settings_apply_thumb_color()
+
+        def _settings_scrollbar_leave(_event):
+            nonlocal _settings_hovering
+            _settings_hovering = False
+            if not _settings_dragging:
+                _settings_apply_thumb_color()
+                _settings_schedule_hide()
+
+        settings_scrollbar.bind("<ButtonPress-1>", _settings_scrollbar_press)
+        settings_scrollbar.bind("<B1-Motion>", _settings_scrollbar_drag)
+        settings_scrollbar.bind("<ButtonRelease-1>", _settings_scrollbar_release)
+        settings_scrollbar.bind("<Enter>", _settings_scrollbar_enter)
+        settings_scrollbar.bind("<Leave>", _settings_scrollbar_leave)
+
+        settings_scroll = ctk.CTkFrame(settings_canvas, fg_color=C_MAIN_BG, corner_radius=0)
+        settings_scroll.grid_columnconfigure(0, weight=1)
+        settings_window = settings_canvas.create_window((0, 0), window=settings_scroll, anchor="nw")
+        self._settings_scroll = settings_canvas
+
+        def _update_settings_scrollregion(_event=None):
+            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+
+        def _fit_settings_width(_event):
+            settings_canvas.itemconfigure(settings_window, width=_event.width)
+
+        def _settings_mousewheel(event):
+            if sys.platform.startswith("win"):
+                delta = -int(event.delta / 120) if event.delta else 0
+            else:
+                delta = -1 if event.delta > 0 else 1
+            if delta:
+                settings_canvas.yview_scroll(delta * 3, "units")
+
+        settings_scroll.bind("<Configure>", _update_settings_scrollregion)
+        settings_canvas.bind("<Configure>", _fit_settings_width)
+        settings_canvas.bind_all("<MouseWheel>", _settings_mousewheel, add="+")
+
+        def _section(parent, title_key: str, subtitle_key: str):
+            card = ctk.CTkFrame(parent, fg_color=C_CARD_BG, corner_radius=16)
             card.pack(fill="x", padx=30, pady=(0, 14))
             card.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(card, text=self.t(title_key), font=font(15, "bold"),
@@ -7109,15 +7906,18 @@ class SteamSaveManager(ctk.CTk):
             ctk.CTkLabel(parent, text=self.t(text_key), font=font(13, "bold"),
                          text_color=C_BODY_TEXT).grid(row=row, column=0, padx=22, pady=(6, 4), sticky="w")
 
-        general = _section("section_general", "section_general_sub")
-        automation = _section("section_automation", "section_automation_sub")
-        system = _section("section_system", "section_system_sub")
+        def _row(parent):
+            return ctk.CTkFrame(parent, fg_color=C_CARD_BG, corner_radius=8)
+
+        general = _section(settings_scroll, "section_general", "section_general_sub")
+        automation = _section(settings_scroll, "section_automation", "section_automation_sub")
+        system = _section(settings_scroll, "section_system", "section_system_sub")
 
         # General
         general.grid_columnconfigure(0, weight=1)
         _label(general, 2, "language")
         self._language_var = ctk.StringVar(value=self._language_display(self.lang))
-        lang_row = ctk.CTkFrame(general, fg_color="transparent")
+        lang_row = _row(general)
         lang_row.grid(row=3, column=0, padx=22, sticky="ew")
         self._language_menu = ctk.CTkOptionMenu(
             lang_row, variable=self._language_var,
@@ -7137,7 +7937,7 @@ class SteamSaveManager(ctk.CTk):
         ).grid(row=5, column=0, padx=22, sticky="w")
 
         _label(general, 6, "steam_path")
-        sf = ctk.CTkFrame(general, fg_color="transparent")
+        sf = _row(general)
         sf.grid(row=7, column=0, padx=22, pady=(0, 18), sticky="ew")
         self._steam_e = ctk.CTkEntry(sf, width=420, font=font(12))
         self._steam_e.insert(0, self.cfg.get("steam_path", ""))
@@ -7157,7 +7957,7 @@ class SteamSaveManager(ctk.CTk):
 
         # Automation
         _label(automation, 2, "auto_backup")
-        af = ctk.CTkFrame(automation, fg_color="transparent")
+        af = _row(automation)
         af.grid(row=3, column=0, padx=22, sticky="w")
         self._auto_var = ctk.StringVar(value="on" if self.cfg.get("auto_backup_enabled") else "off")
         ctk.CTkSwitch(af, text=self.t("enable"), variable=self._auto_var,
@@ -7170,7 +7970,7 @@ class SteamSaveManager(ctk.CTk):
         self._bind_entry_apply(self._int_e, self._apply_auto_backup_interval)
 
         _label(automation, 4, "file_watch")
-        wf = ctk.CTkFrame(automation, fg_color="transparent")
+        wf = _row(automation)
         wf.grid(row=5, column=0, padx=22, sticky="w")
         self._watch_var = ctk.StringVar(value="on" if self.cfg.get("watch_enabled") else "off")
         ctk.CTkSwitch(wf, text=self.t("enable"), variable=self._watch_var,
@@ -7187,7 +7987,7 @@ class SteamSaveManager(ctk.CTk):
                 row=6, column=0, padx=22, pady=(4, 0), sticky="w")
 
         _label(automation, 7, "auto_sync")
-        sy1 = ctk.CTkFrame(automation, fg_color="transparent")
+        sy1 = _row(automation)
         sy1.grid(row=8, column=0, padx=22, sticky="w")
         self._sync_var = ctk.StringVar(value="on" if self.cfg.get("sync_enabled") else "off")
         ctk.CTkSwitch(sy1, text=self.t("enable"), variable=self._sync_var,
@@ -7200,7 +8000,7 @@ class SteamSaveManager(ctk.CTk):
         self._bind_entry_apply(self._sync_int_e, self._apply_sync_interval)
 
         _label(automation, 9, "sync_folder")
-        sy2 = ctk.CTkFrame(automation, fg_color="transparent")
+        sy2 = _row(automation)
         sy2.grid(row=10, column=0, padx=22, sticky="ew")
         self._sync_folder_e = ctk.CTkEntry(
             sy2, width=360, font=font(12),
@@ -7226,7 +8026,7 @@ class SteamSaveManager(ctk.CTk):
                      text_color=C_SUBTLE_TEXT, wraplength=760,
                      justify="left").grid(row=13, column=0, padx=22, pady=(6, 0), sticky="w")
 
-        sync_keep_row = ctk.CTkFrame(automation, fg_color="transparent")
+        sync_keep_row = _row(automation)
         sync_keep_row.grid(row=14, column=0, padx=22, pady=(10, 0), sticky="w")
         ctk.CTkLabel(sync_keep_row, text=self.t("sync_archive_keep"), font=font(12)).pack(side="left")
         self._sync_archive_keep_e = ctk.CTkEntry(sync_keep_row, width=64, font=font(12))
@@ -7238,7 +8038,58 @@ class SteamSaveManager(ctk.CTk):
         self._sync_notify_var = ctk.StringVar(value="on" if self.cfg.get("sync_notify", True) else "off")
         ctk.CTkSwitch(automation, text=self.t("sync_notify"),
                       variable=self._sync_notify_var, onvalue="on", offvalue="off",
-                      font=font(12), command=self._toggle_sync_notify).grid(row=15, column=0, padx=22, pady=(12, 18), sticky="w")
+                      font=font(12), command=self._toggle_sync_notify).grid(row=15, column=0, padx=22, pady=(12, 0), sticky="w")
+
+        # --- WebDAV ---
+        webdav_row = _row(automation)
+        webdav_row.grid(row=16, column=0, padx=22, pady=(10, 0), sticky="w")
+        self._webdav_var = ctk.StringVar(value="on" if self.cfg.get("webdav_enabled") else "off")
+        ctk.CTkSwitch(webdav_row, text=self.t("webdav_enable"),
+                      variable=self._webdav_var, onvalue="on", offvalue="off",
+                      font=font(12), command=self._toggle_webdav).pack(side="left")
+        if not HAS_WEBDAV:
+            ctk.CTkLabel(automation, text=self.t("webdav_missing"),
+                         font=font(11), text_color="#ea580c").grid(
+                row=17, column=0, padx=22, pady=(4, 0), sticky="w")
+
+        self._webdav_fields = _row(automation)
+        self._webdav_fields.grid(row=18, column=0, padx=22, pady=(6, 18), sticky="ew")
+        self._webdav_fields.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_url"), font=font(12, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 2))
+        self._webdav_url_e = ctk.CTkEntry(
+            self._webdav_fields, font=font(12),
+            placeholder_text=self.t("webdav_url_ph"))
+        self._webdav_url_e.insert(0, self.cfg.get("webdav_url", ""))
+        self._webdav_url_e.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._bind_entry_apply(self._webdav_url_e, self._apply_webdav_url)
+
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_username"), font=font(12, "bold")).grid(
+            row=2, column=0, sticky="w", pady=(0, 2))
+        self._webdav_user_e = ctk.CTkEntry(self._webdav_fields, font=font(12))
+        self._webdav_user_e.insert(0, self.cfg.get("webdav_username", ""))
+        self._webdav_user_e.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self._bind_entry_apply(self._webdav_user_e, self._apply_webdav_user)
+
+        ctk.CTkLabel(self._webdav_fields, text=self.t("webdav_password"), font=font(12, "bold")).grid(
+            row=4, column=0, sticky="w", pady=(0, 2))
+        self._webdav_pass_e = ctk.CTkEntry(self._webdav_fields, font=font(12), show="*")
+        self._webdav_pass_e.insert(0, _webdav_decode_password(self.cfg.get("webdav_password", "")))
+        self._webdav_pass_e.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        self._bind_entry_apply(self._webdav_pass_e, self._apply_webdav_pass)
+
+        webdav_btn_row = _row(self._webdav_fields)
+        webdav_btn_row.grid(row=6, column=0, sticky="w")
+        ctk.CTkButton(webdav_btn_row, text=self.t("webdav_test"), width=120, font=font(12),
+                      fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
+                      command=self._test_webdav_connection).pack(side="left")
+        self._webdav_status = ctk.CTkLabel(
+            webdav_btn_row, text="", font=font(11), text_color=C_SUBTLE_TEXT)
+        self._webdav_status.pack(side="left", padx=(10, 0))
+
+        if not self.cfg.get("webdav_enabled"):
+            self._webdav_fields.grid_remove()
 
         # System
         _label(system, 2, "minimize_tray")
@@ -7258,7 +8109,7 @@ class SteamSaveManager(ctk.CTk):
             row=6, column=0, padx=22, sticky="w")
 
         _label(system, 7, "backup_rotation")
-        rf = ctk.CTkFrame(system, fg_color="transparent")
+        rf = _row(system)
         rf.grid(row=8, column=0, padx=22, sticky="w")
         ctk.CTkLabel(rf, text=self.t("max_backups"), font=font(12)).pack(side="left")
         self._max_bk_e = ctk.CTkEntry(rf, width=64, font=font(12))
@@ -7267,7 +8118,7 @@ class SteamSaveManager(ctk.CTk):
         self._bind_entry_apply(self._max_bk_e, self._apply_max_backups)
         ctk.CTkLabel(rf, text=self.t("max_backups_suffix"), font=font(12)).pack(side="left")
 
-        rf2 = ctk.CTkFrame(system, fg_color="transparent")
+        rf2 = _row(system)
         rf2.grid(row=9, column=0, padx=22, pady=(6, 0), sticky="w")
         ctk.CTkLabel(rf2, text=self.t("max_backup_size"), font=font(12)).pack(side="left")
         self._max_size_e = ctk.CTkEntry(rf2, width=64, font=font(12))
@@ -7277,7 +8128,7 @@ class SteamSaveManager(ctk.CTk):
         ctk.CTkLabel(rf2, text=self.t("max_backup_size_suffix"), font=font(12)).pack(side="left")
 
         _label(system, 10, "backup_storage")
-        bpf = ctk.CTkFrame(system, fg_color="transparent")
+        bpf = _row(system)
         bpf.grid(row=11, column=0, padx=22, sticky="ew")
         self._backup_path_e = ctk.CTkEntry(
             bpf, width=420, font=font(12),
@@ -7410,6 +8261,52 @@ class SteamSaveManager(ctk.CTk):
         self.cfg["sync_notify"] = self._sync_notify_var.get() == "on"
         save_config(self.cfg)
 
+    # ─── WebDAV 设置 ───
+    def _toggle_webdav(self):
+        en = self._webdav_var.get() == "on"
+        self.cfg["webdav_enabled"] = en
+        save_config(self.cfg)
+        if en:
+            self._webdav_fields.grid()
+        else:
+            self._webdav_fields.grid_remove()
+
+    def _apply_webdav_url(self):
+        self.cfg["webdav_url"] = self._webdav_url_e.get().strip()
+        save_config(self.cfg)
+
+    def _apply_webdav_user(self):
+        self.cfg["webdav_username"] = self._webdav_user_e.get().strip()
+        save_config(self.cfg)
+
+    def _apply_webdav_pass(self):
+        self.cfg["webdav_password"] = _webdav_encode_password(self._webdav_pass_e.get())
+        save_config(self.cfg)
+
+    def _test_webdav_connection(self):
+        url = self._webdav_url_e.get().strip()
+        user = self._webdav_user_e.get().strip()
+        password = self._webdav_pass_e.get()
+        if not url:
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                self.bi("请先输入 WebDAV 服务器地址", "Please enter a WebDAV server URL"))
+            return
+        self._webdav_status.configure(
+            text=self.t("webdav_testing"), text_color=C_SUBTLE_TEXT)
+        def _worker():
+            ok, msg = webdav_test_connection(url, user, password)
+            self.after(0, lambda: self._on_webdav_test_result(ok, msg))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_webdav_test_result(self, ok, msg):
+        if ok:
+            self._webdav_status.configure(
+                text=self.t("webdav_test_ok"), text_color="#10b981")
+        else:
+            self._webdav_status.configure(
+                text=f"{self.t('webdav_test_fail')}: {msg}", text_color="#ef4444")
+
     def _toggle_minimize_to_tray(self):
         self.cfg["minimize_to_tray"] = self._minimize_tray_var.get() == "on"
         save_config(self.cfg)
@@ -7474,6 +8371,25 @@ class SteamSaveManager(ctk.CTk):
         t = self._theme_code(val)
         ctk.set_appearance_mode(t)
         self.cfg["theme"] = t; save_config(self.cfg)
+        # Update settings page canvas & scrollbar colors dynamically
+        try:
+            canvas = getattr(self, "_settings_scroll", None)
+            if canvas is not None:
+                mode = "light" if t == "light" else "dark"
+                canvas.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
+                for child in canvas.master.winfo_children():
+                    if isinstance(child, tkinter.Canvas) and child is not canvas:
+                        child.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
+                        items = child.find_all()
+                        if len(items) >= 2:
+                            cols = {
+                                "light": {"track": "#e2e2e2", "thumb": "#c0c0c0"},
+                                "dark":  {"track": "#333348", "thumb": "#555568"},
+                            }[mode]
+                            child.itemconfigure(items[0], fill=cols["track"])
+                            child.itemconfigure(items[1], fill=cols["thumb"])
+        except Exception:
+            pass
 
     def _toggle_auto(self):
         en = self._auto_var.get() == "on"
@@ -7509,41 +8425,69 @@ class SteamSaveManager(ctk.CTk):
         self._restart_sync_runtime()
 
     def _manual_sync_all(self):
+        if self._io_busy: return
         sf = self.cfg.get("sync_folder", "")
         if not sf:
             self._show_warning("提示", "请先在设置中配置同步文件夹"); return
         games = self.cfg.get("games", [])
         if not games:
             self._show_info("提示", "请先添加游戏"); return
-        try:
-            results = sync_all_games(self.cfg)
-            lines = [f"{name}：{msg}" for name, msg in results]
-            self._show_info("同步完成", "\n".join(lines))
-            conflict_keys = {
-                get_game_sync_key(game)
-                for game in self.cfg.get("games", [])
-                if get_game_sync_state(self.cfg, game).get("pending_conflict")
-            }
-            for game in self.cfg.get("games", []):
-                if get_game_sync_key(game) in conflict_keys:
-                    self._show_sync_conflict_dialog(game)
-        except Exception as e:
-            self._show_error("同步失败", f"同步过程中出错：\n{e}")
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                results = sync_all_games(self.cfg)
+                self.after(0, lambda: self._on_sync_all_done(results))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_sync_failed(err))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_all_done(self, results):
+        self._set_io_busy(False)
+        lines = [f"{name}：{msg}" for name, msg in results]
+        self._show_info("同步完成", "\n".join(lines))
+        conflict_keys = {
+            get_game_sync_key(game)
+            for game in self.cfg.get("games", [])
+            if get_game_sync_state(self.cfg, game).get("pending_conflict")
+        }
+        for game in self.cfg.get("games", []):
+            if get_game_sync_key(game) in conflict_keys:
+                self._show_sync_conflict_dialog(game)
+
+    def _on_sync_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error("同步失败", f"同步过程中出错：\n{err}")
 
     def _manual_sync_one(self, idx):
-        g = self.cfg["games"][idx]
+        if self._io_busy: return
+        g = dict(self.cfg["games"][idx])
         sf = self.cfg.get("sync_folder", "")
         if not sf:
             self._show_warning("提示", "请先在设置中配置同步文件夹"); return
         mode = self.cfg.get("sync_mode", "bidirectional")
-        try:
-            r = sync_game_save(g, sf, mode, cfg=self.cfg)
-            if r.startswith("冲突："):
-                self._show_sync_conflict_dialog(g)
-            else:
-                self._show_info("同步结果", f"「{g['name']}」{r}")
-        except Exception as e:
-            self._show_error("同步失败", f"「{g['name']}」同步出错：\n{type(e).__name__}: {e}")
+        game_name = g.get("name", "")
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                r = sync_game_save(g, sf, mode, cfg=self.cfg)
+                self.after(0, lambda: self._on_sync_one_done(game_name, r, idx))
+            except Exception as e:
+                self.after(0, lambda err=f"{type(e).__name__}: {e}", name=game_name:
+                    self._on_sync_one_failed(name, err))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_one_done(self, game_name, result, idx):
+        self._set_io_busy(False)
+        if result.startswith("冲突："):
+            live_game = self.cfg["games"][idx] if idx < len(self.cfg["games"]) else None
+            if live_game:
+                self._show_sync_conflict_dialog(live_game)
+        else:
+            self._show_info("同步结果", f"「{game_name}」{result}")
+
+    def _on_sync_one_failed(self, game_name, err):
+        self._set_io_busy(False)
+        self._show_error("同步失败", f"「{game_name}」同步出错：\n{err}")
 
     # ─── 定时备份 ───
     def _start_auto_backup(self):
