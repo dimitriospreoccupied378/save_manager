@@ -3794,15 +3794,45 @@ def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
     return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
 
 
+def _webdav_path_variants(remote_path: str) -> list[str]:
+    raw = str(remote_path or "").strip().replace("\\", "/")
+    if not raw:
+        return ["/", ""]
+    absolute = "/" + raw.strip("/")
+    relative = raw.strip("/")
+    variants = []
+    for item in (absolute, relative):
+        if item not in variants:
+            variants.append(item)
+    return variants
+
+
+def _webdav_try_variants(func, remote_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            return candidate, func(candidate)
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_path")
+
+
 def _webdav_ensure_remote_dir(client, remote_dir: str):
-    normalized = "/" + str(remote_dir or "").strip().strip("/")
-    if normalized == "/":
+    normalized = str(remote_dir or "").strip().strip("/")
+    if not normalized:
         return
     current = ""
     for part in [p for p in normalized.split("/") if p]:
-        current += f"/{part}"
+        current = f"{current}/{part}" if current else part
         try:
-            client.mkdir(current)
+            _webdav_try_variants(lambda path: client.check(path), current)
+            continue
+        except Exception:
+            pass
+        try:
+            _webdav_try_variants(lambda path: client.mkdir(path), current)
         except Exception:
             err_text = str(sys.exc_info()[1] or "").lower()
             if any(token in err_text for token in (
@@ -3826,14 +3856,15 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
     try:
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         _webdav_ensure_remote_dir(client, archive_dir)
+        archive_dir_variant, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
         client.upload_sync(
-            remote_path=f"{archive_dir}/{zip_name}",
+            remote_path=f"{archive_dir_variant.rstrip('/')}/{zip_name}",
             local_path=local_zip)
         try:
             client.upload_sync(
-                remote_path=f"{archive_dir}/{meta_name}",
+                remote_path=f"{archive_dir_variant.rstrip('/')}/{meta_name}",
                 local_path=local_meta)
         except Exception:
             pass
@@ -3850,7 +3881,7 @@ def webdav_list_archives(cfg: dict, game_name: str) -> list:
     try:
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
         try:
-            client.check(archive_dir)
+            archive_dir, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
         except Exception:
             return []
         items = client.list(archive_dir)
@@ -3875,6 +3906,7 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
             return None
         latest_name = archives[-1]
         archive_dir = _webdav_remote_archive_dir(cfg, game_name)
+        archive_dir, _ = _webdav_try_variants(lambda path: client.check(path), archive_dir)
 
         # 解析时间戳 -> 本地 YYYY-MM 子目录
         ts_part = latest_name.replace(".zip", "")
@@ -3886,14 +3918,14 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path)
         if local_zip.exists():
             return None  # 已经是最新
 
-        remote_zip = f"{archive_dir}/{latest_name}"
+        remote_zip = f"{archive_dir.rstrip('/')}/{latest_name}"
         client.download_sync(remote_path=remote_zip, local_path=str(local_zip))
 
         # 也下载 meta 文件
         meta_name = latest_name + ".meta.json"
         try:
             client.download_sync(
-                remote_path=f"{archive_dir}/{meta_name}",
+                remote_path=f"{archive_dir.rstrip('/')}/{meta_name}",
                 local_path=str(month_dir / meta_name))
         except Exception:
             pass
