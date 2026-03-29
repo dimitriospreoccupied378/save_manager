@@ -24,10 +24,15 @@ hiddenimports = [
     "watchdog",
     "watchdog.observers",
     "watchdog.events",
+    "webdav3",
+    "webdav3.client",
 ]
 
-for package_name in ("customtkinter", "pystray"):
-    collected = collect_all(package_name)
+for package_name in ("customtkinter", "pystray", "webdav3"):
+    try:
+        collected = collect_all(package_name)
+    except Exception:
+        continue
     datas += collected[0]
     binaries += collected[1]
     hiddenimports += collected[2]
