@@ -3813,6 +3813,7 @@ def _webdav_split_url(url: str) -> tuple[str, str]:
 
 def _webdav_apply_client_options(client, cfg: Optional[dict]):
     verify_ssl = bool((cfg or {}).get("webdav_verify_ssl", True))
+    preset = str((cfg or {}).get("webdav_preset", "generic") or "generic").strip()
     try:
         client.verify = verify_ssl
     except Exception:
@@ -3823,6 +3824,11 @@ def _webdav_apply_client_options(client, cfg: Optional[dict]):
             session.verify = verify_ssl
     except Exception:
         pass
+    if preset != "generic":
+        try:
+            client.webdav.disable_check = True
+        except Exception:
+            pass
 
 
 def webdav_is_ready(cfg: Optional[dict]) -> bool:
