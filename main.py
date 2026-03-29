@@ -3886,7 +3886,11 @@ def _webdav_try_variants(func, remote_path: str):
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
         try:
-            return candidate, func(candidate)
+            result = func(candidate)
+            if result is False:
+                last_error = RuntimeError(f"operation returned False for {candidate}")
+                continue
+            return candidate, result
         except Exception as e:
             last_error = e
     if last_error:
@@ -3911,7 +3915,10 @@ def _webdav_upload_with_variants(client, remote_path: str, local_path: str):
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
         try:
-            client.upload_sync(remote_path=candidate, local_path=local_path)
+            result = client.upload_sync(remote_path=candidate, local_path=local_path)
+            if result is False:
+                last_error = RuntimeError(f"upload returned False for {candidate}")
+                continue
             return candidate
         except Exception as e:
             last_error = e
@@ -3924,7 +3931,10 @@ def _webdav_download_with_variants(client, remote_path: str, local_path: str):
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
         try:
-            client.download_sync(remote_path=candidate, local_path=local_path)
+            result = client.download_sync(remote_path=candidate, local_path=local_path)
+            if result is False:
+                last_error = RuntimeError(f"download returned False for {candidate}")
+                continue
             return candidate
         except Exception as e:
             last_error = e
