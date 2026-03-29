@@ -97,6 +97,8 @@ jobs:
           } else {
             pip install customtkinter pillow psutil watchdog pystray pyinstaller webdavclient3
           }
+          pip install webdavclient3
+          python -m pip show webdavclient3
 
       - name: 6. Verify WebDAV dependency
         if: steps.version.outputs.skip_build != 'true'
