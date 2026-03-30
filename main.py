@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.7 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.8 — 通用版"""
 
 import os
 import sys
@@ -78,7 +78,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.7"
+VERSION = "1.2.8"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -2640,6 +2640,31 @@ def has_install_root_save_files(path: str) -> bool:
     return strong_hits >= 1 or (strong_hits == 0 and weak_hits >= 2)
 
 
+def infer_install_root_file_specs(path: str) -> list[dict]:
+    """从安装目录根文件中推断精确文件规则，避免整目录打包。"""
+    if not path or not os.path.isdir(path):
+        return []
+    ext_counts: dict[str, int] = {}
+    try:
+        for item in os.scandir(path):
+            if not item.is_file():
+                continue
+            _, ext = os.path.splitext(item.name.lower())
+            if ext in STRONG_SAVE_FILE_EXTENSIONS:
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+    except OSError:
+        return []
+
+    includes = [f"*{ext}" for ext, _ in sorted(ext_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    if not includes:
+        return []
+    return _normalize_unique_save_specs([{
+        "base": os.path.normpath(path),
+        "includes": includes,
+        "recursive": False,
+    }])
+
+
 def score_autocloud_candidate(auto: dict, remotecache_entry: Optional[dict] = None,
                               game_name: str = "", install_dir: str = "") -> int:
     score = 82
@@ -3042,7 +3067,13 @@ def detect_save_candidates(appid: str, game_name: str,
                 _add(path, 94, "appinfo", save_specs=save_specs)
 
     if install_dir and has_install_root_save_files(install_dir):
-        _add(install_dir, 96 if steamdb_enabled else 90, "install-root-files")
+        inferred_root_specs = infer_install_root_file_specs(install_dir)
+        _add(
+            install_dir,
+            96 if steamdb_enabled else 90,
+            "install-root-files",
+            save_specs=inferred_root_specs or None,
+        )
 
     # 1b) SteamDB Cloud Save / UFS 线索（可选，需联网，优先模式）
     if steamdb_enabled and str(appid or "").strip():
@@ -3200,8 +3231,7 @@ def load_config() -> dict:
     }
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+            cfg = load_json_file_tolerant(CONFIG_FILE, default={}) or {}
             # 用 defaults 补齐缺失的键
             for k, v in defaults.items():
                 if k not in cfg:
@@ -3663,8 +3693,7 @@ def get_latest_sync_archive(sync_game_dir: Path) -> Optional[dict]:
         meta = {}
         if meta_path.exists():
             try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
+                meta = load_json_file_tolerant(meta_path, default={}) or {}
             except Exception:
                 meta = {}
         return {
@@ -4246,8 +4275,7 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
             local_meta_data = {}
             if local_meta.exists():
                 try:
-                    with open(local_meta, "r", encoding="utf-8") as fh:
-                        local_meta_data = json.load(fh)
+                    local_meta_data = load_json_file_tolerant(local_meta, default={}) or {}
                 except Exception:
                     local_meta_data = {}
             expected_size = int(local_meta_data.get("archive_size", 0) or 0)
@@ -4272,8 +4300,7 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
         meta_data = {}
         if local_meta.exists():
             try:
-                with open(local_meta, "r", encoding="utf-8") as fh:
-                    meta_data = json.load(fh)
+                meta_data = load_json_file_tolerant(local_meta, default={}) or {}
             except Exception:
                 meta_data = {}
         expected_size = int(meta_data.get("archive_size", 0) or 0)
@@ -4990,6 +5017,39 @@ def fmt_size(size: int) -> str:
     return f"{s:.1f} TB"
 
 
+def load_json_file_tolerant(path: Path | str, default=None, repair: bool = True):
+    """宽容读取 JSON，允许尾部出现额外字符，并可自动修复文件。"""
+    file_path = Path(path)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        pass
+    except Exception:
+        return default
+
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return default
+
+    cleaned = raw.lstrip("\ufeff")
+    decoder = json.JSONDecoder()
+    try:
+        obj, end = decoder.raw_decode(cleaned)
+    except Exception:
+        return default
+
+    trailing = cleaned[end:].strip()
+    if trailing and repair:
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return obj
+
+
 def create_backup(game: dict, note: str = "") -> Optional[str]:
     save_specs = get_game_save_specs(game, existing_only=True)
     if not save_specs:
@@ -5028,7 +5088,7 @@ def enforce_backup_limits(game_name: str = None):
     """
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+            cfg = load_json_file_tolerant(CONFIG_FILE, default={}) or {}
     except Exception:
         return
     max_per_game = cfg.get("max_backups_per_game", 20)
@@ -5160,8 +5220,7 @@ def get_backups(game_name: str) -> list:
         meta_file = f.with_suffix(".meta.json")
         meta = {}
         if meta_file.exists():
-            with open(meta_file, "r", encoding="utf-8") as mf:
-                meta = json.load(mf)
+            meta = load_json_file_tolerant(meta_file, default={}) or {}
         backups.append({
             "path": str(f), "filename": f.name,
             "timestamp": meta.get("timestamp", f.stem),
