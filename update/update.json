@@ -1,6 +1,6 @@
 {
-  "sha256": "713c8e3fbc0f163ae2b949307d4680917c12673388857b3d48ebbd332e318a16",
-  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.2.7/SteamSaveManager.exe",
-  "version": "1.2.7",
-  "notes": "1. 支持将存档自动同步到任意 WebDAV 兼容的云存储服务（如坚果云、NextCloud、群晖Synology 等），实现多设备间的存档同步，同时与同步文件夹不冲突，开启方法：设置 - WebDev远程同步\n2. 修复WebDev与本地映射同步文件夹冲突的问题\n3. 新增WebDev自定义同步目录\n4. 持续修复部分steamdb模式存档识别问题\n5. 修复设置页拖动时出现的拖影问题\n6. 修复博德之门 3 存档路径丢失问题，合并 PlayerProfiles 与根目录两条路径；删除只狼冗余重复条目\n7. 备份、还原、删除备份、同步等 11 个 IO 操作全部移入后台线程，操作期间界面保持响应\n8. 一键备份时窗口标题实时显示进度（如 \"备份中 3/10...\"）\n9. 将 compute_save_spec_hash 和 compute_dir_hash 中重复的 64KB 分块哈希逻辑合并为 _streaming_file_hash 公共函数\n10. 新增 _io_busy 防重复触发机制，防止 IO 操作进行中重复点击"
+  "version": "1.2.8",
+  "notes": "1. 修复了多设备切换时，备份元数据或配置文件尾部被追加额外字符后导致程序崩溃的问题\n2. 新增宽容 JSON 读取与自动修复机制，可处理前半段是合法 JSON、尾部带脏数据的文件\n3. 宽容 JSON 读取已应用到备份元数据、同步归档元数据、WebDAV 归档元数据以及备份和配置读取流程\n4. 优化了游戏根目录存档的识别逻辑，避免这类游戏退化成整目录打包\n5. 新增安装目录根文件规则推断，可自动生成类似 *.sav 的精确文件模式，而不是把整个游戏根目录视为存档目录\n6. 保持对普通文件夹型存档游戏的兼容，同时让根目录文件型游戏能按精确规则进行备份和同步",
+  "url": "https://github.com/Kiowx/save_manager/releases/download/v1.2.8/SteamSaveManager.exe",
+  "sha256": "ce6f78e8dc30a94d3cfd3259c41b989c2da7d5af5fc274e3686cd6504e7028c3"
 }
