@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.8 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.2.9 — 通用版"""
 
 import os
 import sys
@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import html
 import tkinter
+import weakref
 from pathlib import Path
 from typing import Optional
 
@@ -78,7 +79,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.8"
+VERSION = "1.2.9"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -3621,6 +3622,11 @@ def enforce_all_sync_archive_limits(cfg: Optional[dict]):
             continue
         seen_dirs.add(dir_key)
         enforce_sync_archive_limits(sync_game_dir, keep_count)
+        if cfg.get("webdav_enabled") and HAS_WEBDAV:
+            try:
+                webdav_enforce_archive_limits(cfg, game_name, keep_count)
+            except Exception:
+                pass
 
 
 def _remove_tree_contents(path: Path):
@@ -3652,9 +3658,9 @@ def create_sync_archive(game: dict, sync_game_dir: Path,
     month_dir = get_sync_archive_root(sync_game_dir) / now.strftime("%Y-%m")
     month_dir.mkdir(parents=True, exist_ok=True)
     archive_path = month_dir / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.zip"
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+    with _open_zip_for_write(archive_path) as archive:
         for _, abs_f, arcname in _iter_sync_payload_files(save_specs):
-            archive.write(abs_f, arcname)
+            _zip_write_file(archive, abs_f, arcname)
     archive_size = int(archive_path.stat().st_size) if archive_path.exists() else 0
     archive_sha256 = compute_file_sha256(archive_path) if archive_size else ""
     meta = {
@@ -4234,6 +4240,37 @@ def webdav_list_archives(cfg: dict, game_name: str) -> list:
         return sorted(names)
     except Exception:
         return []
+
+
+def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3):
+    """执行 WebDAV 远端归档轮转，只保留最近 keep_count 个 ZIP。"""
+    if keep_count <= 0:
+        return
+    client = _webdav_make_client(cfg)
+    if not client:
+        return
+    try:
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
+        archive_dir = _webdav_find_existing_variant(client, archive_dir)
+    except Exception:
+        return
+
+    try:
+        archive_names = sorted(webdav_list_archives(cfg, game_name), reverse=True)
+    except Exception:
+        archive_names = []
+    if len(archive_names) <= keep_count:
+        return
+
+    for name in archive_names[keep_count:]:
+        try:
+            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}")
+        except Exception:
+            pass
+        try:
+            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}.meta.json")
+        except Exception:
+            pass
 
 
 def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
@@ -4856,6 +4893,10 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                     webdav_error = upload_msg or "upload_failed"
                 else:
                     webdav_error = ""
+                    try:
+                        webdav_enforce_archive_limits(cfg, game["name"], keep_count)
+                    except Exception:
+                        pass
         return archive_path
 
     def _download_remote_payload():
@@ -5017,6 +5058,34 @@ def fmt_size(size: int) -> str:
     return f"{s:.1f} TB"
 
 
+def _zip_safe_datetime(timestamp: float) -> tuple[int, int, int, int, int, int]:
+    try:
+        dt = datetime.datetime.fromtimestamp(max(float(timestamp), 0.0))
+    except Exception:
+        dt = datetime.datetime.now()
+    if dt.year < 1980:
+        dt = datetime.datetime(1980, 1, 1, 0, 0, 0)
+    elif dt.year > 2107:
+        dt = datetime.datetime(2107, 12, 31, 23, 59, 58)
+    return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+
+
+def _open_zip_for_write(zip_path: Path | str):
+    return zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False)
+
+
+def _zip_write_file(zf: zipfile.ZipFile, file_path: Path | str, arcname: Path | str):
+    src_path = Path(file_path)
+    arcname_str = Path(arcname).as_posix()
+    st = src_path.stat()
+    info = zipfile.ZipInfo(filename=arcname_str, date_time=_zip_safe_datetime(st.st_mtime))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = (st.st_mode & 0xFFFF) << 16
+    with src_path.open("rb") as src, zf.open(info, "w") as dst:
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+
 def load_json_file_tolerant(path: Path | str, default=None, repair: bool = True):
     """宽容读取 JSON，允许尾部出现额外字符，并可自动修复文件。"""
     file_path = Path(path)
@@ -5050,7 +5119,7 @@ def load_json_file_tolerant(path: Path | str, default=None, repair: bool = True)
     return obj
 
 
-def create_backup(game: dict, note: str = "") -> Optional[str]:
+def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None) -> Optional[str]:
     save_specs = get_game_save_specs(game, existing_only=True)
     if not save_specs:
         return None
@@ -5060,11 +5129,11 @@ def create_backup(game: dict, note: str = "") -> Optional[str]:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = game_dir / f"{ts}.zip"
     is_multi = len(save_specs) > 1
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with _open_zip_for_write(zip_path) as zf:
         for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
             arc_prefix = Path("__multi__") / f"p{idx}" if is_multi else Path()
             arcname = arc_prefix / Path(rel) if is_multi else Path(rel)
-            zf.write(abs_f, arcname)
+            _zip_write_file(zf, abs_f, arcname)
     meta = {
         "game": game["name"], "appid": game.get("appid", ""),
         "timestamp": ts, "note": note,
@@ -5073,6 +5142,8 @@ def create_backup(game: dict, note: str = "") -> Optional[str]:
         "multi_path": is_multi,
         "size": zip_path.stat().st_size,
     }
+    if isinstance(extra_meta, dict):
+        meta.update(extra_meta)
     with open(zip_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     enforce_backup_limits(game["name"])
@@ -5226,6 +5297,8 @@ def get_backups(game_name: str) -> list:
             "timestamp": meta.get("timestamp", f.stem),
             "note": meta.get("note", ""),
             "size": meta.get("size", f.stat().st_size),
+            "backup_kind": meta.get("backup_kind", ""),
+            "linked_sync_archive": meta.get("linked_sync_archive", ""),
         })
     return backups
 
@@ -5235,6 +5308,48 @@ def delete_backup(zip_path: str):
     if p.exists(): p.unlink()
     m = p.with_suffix(".meta.json")
     if m.exists(): m.unlink()
+
+
+def delete_linked_sync_archive(cfg: Optional[dict], game_name: str, archive_name: str) -> dict:
+    result = {"local_deleted": False, "webdav_deleted": False, "errors": []}
+    if not cfg or not game_name or not archive_name:
+        return result
+
+    local_root = str(cfg.get("sync_folder", "") or "").strip()
+    if local_root and os.path.isdir(local_root):
+        archive_root = get_sync_archive_root(get_sync_game_dir(local_root, game_name))
+        try:
+            matches = list(archive_root.rglob(archive_name)) if archive_root.exists() else []
+        except Exception:
+            matches = []
+        for archive_path in matches:
+            try:
+                archive_path.unlink()
+                result["local_deleted"] = True
+            except Exception as e:
+                result["errors"].append(f"local:{type(e).__name__}: {e}")
+            try:
+                meta_path = get_sync_archive_meta_path(archive_path)
+                if meta_path.exists():
+                    meta_path.unlink()
+            except Exception as e:
+                result["errors"].append(f"local-meta:{type(e).__name__}: {e}")
+
+    if cfg.get("webdav_enabled") and HAS_WEBDAV:
+        client = _webdav_make_client(cfg)
+        if client:
+            remote_dir = _webdav_remote_archive_dir(cfg, game_name)
+            try:
+                _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}")
+                result["webdav_deleted"] = True
+            except Exception as e:
+                result["errors"].append(f"webdav:{type(e).__name__}: {e}")
+            try:
+                _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}.meta.json")
+            except Exception:
+                pass
+
+    return result
 
 
 # ══════════════════════════════════════════════
@@ -5859,6 +5974,8 @@ class SteamSaveManager(ctk.CTk):
         self._scan_start_btn = None
         self._scan_add_all_btn = None
         self._io_busy = False
+        self._popup_windows: weakref.WeakSet = weakref.WeakSet()
+        self._popup_restore_grab: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
         self.title(self.t("product_title"))
         self.geometry("1080x720")
@@ -5868,6 +5985,7 @@ class SteamSaveManager(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.configure(fg_color=C_MAIN_BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Map>", self._on_root_map, add="+")
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -6013,9 +6131,74 @@ class SteamSaveManager(ctk.CTk):
             self.focus_force()
         except Exception:
             pass
+        self.after(60, self._restore_popup_windows)
+
+    def _track_popup(self, window):
+        try:
+            self._popup_windows.add(window)
+            self._popup_restore_grab[window] = False
+        except Exception:
+            pass
+        window.bind("<Unmap>", lambda e, w=window: self._on_popup_unmap(w), add="+")
+        window.bind("<Map>", lambda e, w=window: self._on_popup_map(w), add="+")
+        window.bind("<Destroy>", lambda e, w=window: self._on_popup_destroy(w), add="+")
+        return window
+
+    def _on_popup_destroy(self, window):
+        try:
+            self._popup_restore_grab.pop(window, None)
+        except Exception:
+            pass
+
+    def _on_popup_unmap(self, window):
+        try:
+            if not window.winfo_exists():
+                return
+            state = window.state()
+            current = self.grab_current()
+            if current == window and state == "iconic":
+                self._popup_restore_grab[window] = True
+                window.grab_release()
+        except Exception:
+            pass
+
+    def _on_popup_map(self, window):
+        self.after(80, lambda w=window: self._restore_single_popup(w))
+
+    def _on_root_map(self, _event=None):
+        self.after(80, self._restore_popup_windows)
+
+    def _restore_single_popup(self, window):
+        try:
+            if not window.winfo_exists():
+                return
+            if self.state() == "iconic":
+                return
+            try:
+                if window.state() == "iconic":
+                    window.deiconify()
+            except Exception:
+                pass
+            try:
+                window.lift()
+            except Exception:
+                pass
+            if self._popup_restore_grab.get(window):
+                try:
+                    window.grab_set()
+                    self._popup_restore_grab[window] = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _restore_popup_windows(self):
+        for window in list(self._popup_windows):
+            self._restore_single_popup(window)
 
     def _prepare_popup(self, window):
         self._prepare_dialog_parent()
+        self._track_popup(window)
         try:
             window.transient(self)
         except Exception:
@@ -7083,10 +7266,11 @@ class SteamSaveManager(ctk.CTk):
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             zp = gd / f"{ts}_imported.zip"
             fp = Path(folder)
-            with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+            with _open_zip_for_write(zp) as zf:
                 for root, _, files in os.walk(fp):
                     for file in files:
-                        af = Path(root) / file; zf.write(af, af.relative_to(fp))
+                        af = Path(root) / file
+                        _zip_write_file(zf, af, af.relative_to(fp))
             meta = {"game": g["name"], "appid": g.get("appid", ""),
                     "timestamp": ts, "note": self.bi("导入的存档文件夹", "Imported save folder"),
                     "source": folder, "size": zp.stat().st_size}
@@ -9377,6 +9561,7 @@ class SteamSaveManager(ctk.CTk):
             self.deiconify()
             self.lift()
             self.focus_force()
+            self._restore_popup_windows()
         self.after(0, _show)
 
     def _tray_show_about(self, *a):
