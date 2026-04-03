@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.2.9 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.0 — 通用版"""
 
 import os
 import sys
@@ -79,7 +79,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.2.9"
+VERSION = "1.3.0"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -143,6 +143,7 @@ TRANSLATIONS = {
         "section_system": "系统与存储",
         "section_system_sub": "通知、托盘、自启和备份轮转",
         "steam_path": "Steam 安装路径",
+        "steam_account": "Steam 账号",
         "steamdb_detection": "SteamDB 存档识别",
         "steamdb_detection_desc": "启用后优先使用 SteamDB 识别；若无结果则回退到普通本地识别。",
         "browse": "浏览",
@@ -258,6 +259,7 @@ TRANSLATIONS = {
         "section_system": "System & Storage",
         "section_system_sub": "Notifications, tray behavior, startup, and retention",
         "steam_path": "Steam Install Path",
+        "steam_account": "Steam Account",
         "steamdb_detection": "SteamDB Save Detection",
         "steamdb_detection_desc": "When enabled, the app prioritizes SteamDB for save detection. If no result is found, it falls back to normal local detection.",
         "browse": "Browse",
@@ -386,6 +388,24 @@ def bilingual_text(lang: str, zh: str, en: str) -> str:
 
 def bilingual_cfg(cfg: Optional[dict], zh: str, en: str) -> str:
     return bilingual_text(cfg_language(cfg), zh, en)
+
+
+def localize_backup_note(note: str, lang: str = "") -> str:
+    note = (note or "").strip()
+    if not note:
+        return ""
+    target_lang = normalize_language(lang)
+    system_note_pairs = [
+        ("定时自动备份", "Scheduled Backup"),
+        ("文件变动自动备份", "File change auto backup"),
+        ("同步前自动备份", "Auto backup before sync"),
+        ("自动同步成功", "Auto sync completed"),
+        ("同步成功", "Sync completed"),
+    ]
+    for zh, en in system_note_pairs:
+        if note == zh or note == en:
+            return bilingual_text(target_lang, zh, en)
+    return note
 
 
 def translate_cfg(cfg: Optional[dict], key: str, **kwargs) -> str:
@@ -929,6 +949,63 @@ def get_steam_user_ids(steam_path: str) -> list[str]:
         return []
     return [d for d in os.listdir(userdata)
             if os.path.isdir(os.path.join(userdata, d)) and d.isdigit()]
+
+
+def _accountid_from_steam64(steamid64: str) -> str:
+    try:
+        return str(int(str(steamid64).strip()) - 76561197960265728)
+    except Exception:
+        return ""
+
+
+def get_steam_accounts(steam_path: str) -> list[dict]:
+    """读取 Steam 多账号列表，并尽量补齐账号昵称。"""
+    accounts: dict[str, dict] = {}
+    for uid in get_steam_user_ids(steam_path):
+        accounts[uid] = {
+            "accountid": uid,
+            "steamid64": _steam64_from_accountid(uid),
+            "persona_name": "",
+            "account_name": "",
+            "most_recent": False,
+        }
+
+    loginusers_path = os.path.join(steam_path, "config", "loginusers.vdf")
+    if os.path.isfile(loginusers_path):
+        try:
+            data = parse_vdf(Path(loginusers_path).read_text(encoding="utf-8", errors="ignore"))
+            users = data.get("users") or data.get("Users") or {}
+            if isinstance(users, dict):
+                for steam64, info in users.items():
+                    if not isinstance(info, dict):
+                        continue
+                    accountid = _accountid_from_steam64(steam64)
+                    if not accountid:
+                        continue
+                    item = accounts.setdefault(accountid, {
+                        "accountid": accountid,
+                        "steamid64": str(steam64).strip(),
+                        "persona_name": "",
+                        "account_name": "",
+                        "most_recent": False,
+                    })
+                    item["steamid64"] = str(steam64).strip() or item.get("steamid64", "")
+                    item["persona_name"] = str(
+                        info.get("PersonaName") or info.get("personaname") or item.get("persona_name", "")
+                    ).strip()
+                    item["account_name"] = str(
+                        info.get("AccountName") or info.get("accountname") or item.get("account_name", "")
+                    ).strip()
+                    item["most_recent"] = str(info.get("MostRecent") or info.get("mostrecent") or "0").strip() == "1"
+        except Exception:
+            pass
+
+    result = list(accounts.values())
+    result.sort(key=lambda item: (
+        0 if item.get("most_recent") else 1,
+        (item.get("persona_name") or item.get("account_name") or item.get("accountid") or "").lower(),
+    ))
+    return result
 
 
 def parse_acf(acf_path: str) -> dict:
@@ -1930,6 +2007,21 @@ def _save_spec_match_relpath(spec: dict, rel_path: str) -> bool:
     return False
 
 
+def _save_specs_match_path(specs: list[dict], abs_path: str) -> bool:
+    target = Path(abs_path)
+    for spec in _normalize_unique_save_specs(specs):
+        try:
+            base = Path(spec.get("base", ""))
+            if not base:
+                continue
+            rel = target.relative_to(base).as_posix()
+        except Exception:
+            continue
+        if _save_spec_match_relpath(spec, rel):
+            return True
+    return False
+
+
 def iter_save_spec_files(specs: list[dict]):
     for idx, spec in enumerate(_normalize_unique_save_specs(specs), start=1):
         base = Path(spec["base"])
@@ -2018,14 +2110,17 @@ def get_installed_game_info(steam_path: str, appid: str) -> Optional[dict]:
 
 def _resolve_metadata_entry_specs(entry: dict, appid: str, primary_path: str,
                                   install_dir: str, steam_path: str,
-                                  library_path: str = "") -> list[dict]:
+                                  library_path: str = "",
+                                  preferred_accountids: Optional[list[str]] = None) -> list[dict]:
     includes = list(entry.get("includes", []))
     if not includes:
         return []
     template = str(entry.get("template", "") or "").strip()
     if not template:
         return []
-    expanded_paths = expand_steamdb_template(template, appid, install_dir, steam_path, library_path)
+    expanded_paths = expand_steamdb_template(
+        template, appid, install_dir, steam_path, library_path, preferred_accountids
+    )
     if not expanded_paths:
         inferred_install = infer_install_dir_from_steamdb_template(template, install_dir, library_path)
         if inferred_install:
@@ -2069,14 +2164,19 @@ def _infer_precise_metadata_specs_for_game(game: Optional[dict], steam_path: str
     if os.path.normcase(os.path.normpath(primary_path)) != os.path.normcase(os.path.normpath(install_dir)):
         return []
     candidate_specs = []
+    preferred_accountids = _preferred_steam_account_ids(cfg, steam_path)
     for entry in parse_appinfo_ufs_entries(steam_path, appid):
         candidate_specs.extend(
-            _resolve_metadata_entry_specs(entry, appid, primary_path, install_dir, steam_path, library_path)
+            _resolve_metadata_entry_specs(
+                entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
+            )
         )
     if cfg and cfg.get("steamdb_detection_enabled"):
         for entry in fetch_steamdb_ufs_entries(appid):
             candidate_specs.extend(
-                _resolve_metadata_entry_specs(entry, appid, primary_path, install_dir, steam_path, library_path)
+                _resolve_metadata_entry_specs(
+                    entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
+                )
             )
     candidate_specs = _normalize_unique_save_specs(candidate_specs)
     if candidate_specs:
@@ -2110,6 +2210,12 @@ def _steam64_from_accountid(accountid: str) -> str:
         return str(76561197960265728 + int(str(accountid).strip()))
     except Exception:
         return ""
+
+
+def _preferred_steam_account_ids(cfg: Optional[dict], steam_path: str) -> list[str]:
+    return []
+
+
 
 
 def _steamdb_strip_html(fragment: str) -> str:
@@ -2250,7 +2356,8 @@ def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
 
 def expand_steamdb_template(template: str, appid: str,
                             install_dir: str = "", steam_path: str = "",
-                            library_path: str = "") -> list[str]:
+                            library_path: str = "",
+                            preferred_accountids: Optional[list[str]] = None) -> list[str]:
     if not template:
         return []
     library_root = _get_steam_library_root(install_dir, steam_path, library_path)
@@ -2306,6 +2413,14 @@ def expand_steamdb_template(template: str, appid: str,
     candidates = [os.path.expandvars(candidate) for candidate in candidates]
 
     account_ids = get_steam_user_ids(steam_path) if steam_path else []
+    preferred_accountids = [
+        str(aid or "").strip()
+        for aid in (preferred_accountids or [])
+        if str(aid or "").strip()
+    ]
+    prioritized = [aid for aid in preferred_accountids if aid in account_ids]
+    if prioritized:
+        account_ids = prioritized + [aid for aid in account_ids if aid not in prioritized]
     expanded = []
     for candidate in candidates:
         queue_items = [candidate]
@@ -2875,12 +2990,21 @@ def score_remotecache_candidate(path: str) -> int:
 
 
 def get_remotecache_entries(appid: str, steam_path: str,
-                            install_dir: str = "") -> list[dict]:
+                            install_dir: str = "", preferred_accountids: Optional[list[str]] = None) -> list[dict]:
     """收集某个 AppID 在各 userdata 根中的 remotecache/remote 线索。"""
     entries = []
+    preferred_accountids = [
+        str(aid or "").strip()
+        for aid in (preferred_accountids or [])
+        if str(aid or "").strip()
+    ]
     for userdata_root in get_steam_userdata_roots(steam_path):
-        for uid in [d for d in os.listdir(userdata_root)
-                    if os.path.isdir(os.path.join(userdata_root, d)) and d.isdigit()]:
+        user_ids = [d for d in os.listdir(userdata_root)
+                    if os.path.isdir(os.path.join(userdata_root, d)) and d.isdigit()]
+        prioritized = [aid for aid in preferred_accountids if aid in user_ids]
+        if prioritized:
+            user_ids = prioritized + [uid for uid in user_ids if uid not in prioritized]
+        for uid in user_ids:
             app_root = os.path.join(userdata_root, uid, appid)
             if not os.path.isdir(app_root):
                 continue
@@ -2981,12 +3105,14 @@ def detect_save_candidates(appid: str, game_name: str,
     """
     综合检测某游戏的存档路径，返回按分数排序后的候选项。
     """
+    preferred_accountids = _preferred_steam_account_ids(cfg, steam_path)
     cache_key = "||".join([
         str(appid or "").strip(),
         _normalize_recognition_name(game_name),
         os.path.normpath(install_dir or ""),
         os.path.normpath(steam_path or ""),
         os.path.normpath(library_path or ""),
+        str((cfg or {}).get("steam_account_id", "") or "").strip(),
         "steamdb:on" if cfg and cfg.get("steamdb_detection_enabled") else "steamdb:off",
         get_cached_recognition_path(cfg, appid, game_name),
         "|".join(sorted(get_recognition_blacklist(cfg, appid, game_name))),
@@ -3059,7 +3185,9 @@ def detect_save_candidates(appid: str, game_name: str,
     if str(appid or "").strip() and steam_path:
         for appinfo_entry in parse_appinfo_ufs_entries(steam_path, appid):
             template = appinfo_entry.get("template", "")
-            for path in expand_steamdb_template(template, appid, install_dir, steam_path, library_path):
+            for path in expand_steamdb_template(
+                template, appid, install_dir, steam_path, library_path, preferred_accountids
+            ):
                 save_specs = [{
                     "base": path,
                     "includes": list(appinfo_entry.get("includes", [])),
@@ -3080,7 +3208,9 @@ def detect_save_candidates(appid: str, game_name: str,
     if steamdb_enabled and str(appid or "").strip():
         for steamdb_entry in fetch_steamdb_ufs_entries(appid):
             template = steamdb_entry.get("template", "")
-            expanded_paths = expand_steamdb_template(template, appid, install_dir, steam_path, library_path)
+            expanded_paths = expand_steamdb_template(
+                template, appid, install_dir, steam_path, library_path, preferred_accountids
+            )
             if not expanded_paths:
                 inferred_install = infer_install_dir_from_steamdb_template(template, install_dir, library_path)
                 if inferred_install:
@@ -3140,7 +3270,7 @@ def detect_save_candidates(appid: str, game_name: str,
             _add(path, 78, "system-search")
 
     # 4) remotecache.vdf 联动线索
-    remotecache_entries = get_remotecache_entries(appid, steam_path, install_dir)
+    remotecache_entries = get_remotecache_entries(appid, steam_path, install_dir, preferred_accountids)
     for entry in remotecache_entries:
         local_candidates = entry.get("local_candidates", [])
         has_local_candidates = bool(local_candidates)
@@ -3199,6 +3329,8 @@ def load_config() -> dict:
     changed = False
     defaults = {
         "steam_path": "",
+        "steam_account_id": "",
+        "steam_account_ids": [],
         "games": [],
         "theme": "light",
         "language": "",
@@ -3212,7 +3344,7 @@ def load_config() -> dict:
         "sync_interval": 10,
         "sync_mode": "smart",
         "sync_archive_keep": 3,
-        "steamdb_detection_enabled": False,
+        "steamdb_detection_enabled": True,
         "sync_state": {},
         "sync_retry_queue": [],
         "recognition_cache": {},
@@ -5884,19 +6016,46 @@ class SaveChangeHandler(FileSystemEventHandler):
         self.game = game
         self.cooldown = cooldown
         self._last_backup = 0
+        self._quiet_delay = 2.5
+        self._timer = None
+        self._timer_lock = threading.Lock()
+        self._specs = get_game_save_specs(game, existing_only=False)
 
     def on_modified(self, event):
-        self._try_backup()
+        self._handle_event(event)
 
     def on_created(self, event):
-        self._try_backup()
+        self._handle_event(event)
+
+    def _handle_event(self, event):
+        if getattr(event, "is_directory", False):
+            return
+        src_path = getattr(event, "src_path", "") or ""
+        if not src_path:
+            return
+        if self._specs and not _save_specs_match_path(self._specs, src_path):
+            return
+        self._schedule_backup()
+
+    def _schedule_backup(self):
+        with self._timer_lock:
+            if self._timer:
+                try:
+                    self._timer.cancel()
+                except Exception:
+                    pass
+            self._timer = threading.Timer(self._quiet_delay, self._try_backup)
+            self._timer.daemon = True
+            self._timer.start()
 
     def _try_backup(self):
+        with self._timer_lock:
+            self._timer = None
         now = datetime.datetime.now().timestamp()
         if now - self._last_backup < self.cooldown:
             return
         self._last_backup = now
-        create_backup(self.game, "文件变动自动备份")
+        create_backup(self.game, localize_backup_note("文件变动自动备份", cfg_language(None)))
 
 
 # ══════════════════════════════════════════════
@@ -5961,6 +6120,7 @@ class SteamSaveManager(ctk.CTk):
         self._current_frame = "home"
         self._about_update_status_label = None
         self._about_update_btn = None
+        self._about_dialog = None
         self._sidebar_version_label = None
         self._sidebar_version_text = f"v{VERSION}"
         self._sidebar_version_color = ("#cbd5e1", "#3f3f46")
@@ -5968,6 +6128,9 @@ class SteamSaveManager(ctk.CTk):
         self._scan_results: list[dict] = []
         self._scan_lib_folders: list[str] = []
         self._scan_choice_vars: dict[str, ctk.StringVar] = {}
+        self._scan_search_job = None
+        self._games_search_job = None
+        self._game_backup_count_cache: dict[str, int] = {}
         self._scan_in_progress = False
         self._scan_worker_count = 0
         self._scan_storage_profile = "unknown"
@@ -6219,25 +6382,80 @@ class SteamSaveManager(ctk.CTk):
         self._prepare_popup(window)
         return window
 
-    def _show_info(self, title: str, message: str):
-        self._prepare_dialog_parent()
-        return messagebox.showinfo(title, message, parent=self)
+    def _resolve_dialog_parent(self, parent=None):
+        if parent is not None:
+            try:
+                if parent.winfo_exists():
+                    return parent
+            except Exception:
+                return self
+        about_dialog = getattr(self, "_about_dialog", None)
+        try:
+            if about_dialog is not None and about_dialog.winfo_exists():
+                return about_dialog
+        except Exception:
+            pass
+        return self
 
-    def _show_warning(self, title: str, message: str):
-        self._prepare_dialog_parent()
-        return messagebox.showwarning(title, message, parent=self)
+    def _show_info(self, title: str, message: str, parent=None):
+        owner = self._resolve_dialog_parent(parent)
+        if owner is self:
+            self._prepare_dialog_parent()
+        else:
+            try:
+                owner.lift()
+                owner.focus_force()
+            except Exception:
+                pass
+        return messagebox.showinfo(title, message, parent=owner)
 
-    def _show_error(self, title: str, message: str):
-        self._prepare_dialog_parent()
-        return messagebox.showerror(title, message, parent=self)
+    def _show_warning(self, title: str, message: str, parent=None):
+        owner = self._resolve_dialog_parent(parent)
+        if owner is self:
+            self._prepare_dialog_parent()
+        else:
+            try:
+                owner.lift()
+                owner.focus_force()
+            except Exception:
+                pass
+        return messagebox.showwarning(title, message, parent=owner)
 
-    def _ask_yes_no(self, title: str, message: str):
-        self._prepare_dialog_parent()
-        return messagebox.askyesno(title, message, parent=self)
+    def _show_error(self, title: str, message: str, parent=None):
+        owner = self._resolve_dialog_parent(parent)
+        if owner is self:
+            self._prepare_dialog_parent()
+        else:
+            try:
+                owner.lift()
+                owner.focus_force()
+            except Exception:
+                pass
+        return messagebox.showerror(title, message, parent=owner)
 
-    def _ask_yes_no_cancel(self, title: str, message: str):
-        self._prepare_dialog_parent()
-        return messagebox.askyesnocancel(title, message, parent=self)
+    def _ask_yes_no(self, title: str, message: str, parent=None):
+        owner = self._resolve_dialog_parent(parent)
+        if owner is self:
+            self._prepare_dialog_parent()
+        else:
+            try:
+                owner.lift()
+                owner.focus_force()
+            except Exception:
+                pass
+        return messagebox.askyesno(title, message, parent=owner)
+
+    def _ask_yes_no_cancel(self, title: str, message: str, parent=None):
+        owner = self._resolve_dialog_parent(parent)
+        if owner is self:
+            self._prepare_dialog_parent()
+        else:
+            try:
+                owner.lift()
+                owner.focus_force()
+            except Exception:
+                pass
+        return messagebox.askyesnocancel(title, message, parent=owner)
 
     def _ask_directory(self, **kwargs):
         self._prepare_dialog_parent()
@@ -6440,7 +6658,8 @@ class SteamSaveManager(ctk.CTk):
                          font=font(12, "bold"), text_color=C_BODY_TEXT).pack(
                 side="left", padx=(12, 6), pady=7)
             info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
-            if b["note"]: info += f"  ·  📝 {b['note']}"
+            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+            if note_text: info += f"  ·  📝 {note_text}"
             ctk.CTkLabel(row, text=info, font=font(11),
                          text_color=C_SUBTLE_TEXT).pack(side="left", padx=4, pady=7)
 
@@ -6474,9 +6693,9 @@ class SteamSaveManager(ctk.CTk):
         self._scan_status.grid(row=1, column=0, padx=32, sticky="w")
 
         self._scan_search_var = ctk.StringVar()
-        self._scan_search_var.trace_add("write", lambda *_: self._render_scan_results())
+        self._scan_search_var.trace_add("write", self._schedule_scan_search_render)
         search_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        search_frame.grid(row=2, column=0, padx=32, pady=(4, 0), sticky="ew")
+        search_frame.grid(row=2, column=0, padx=32, pady=(6, 0), sticky="ew")
         search_frame.grid_columnconfigure(0, weight=1)
         self._scan_search_entry = ctk.CTkEntry(
             search_frame, textvariable=self._scan_search_var,
@@ -6520,13 +6739,63 @@ class SteamSaveManager(ctk.CTk):
         """标记 IO 操作进行中，防止重复触发"""
         self._io_busy = busy
 
+    def _notify_io_busy(self):
+        self._show_warning(
+            self.bi("处理中", "Busy"),
+            self.bi(
+                "当前已有备份、恢复或同步任务正在进行，请稍候再试。",
+                "A backup, restore, or sync task is already running. Please try again in a moment.",
+            ),
+        )
+
+    def _schedule_scan_search_render(self, *_args):
+        if self._scan_search_job:
+            try:
+                self.after_cancel(self._scan_search_job)
+            except Exception:
+                pass
+        self._scan_search_job = self.after(180, self._run_scan_search_render)
+
+    def _run_scan_search_render(self):
+        self._scan_search_job = None
+        self._render_scan_results()
+
+    def _schedule_games_refresh(self, *_args):
+        if self._games_search_job:
+            try:
+                self.after_cancel(self._games_search_job)
+            except Exception:
+                pass
+        self._games_search_job = self.after(180, self._run_games_refresh)
+
+    def _run_games_refresh(self):
+        self._games_search_job = None
+        self._refresh_games_list()
+
+    def _invalidate_game_backup_count_cache(self, game_name: Optional[str] = None):
+        if game_name:
+            self._game_backup_count_cache.pop(str(game_name), None)
+            return
+        self._game_backup_count_cache.clear()
+
+    def _get_game_backup_count_cached(self, game_name: str) -> int:
+        key = str(game_name or "")
+        if key in self._game_backup_count_cache:
+            return self._game_backup_count_cache[key]
+        count = len(get_backups(key))
+        self._game_backup_count_cache[key] = count
+        return count
+
     def _get_filtered_scan_results(self):
         search_text = self._scan_search_var.get().strip().lower() if hasattr(self, "_scan_search_var") else ""
         results = []
         for game in self._scan_results:
             appid = game.get("appid")
-            name = game.get("name", "")
-            if search_text and search_text not in name.lower() and search_text not in str(appid).lower():
+            haystack = game.get("_search_blob")
+            if haystack is None:
+                haystack = f"{str(game.get('name', '') or '').lower()} {str(appid or '').lower()}"
+                game["_search_blob"] = haystack
+            if search_text and search_text not in haystack:
                 continue
             results.append(game)
         return results
@@ -6719,6 +6988,7 @@ class SteamSaveManager(ctk.CTk):
                     **game,
                     "save_candidates": save_candidates,
                     "save_paths": [c["path"] for c in save_candidates],
+                    "_search_blob": f"{str(game.get('name', '') or '').lower()} {str(game.get('appid', '') or '').lower()}",
                 })
                 completed += 1
                 if completed == total or completed == 1 or completed % 5 == 0:
@@ -6935,7 +7205,7 @@ class SteamSaveManager(ctk.CTk):
             row=0, column=1, sticky="e")
 
         self._games_search_var = ctk.StringVar()
-        self._games_search_var.trace_add("write", lambda *_: self._refresh_games_list())
+        self._games_search_var.trace_add("write", self._schedule_games_refresh)
         search_frame = ctk.CTkFrame(frame, fg_color="transparent")
         search_frame.grid(row=1, column=0, padx=32, pady=(4, 0), sticky="ew")
         search_frame.grid_columnconfigure(0, weight=1)
@@ -6961,7 +7231,11 @@ class SteamSaveManager(ctk.CTk):
                 text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
             return
         for idx, g in enumerate(games):
-            if search_text and search_text not in g["name"].lower() and search_text not in str(g.get("appid", "")).lower():
+            haystack = g.get("_search_blob")
+            if haystack is None:
+                haystack = f"{str(g.get('name', '') or '').lower()} {str(g.get('appid', '') or '').lower()}"
+                g["_search_blob"] = haystack
+            if search_text and search_text not in haystack:
                 continue
             card = ctk.CTkFrame(self._games_scroll,
                                 fg_color=("#f1f5f9", "#252640"), corner_radius=12)
@@ -6983,7 +7257,7 @@ class SteamSaveManager(ctk.CTk):
                          text_color=C_SUBTLE_TEXT).grid(
                 row=1, column=0, columnspan=2, padx=14, pady=(0, 3), sticky="w")
 
-            bc = len(get_backups(g["name"]))
+            bc = self._get_game_backup_count_cached(g["name"])
             ctk.CTkLabel(card, text=self.bi(f"备份数：{bc}", f"Backups: {bc}"), font=font(11),
                          text_color=C_SUBTLE_TEXT).grid(
                 row=2, column=0, padx=14, pady=(0, 10), sticky="w")
@@ -7563,7 +7837,8 @@ class SteamSaveManager(ctk.CTk):
                              font=font(12, "bold"), text_color=C_BODY_TEXT).grid(
                     row=0, column=0, padx=14, pady=(10, 0), sticky="w")
                 sub = fmt_size(b['size'])
-                if b["note"]: sub += f"  ·  📝 {b['note']}"
+                note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+                if note_text: sub += f"  ·  📝 {note_text}"
                 ctk.CTkLabel(row, text=sub, font=font(11),
                              text_color=C_SUBTLE_TEXT).grid(
                     row=1, column=0, padx=14, pady=(2, 10), sticky="w")
@@ -7948,7 +8223,8 @@ class SteamSaveManager(ctk.CTk):
                     self._show_error(
                         self.bi("检查更新失败", "Update Check Failed"),
                         self.bi(f"无法读取远程更新信息：\n{type(e).__name__}: {e}",
-                                f"Could not read remote update info:\n{type(e).__name__}: {e}")
+                                f"Could not read remote update info:\n{type(e).__name__}: {e}"),
+                        parent=self._about_dialog,
                     )
             self.after(0, _on_error)
             return
@@ -7969,7 +8245,8 @@ class SteamSaveManager(ctk.CTk):
                     self._show_info(
                         self.bi("检查更新", "Check for Updates"),
                         self.bi(f"当前已经是最新版本。\n\n当前版本：v{VERSION}",
-                                f"You're already on the latest version.\n\nCurrent version: v{VERSION}")
+                                f"You're already on the latest version.\n\nCurrent version: v{VERSION}"),
+                        parent=self._about_dialog,
                     )
             self.after(0, _on_latest)
             return
@@ -8003,7 +8280,8 @@ class SteamSaveManager(ctk.CTk):
             self.bi(
                 f"发现新版本：v{manifest['version']}\n当前版本：v{VERSION}\n\n更新说明：\n{notes}\n\n是否立即下载？",
                 f"New version found: v{manifest['version']}\nCurrent version: v{VERSION}\n\nRelease notes:\n{notes}\n\nDownload it now?",
-            )
+            ),
+            parent=self._about_dialog,
         )
         if ok:
             self._download_update(manifest)
@@ -8027,7 +8305,8 @@ class SteamSaveManager(ctk.CTk):
                 self._show_error(
                     self.bi("下载更新失败", "Update Download Failed"),
                     self.bi(f"下载更新时出错：\n{type(e).__name__}: {e}",
-                            f"An error occurred while downloading the update:\n{type(e).__name__}: {e}")
+                            f"An error occurred while downloading the update:\n{type(e).__name__}: {e}"),
+                    parent=self._about_dialog,
                 )
             ))
             return
@@ -8043,13 +8322,15 @@ class SteamSaveManager(ctk.CTk):
                 self.bi(
                     f"新版本已下载完成：\n{target}\n\n是否立即关闭当前程序并启动新版本？",
                     f"The new version has been downloaded:\n{target}\n\nClose the current app and launch the new version now?",
-                )):
+                ),
+                parent=self._about_dialog):
             self._launch_downloaded_update(target)
         else:
             self._show_info(
                 self.bi("下载完成", "Download Complete"),
                 self.bi(f"更新文件已保存到：\n{target}",
-                        f"The update package has been saved to:\n{target}")
+                        f"The update package has been saved to:\n{target}"),
+                parent=self._about_dialog,
             )
 
     def _launch_downloaded_update(self, target: Path):
@@ -8067,7 +8348,8 @@ class SteamSaveManager(ctk.CTk):
             self._show_error(
                 self.bi("启动更新失败", "Failed to Launch Update"),
                 self.bi(f"无法启动下载的新版本：\n{type(e).__name__}: {e}",
-                        f"Could not launch the downloaded update:\n{type(e).__name__}: {e}")
+                        f"Could not launch the downloaded update:\n{type(e).__name__}: {e}"),
+                parent=self._about_dialog,
             )
             return
 
@@ -8082,11 +8364,13 @@ class SteamSaveManager(ctk.CTk):
 
     def _show_about_dialog(self, *a):
         d = self._create_popup(self.bi("关于 Steam 存档管家", "About Steam Save Manager"), "560x360")
+        self._about_dialog = d
         d.grid_columnconfigure(0, weight=1)
         d.grid_rowconfigure(1, weight=1)
         def _on_close():
             self._about_update_status_label = None
             self._about_update_btn = None
+            self._about_dialog = None
             d.destroy()
         d.protocol("WM_DELETE_WINDOW", _on_close)
 
@@ -8197,7 +8481,9 @@ class SteamSaveManager(ctk.CTk):
             self._detail_refresh_job = None
 
     def _backup_from_detail(self, idx):
-        if self._io_busy: return
+        if self._io_busy:
+            self._notify_io_busy()
+            return
         g = dict(self.cfg["games"][idx])
         note = self._input_dialog(
             title=self.bi("备注", "Note"),
@@ -8205,13 +8491,18 @@ class SteamSaveManager(ctk.CTk):
         detail_idx = self._detail_idx
         self._set_io_busy(True)
         def _worker():
-            r = create_backup(g, note)
-            self.after(0, lambda: self._on_backup_detail_done(r, detail_idx))
+            try:
+                r = create_backup(g, note)
+                self.after(0, lambda: self._on_backup_detail_done(r, detail_idx))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_backup_failed(err, detail_idx))
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_backup_detail_done(self, result, idx):
         self._set_io_busy(False)
         if result:
+            if idx < len(self.cfg.get("games", [])):
+                self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
             self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
             self._show_game_detail(idx)
         else:
@@ -8258,6 +8549,8 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_restore_detail_done(self, idx):
         self._set_io_busy(False)
+        if idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
         self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
         self._show_game_detail(idx)
 
@@ -8274,29 +8567,45 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_del_bk_detail_done(self, idx):
         self._set_io_busy(False)
+        if idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
         self._show_game_detail(idx)
 
     def _manual_backup(self, idx):
-        if self._io_busy: return
+        if self._io_busy:
+            self._notify_io_busy()
+            return
         g = dict(self.cfg["games"][idx])
         note = self._input_dialog(
             title=self.bi("备注", "Note"),
             text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
         self._set_io_busy(True)
         def _worker():
-            r = create_backup(g, note)
-            self.after(0, lambda: self._on_backup_done(r))
+            try:
+                r = create_backup(g, note)
+                self.after(0, lambda: self._on_backup_done(r))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_backup_failed(err))
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_backup_done(self, result):
         self._set_io_busy(False)
         if result:
+            self._invalidate_game_backup_count_cache()
             self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
         else:
             self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
 
+    def _on_backup_failed(self, err, detail_idx=None):
+        self._set_io_busy(False)
+        if detail_idx is not None and detail_idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][detail_idx].get("name", ""))
+        self._show_error(self.bi("备份失败", "Backup Failed"), err)
+
     def _backup_all(self):
-        if self._io_busy: return
+        if self._io_busy:
+            self._notify_io_busy()
+            return
         games = self.cfg.get("games", [])
         if not games: self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
         game_copies = [dict(g) for g in games]
@@ -8308,23 +8617,35 @@ class SteamSaveManager(ctk.CTk):
         def _worker():
             ok = 0
             total = len(game_copies)
-            for i, g in enumerate(game_copies):
-                r = create_backup(g, default_note)
-                if r: ok += 1
-                label = progress_tpl.format(cur=i + 1, total=total)
-                self.after(0, lambda t=label: self.title(t))
-            self.after(0, lambda: self._on_backup_all_done(total, ok, original_title, done_title))
+            failed: list[str] = []
+            try:
+                for i, g in enumerate(game_copies):
+                    try:
+                        r = create_backup(g, default_note)
+                        if r:
+                            ok += 1
+                        else:
+                            failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: " + self.bi("存档路径不存在", "Save path does not exist"))
+                    except Exception as e:
+                        failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: {type(e).__name__}: {e}")
+                    label = progress_tpl.format(cur=i + 1, total=total)
+                    self.after(0, lambda t=label: self.title(t))
+            finally:
+                self.after(0, lambda: self._on_backup_all_done(total, ok, original_title, done_title, failed))
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_backup_all_done(self, total, ok, original_title, done_title):
+    def _on_backup_all_done(self, total, ok, original_title, done_title, failed=None):
         self._set_io_busy(False)
         self.title(original_title)
-        self._show_info(done_title, self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}"))
-
-    def _on_backup_all_done(self, total, ok, original_title):
-        self._set_io_busy(False)
-        self.title(original_title)
-        self._show_info(self.bi("完成", "Done"), self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}"))
+        self._invalidate_game_backup_count_cache()
+        failed = failed or []
+        message = self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}")
+        if failed:
+            details = "\n".join(failed[:8])
+            if len(failed) > 8:
+                details += "\n" + self.bi(f"……另有 {len(failed) - 8} 个失败项", f"...and {len(failed) - 8} more failures")
+            message += "\n\n" + self.bi("失败项目：", "Failed items:") + "\n" + details
+        self._show_info(done_title, message)
 
     # ─── 备份记录 ───
     def _build_backup_frame(self):
@@ -8382,7 +8703,8 @@ class SteamSaveManager(ctk.CTk):
                          text_color=C_BODY_TEXT).grid(
                 row=0, column=0, padx=14, pady=(10, 0), sticky="w")
             info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
-            if b["note"]: info += f"  ·  📝 {b['note']}"
+            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+            if note_text: info += f"  ·  📝 {note_text}"
             ctk.CTkLabel(card, text=info, font=font(11),
                          text_color=C_SUBTLE_TEXT).grid(
                 row=1, column=0, padx=14, pady=(0, 10), sticky="w")
@@ -8414,6 +8736,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_restore_done(self):
         self._set_io_busy(False)
+        self._invalidate_game_backup_count_cache()
         self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
 
     def _on_restore_failed(self, err):
@@ -8432,6 +8755,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_del_bk_done(self):
         self._set_io_busy(False)
+        self._invalidate_game_backup_count_cache()
         self._refresh_backup_list()
 
     # ─── 设置 ───
@@ -8662,6 +8986,30 @@ class SteamSaveManager(ctk.CTk):
             settings_canvas.itemconfigure(settings_window, width=_event.width)
 
         def _settings_mousewheel(event):
+            try:
+                focused_popup = any(
+                    window.winfo_exists() and window.focus_displayof() is not None
+                    for window in list(self._popup_windows)
+                )
+                if focused_popup:
+                    return
+            except Exception:
+                pass
+            try:
+                target_widget = self.winfo_containing(event.x_root, event.y_root)
+            except Exception:
+                target_widget = None
+            inside_settings = False
+            while target_widget is not None:
+                if target_widget == settings_host:
+                    inside_settings = True
+                    break
+                try:
+                    target_widget = target_widget.master
+                except Exception:
+                    target_widget = None
+            if not inside_settings:
+                return
             if sys.platform.startswith("win"):
                 delta = -int(event.delta / 120) if event.delta else 0
             else:
@@ -8719,7 +9067,7 @@ class SteamSaveManager(ctk.CTk):
 
         _label(general, 6, "steam_path")
         sf = _row(general)
-        sf.grid(row=7, column=0, padx=22, pady=(0, 18), sticky="ew")
+        sf.grid(row=7, column=0, padx=22, pady=(0, 10), sticky="ew")
         self._steam_e = ctk.CTkEntry(sf, width=420, font=font(12))
         self._steam_e.insert(0, self.cfg.get("steam_path", ""))
         self._steam_e.pack(side="left")
@@ -9023,6 +9371,7 @@ class SteamSaveManager(ctk.CTk):
     def _apply_steam_path(self):
         self.cfg["steam_path"] = self._steam_e.get().strip()
         save_config(self.cfg)
+        _SAVE_DETECTION_CACHE.clear()
 
     def _apply_auto_backup_interval(self):
         try:
@@ -9092,7 +9441,7 @@ class SteamSaveManager(ctk.CTk):
     def _webdav_hint_for_preset(self, preset_code: str, username: str = "") -> str:
         preset = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
         if preset == "synology":
-            return "http://nas:5005  或  https://nas:5006"
+            return "http://nas:5005 / https://nas:5006"
         if preset == "qnap":
             return "https://nas:5006/webdav"
         if preset == "truenas":
@@ -9332,7 +9681,7 @@ class SteamSaveManager(ctk.CTk):
             return
         games = self.cfg.get("games", [])
         if not games:
-            self._show_info("提示", "请先添加游戏"); return
+            self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
         self._set_io_busy(True)
         def _worker():
             try:
@@ -9344,8 +9693,8 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_sync_all_done(self, results):
         self._set_io_busy(False)
-        lines = [f"{name}：{msg}" for name, msg in results]
-        self._show_info("同步完成", "\n".join(lines))
+        lines = [self.bi(f"{name}：{msg}", f"{name}: {msg}") for name, msg in results]
+        self._show_info(self.bi("同步完成", "Sync Complete"), "\n".join(lines))
         conflict_keys = {
             get_game_sync_key(game)
             for game in self.cfg.get("games", [])
@@ -9357,7 +9706,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_sync_failed(self, err):
         self._set_io_busy(False)
-        self._show_error("同步失败", f"同步过程中出错：\n{err}")
+        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"同步过程中出错：\n{err}", f"An error occurred during sync:\n{err}"))
 
     def _manual_sync_one(self, idx):
         if self._io_busy: return
@@ -9390,16 +9739,16 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_sync_one_done(self, game_name, result, idx):
         self._set_io_busy(False)
-        if result.startswith("冲突："):
+        if result.startswith("冲突：") or result.startswith("Conflict:"):
             live_game = self.cfg["games"][idx] if idx < len(self.cfg["games"]) else None
             if live_game:
                 self._show_sync_conflict_dialog(live_game)
         else:
-            self._show_info("同步结果", f"「{game_name}」{result}")
+            self._show_info(self.bi("同步结果", "Sync Result"), self.bi(f"「{game_name}」{result}", f"{game_name}: {result}"))
 
     def _on_sync_one_failed(self, game_name, err):
         self._set_io_busy(False)
-        self._show_error("同步失败", f"「{game_name}」同步出错：\n{err}")
+        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"「{game_name}」同步出错：\n{err}", f"Sync failed for {game_name}:\n{err}"))
 
     # ─── 定时备份 ───
     def _start_auto_backup(self):
@@ -9422,7 +9771,7 @@ class SteamSaveManager(ctk.CTk):
             for g in self.cfg.get("games", []):
                 if not g.get("auto_backup", True):
                     continue
-                create_backup(g, "定时自动备份")
+                create_backup(g, self.bi("定时自动备份", "Scheduled Backup"))
 
     def _update_status(self):
         if self.cfg.get("auto_backup_enabled"):
@@ -9462,12 +9811,20 @@ class SteamSaveManager(ctk.CTk):
                     if state.get("pending_conflict"):
                         self._enqueue_sync_conflict_dialog(game)
                 if self.cfg.get("sync_notify", True):
-                    synced = [f"{n}：{m}" for n, m in results
-                              if "跳过" not in m and "无需" not in m and not m.startswith("冲突：")]
+                    synced = [
+                        self.bi(f"{n}：{m}", f"{n}: {m}")
+                        for n, m in results
+                        if "跳过" not in m
+                        and "无需" not in m
+                        and "Skipped:" not in m
+                        and "No need" not in m
+                        and not m.startswith("冲突：")
+                        and not m.startswith("Conflict:")
+                    ]
                     if synced:
                         send_desktop_notification(
-                            "存档管家 · 自动同步完成",
-                            "；".join(synced[:3]))
+                            self.bi("存档管家 · 自动同步完成", "Steam Save Manager · Auto Sync Complete"),
+                            self.bi("；", "; ").join(synced[:3]))
             except Exception:
                 pass
 
@@ -9617,6 +9974,7 @@ if __name__ == "__main__":
     ensure_dirs()
     if not acquire_lock():
         # 已有实例在运行，弹出提示后退出
+        boot_lang = normalize_language("")
         root = ctk.CTk()
         root.overrideredirect(True)
         root.attributes("-alpha", 0.0)
@@ -9626,7 +9984,11 @@ if __name__ == "__main__":
         root.geometry(f"1x1+{max(sw//2, 0)}+{max(sh//2, 0)}")
         root.deiconify()
         root.lift()
-        messagebox.showinfo("提示", "Steam 存档管家已在运行中，请勿重复启动。", parent=root)
+        messagebox.showinfo(
+            bilingual_text(boot_lang, "提示", "Notice"),
+            bilingual_text(boot_lang, "Steam 存档管家已在运行中，请勿重复启动。", "Steam Save Manager is already running. Please do not start another instance."),
+            parent=root,
+        )
         root.destroy()
         sys.exit(0)
     SteamSaveManager().mainloop()
