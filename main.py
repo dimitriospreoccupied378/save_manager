@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.3.0 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.1 — 通用版"""
 
 import os
 import sys
@@ -79,7 +79,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 CONFIG_DIR = Path.home() / ".steam_save_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
@@ -6114,6 +6114,7 @@ class SteamSaveManager(ctk.CTk):
         self.auto_backup_running = False
         self._stop_event = threading.Event()
         self._watchers: list[Observer] = []
+        self._watch_handlers: list[SaveChangeHandler] = []
         self._detail_refresh_job = None  # 详情页自动刷新定时器
         self._sync_ui_queue: queue.Queue = queue.Queue()
         self._open_conflict_dialogs: set[str] = set()
@@ -6128,9 +6129,21 @@ class SteamSaveManager(ctk.CTk):
         self._scan_results: list[dict] = []
         self._scan_lib_folders: list[str] = []
         self._scan_choice_vars: dict[str, ctk.StringVar] = {}
+        self._scan_cards: dict[str, dict] = {}
+        self._scan_info_banner = None
+        self._scan_empty_label = None
         self._scan_search_job = None
         self._games_search_job = None
         self._game_backup_count_cache: dict[str, int] = {}
+        self._game_backups_cache: dict[str, list] = {}
+        self._recent_backups_cache: dict[int, list] = {}
+        self._game_detail_metrics_cache: dict[str, dict] = {}
+        self._game_cards: dict[str, dict] = {}
+        self._games_empty_label = None
+        self._home_recent_rows: dict[str, dict] = {}
+        self._home_recent_empty_label = None
+        self._backup_rows: dict[str, dict] = {}
+        self._backup_empty_label = None
         self._scan_in_progress = False
         self._scan_worker_count = 0
         self._scan_storage_profile = "unknown"
@@ -6629,10 +6642,17 @@ class SteamSaveManager(ctk.CTk):
             height=260, corner_radius=12, fg_color=C_CARD_BG)
         self._home_recent.grid(row=4, column=0, padx=30, pady=(14, 24), sticky="nsew")
         frame.grid_rowconfigure(4, weight=1)
+        self._home_recent_rows = {}
+        self._home_recent_empty_label = ctk.CTkLabel(
+            self._home_recent,
+            text="",
+            text_color=C_SUBTLE_TEXT,
+            font=font(13),
+        )
 
     def _refresh_home(self):
         games = self.cfg.get("games", [])
-        total = sum(len(get_backups(g["name"])) for g in games)
+        total = sum(self._get_game_backup_count_cached(g["name"]) for g in games)
         auto = self.t("switch_on") if self.cfg.get("auto_backup_enabled") else self.t("switch_off")
         watch = self.t("switch_on") if self.cfg.get("watch_enabled") else self.t("switch_off")
         self._stat_cards["games"].configure(text=self.t("value_games", count=len(games)))
@@ -6640,28 +6660,44 @@ class SteamSaveManager(ctk.CTk):
         self._stat_cards["auto"].configure(text=auto)
         self._stat_cards["watch"].configure(text=watch)
 
-        for w in self._home_recent.winfo_children(): w.destroy()
-        all_b = []
-        for g in games:
-            for b in get_backups(g["name"]):
-                b["game"] = g["name"]; all_b.append(b)
-        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
+        all_b = self._get_recent_backups_cached(15)
+        for item in self._home_recent_rows.values():
+            item["row"].pack_forget()
         if not all_b:
-            ctk.CTkLabel(self._home_recent, text=self.t("home_no_backups"),
-                         text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
+            self._home_recent_empty_label.configure(text=self.t("home_no_backups"))
+            self._home_recent_empty_label.pack(pady=40)
             return
+        self._home_recent_empty_label.pack_forget()
+        active_keys = set()
         for b in all_b[:15]:
-            row = ctk.CTkFrame(self._home_recent,
-                               fg_color=("#f1f5f9", "#252640"), corner_radius=8)
-            row.pack(fill="x", padx=4, pady=2)
-            ctk.CTkLabel(row, text=f"🎮 {b['game']}",
-                         font=font(12, "bold"), text_color=C_BODY_TEXT).pack(
-                side="left", padx=(12, 6), pady=7)
+            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
+            active_keys.add(key)
+            item = self._home_recent_rows.get(key)
+            if item is None:
+                row = ctk.CTkFrame(self._home_recent,
+                                   fg_color=("#f1f5f9", "#252640"), corner_radius=8)
+                title = ctk.CTkLabel(
+                    row, text="", font=font(12, "bold"), text_color=C_BODY_TEXT
+                )
+                title.pack(side="left", padx=(12, 6), pady=7)
+                info_label = ctk.CTkLabel(
+                    row, text="", font=font(11), text_color=C_SUBTLE_TEXT
+                )
+                info_label.pack(side="left", padx=4, pady=7)
+                item = {"row": row, "title": title, "info": info_label}
+                self._home_recent_rows[key] = item
+            item["title"].configure(text=f"🎮 {b['game']}")
             info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
             note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
-            if note_text: info += f"  ·  📝 {note_text}"
-            ctk.CTkLabel(row, text=info, font=font(11),
-                         text_color=C_SUBTLE_TEXT).pack(side="left", padx=4, pady=7)
+            if note_text:
+                info += f"  ·  📝 {note_text}"
+            item["info"].configure(text=info)
+            item["row"].pack(fill="x", padx=4, pady=2)
+        stale_keys = [key for key in self._home_recent_rows.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._home_recent_rows.pop(key, None)
+            if item:
+                item["row"].destroy()
 
     # ─── 扫描游戏 ───
     def _build_scan_frame(self):
@@ -6707,6 +6743,17 @@ class SteamSaveManager(ctk.CTk):
             frame, height=420, corner_radius=12, fg_color=C_CARD_BG)
         self._scan_scroll.grid(row=3, column=0, padx=30, pady=10, sticky="nsew")
         frame.grid_rowconfigure(3, weight=1)
+        self._scan_cards = {}
+        self._scan_info_banner = ctk.CTkFrame(
+            self._scan_scroll, fg_color=("#eef2ff", "#1e1b4b"), corner_radius=10
+        )
+        self._scan_info_label = ctk.CTkLabel(
+            self._scan_info_banner, text="", font=font(11), justify="left", text_color=C_BODY_TEXT
+        )
+        self._scan_info_label.pack(padx=14, pady=10, anchor="w")
+        self._scan_empty_label = ctk.CTkLabel(
+            self._scan_scroll, text="", font=font(13), text_color=C_SUBTLE_TEXT
+        )
 
     def _scan_profile_label(self, profile: str) -> str:
         labels = {
@@ -6774,17 +6821,75 @@ class SteamSaveManager(ctk.CTk):
 
     def _invalidate_game_backup_count_cache(self, game_name: Optional[str] = None):
         if game_name:
-            self._game_backup_count_cache.pop(str(game_name), None)
+            key = str(game_name)
+            self._game_backup_count_cache.pop(key, None)
+            self._game_backups_cache.pop(key, None)
+            self._recent_backups_cache.clear()
+            self._game_detail_metrics_cache.pop(key, None)
             return
         self._game_backup_count_cache.clear()
+        self._game_backups_cache.clear()
+        self._recent_backups_cache.clear()
+        self._game_detail_metrics_cache.clear()
 
     def _get_game_backup_count_cached(self, game_name: str) -> int:
         key = str(game_name or "")
         if key in self._game_backup_count_cache:
             return self._game_backup_count_cache[key]
-        count = len(get_backups(key))
+        count = len(self._get_game_backups_cached(key))
         self._game_backup_count_cache[key] = count
         return count
+
+    def _get_game_backups_cached(self, game_name: str) -> list:
+        key = str(game_name or "")
+        cached = self._game_backups_cache.get(key)
+        if cached is not None:
+            return [dict(item) for item in cached]
+        backups = get_backups(key)
+        self._game_backups_cache[key] = [dict(item) for item in backups]
+        return [dict(item) for item in backups]
+
+    def _get_recent_backups_cached(self, limit: int = 15) -> list:
+        cached = self._recent_backups_cache.get(limit)
+        if cached is not None:
+            return [dict(item) for item in cached]
+        all_b = []
+        for g in self.cfg.get("games", []):
+            for b in self._get_game_backups_cached(g["name"]):
+                item = dict(b)
+                item["game"] = g["name"]
+                all_b.append(item)
+        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
+        recent = all_b[:limit]
+        self._recent_backups_cache[limit] = [dict(item) for item in recent]
+        return [dict(item) for item in recent]
+
+    def _get_game_detail_metrics_cached(self, game: dict) -> dict:
+        key = str(game.get("name", "") or "")
+        now = time.time()
+        cached = self._game_detail_metrics_cache.get(key)
+        if cached and now - float(cached.get("ts", 0.0)) < 10.0:
+            return dict(cached.get("data", {}))
+
+        save_paths = get_game_save_paths(game, existing_only=False)
+        existing_paths = [p for p in save_paths if os.path.isdir(p)]
+        path_ok = bool(existing_paths)
+        file_count = 0
+        for path in existing_paths:
+            try:
+                for _, _, fs in os.walk(path):
+                    file_count += len(fs)
+            except Exception:
+                continue
+
+        data = {
+            "save_paths": save_paths,
+            "existing_paths": existing_paths,
+            "path_ok": path_ok,
+            "file_count": file_count,
+        }
+        self._game_detail_metrics_cache[key] = {"ts": now, "data": dict(data)}
+        return dict(data)
 
     def _get_filtered_scan_results(self):
         search_text = self._scan_search_var.get().strip().lower() if hasattr(self, "_scan_search_var") else ""
@@ -6801,38 +6906,72 @@ class SteamSaveManager(ctk.CTk):
         return results
 
     def _render_scan_results(self):
-        for w in self._scan_scroll.winfo_children():
-            w.destroy()
+        for item in self._scan_cards.values():
+            item["card"].pack_forget()
 
-        self._scan_choice_vars = {}
         if self._scan_lib_folders:
-            ic = ctk.CTkFrame(self._scan_scroll, fg_color=("#eef2ff", "#1e1b4b"),
-                              corner_radius=10)
-            ic.pack(fill="x", padx=4, pady=(0, 8))
+            self._scan_info_banner.configure(fg_color=("#eef2ff", "#1e1b4b"))
             txt = self.bi("检测到的 Steam 库路径：\n", "Detected Steam library paths:\n") + "\n".join(
                 f"  📂 {p}" for p in self._scan_lib_folders)
-            ctk.CTkLabel(ic, text=txt, font=font(11),
-                         justify="left", text_color=C_BODY_TEXT).pack(
-                padx=14, pady=10, anchor="w")
+            self._scan_info_label.configure(text=txt, font=font(11), text_color=C_BODY_TEXT, justify="left")
+            self._scan_info_banner.pack(fill="x", padx=4, pady=(0, 8))
+        else:
+            self._scan_info_banner.pack_forget()
 
         already_added = {g.get("appid") for g in self.cfg.get("games", [])}
         found = 0
         addable = 0
-        for game in self._get_filtered_scan_results():
+        filtered_results = self._get_filtered_scan_results()
+        active_keys = set()
+
+        if not filtered_results:
+            self._scan_empty_label.configure(
+                text=self.bi("没有匹配的扫描结果", "No matching scan results")
+            )
+            self._scan_empty_label.pack(pady=40)
+        else:
+            self._scan_empty_label.pack_forget()
+        for game in filtered_results:
             appid = game["appid"]
             name = game["name"]
             save_paths = game.get("save_paths", [])
             top_candidate = (game.get("save_candidates") or [{}])[0] if save_paths else {}
-
-            card = ctk.CTkFrame(self._scan_scroll,
-                                fg_color=("#f1f5f9", "#252640"), corner_radius=10)
-            card.pack(fill="x", padx=4, pady=2)
-            card.grid_columnconfigure(1, weight=1)
+            key = str(appid)
+            active_keys.add(key)
+            item = self._scan_cards.get(key)
+            if item is None:
+                card = ctk.CTkFrame(self._scan_scroll,
+                                    fg_color=("#f1f5f9", "#252640"), corner_radius=10)
+                card.grid_columnconfigure(1, weight=1)
+                title = ctk.CTkLabel(card, text="", font=font(13, "bold"),
+                                     text_color=C_BODY_TEXT)
+                title.grid(row=0, column=0, padx=14, pady=(10, 2), sticky="w", columnspan=2)
+                path_label = ctk.CTkLabel(card, text="", font=font(11),
+                                          text_color=C_SUBTLE_TEXT)
+                path_label.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+                meta_label = ctk.CTkLabel(card, text="", font=font(10),
+                                          text_color=C_SUBTLE_TEXT)
+                meta_label.grid(row=2, column=0, padx=14, pady=(0, 8), sticky="w")
+                right_top = ctk.CTkFrame(card, fg_color="transparent")
+                right_top.grid(row=0, column=1, padx=6, pady=4, sticky="e")
+                right_bottom = ctk.CTkFrame(card, fg_color="transparent")
+                right_bottom.grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
+                item = {
+                    "card": card,
+                    "title": title,
+                    "path": path_label,
+                    "meta": meta_label,
+                    "right_top": right_top,
+                    "right_bottom": right_bottom,
+                    "status": None,
+                    "option": None,
+                    "folder_btn": None,
+                    "add_btn": None,
+                }
+                self._scan_cards[key] = item
 
             ico = "✔" if appid in already_added else ("✅" if save_paths else "❓")
-            ctk.CTkLabel(card, text=f"{ico} {name}", font=font(13, "bold"),
-                         text_color=C_BODY_TEXT).grid(
-                row=0, column=0, padx=14, pady=(10, 2), sticky="w", columnspan=2)
+            item["title"].configure(text=f"{ico} {name}")
 
             if save_paths:
                 found += 1
@@ -6843,9 +6982,10 @@ class SteamSaveManager(ctk.CTk):
                     self.bi(f"  (+{len(save_paths)-1} 个候选)", f"  (+{len(save_paths)-1} candidates)")
                     if len(save_paths) > 1 else ""
                 )
-                ctk.CTkLabel(card, text=f"📁 {pd}{extra}", font=font(11),
-                             text_color=C_SUBTLE_TEXT).grid(
-                    row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+                item["path"].configure(
+                    text=f"📁 {pd}{extra}",
+                    text_color=C_SUBTLE_TEXT,
+                )
                 confidence_map = {
                     "high": self.bi("高可信", "High confidence"),
                     "medium": self.bi("中可信", "Medium confidence"),
@@ -6872,44 +7012,93 @@ class SteamSaveManager(ctk.CTk):
                 reason_text = self.bi("文件特征匹配", "Save file signals") if "save-files" in top_candidate.get("reasons", []) else ""
                 meta_parts = [p for p in [confidence_text, source_text, reason_text] if p]
                 if meta_parts:
-                    ctk.CTkLabel(card, text=" · ".join(meta_parts), font=font(10),
-                                 text_color=C_SUBTLE_TEXT).grid(
-                        row=2, column=0, padx=14, pady=(0, 8), sticky="w")
+                    item["meta"].configure(text=" · ".join(meta_parts))
+                    item["meta"].grid()
+                else:
+                    item["meta"].configure(text="")
+                    item["meta"].grid_remove()
                 if appid not in already_added:
                     addable += 1
-                    pv = ctk.StringVar(value=save_paths[0])
-                    self._scan_choice_vars[appid] = pv
-                    ctk.CTkOptionMenu(card, variable=pv, values=save_paths,
-                                      width=240, font=font(11)).grid(
-                        row=0, column=1, padx=6, pady=4, sticky="e")
-                    action_frame = ctk.CTkFrame(card, fg_color="transparent")
-                    action_frame.grid(row=1, column=1, padx=14, pady=(0, 10), sticky="e")
-                    ctk.CTkButton(action_frame, text="📁", width=36, height=28,
-                                  font=font(14), corner_radius=6,
-                                  fg_color=BTN_WARN, hover_color=BTN_WARN_H,
-                                  command=lambda a=appid, n=name:
-                                  self._override_scan_result_path(a, n)
-                                  ).pack(side="left")
-                    ctk.CTkButton(action_frame, text=self.bi("添加", "Add"), width=64, height=28,
-                                  font=font(12), corner_radius=6,
-                                  fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                                  command=lambda a=appid, n=name, v=pv:
-                                  self._add_from_scan(a, n, v.get())
-                                  ).pack(side="left", padx=(8, 0))
+                    pv = self._scan_choice_vars.get(appid)
+                    if pv is None:
+                        pv = ctk.StringVar(value=save_paths[0])
+                        self._scan_choice_vars[appid] = pv
+                    if pv.get() not in save_paths:
+                        pv.set(save_paths[0])
+                    if item["option"] is None:
+                        item["option"] = ctk.CTkOptionMenu(
+                            item["right_top"], variable=pv, values=save_paths, width=240, font=font(11)
+                        )
+                        item["option"].pack(side="left")
+                    else:
+                        item["option"].configure(variable=pv, values=save_paths)
+                        if not item["option"].winfo_manager():
+                            item["option"].pack(side="left")
+                    if item["folder_btn"] is None:
+                        item["folder_btn"] = ctk.CTkButton(
+                            item["right_bottom"], text="📁", width=36, height=28,
+                            font=font(14), corner_radius=6,
+                            fg_color=BTN_WARN, hover_color=BTN_WARN_H,
+                        )
+                        item["folder_btn"].pack(side="left")
+                    elif not item["folder_btn"].winfo_manager():
+                        item["folder_btn"].pack(side="left")
+                    item["folder_btn"].configure(command=lambda a=appid, n=name: self._override_scan_result_path(a, n))
+                    if item["add_btn"] is None:
+                        item["add_btn"] = ctk.CTkButton(
+                            item["right_bottom"], text=self.bi("添加", "Add"), width=64, height=28,
+                            font=font(12), corner_radius=6,
+                            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                        )
+                        item["add_btn"].pack(side="left", padx=(8, 0))
+                    elif not item["add_btn"].winfo_manager():
+                        item["add_btn"].pack(side="left", padx=(8, 0))
+                    item["add_btn"].configure(command=lambda a=appid, n=name, v=pv: self._add_from_scan(a, n, v.get()))
+                    if item["status"] is not None:
+                        item["status"].grid_remove()
                 else:
-                    ctk.CTkLabel(card, text=self.bi("✔ 已添加", "✔ Added"), font=font(11),
-                                 text_color=BTN_SUCCESS).grid(
-                        row=0, column=1, padx=14, sticky="e")
+                    if item["option"] is not None:
+                        item["option"].pack_forget()
+                    if item["folder_btn"] is not None:
+                        item["folder_btn"].pack_forget()
+                    if item["add_btn"] is not None:
+                        item["add_btn"].pack_forget()
+                    if item["status"] is None:
+                        item["status"] = ctk.CTkLabel(
+                            item["right_top"], text="", font=font(11), text_color=BTN_SUCCESS
+                        )
+                    item["status"].configure(text=self.bi("✔ 已添加", "✔ Added"))
+                    item["status"].grid(row=0, column=0, padx=14, sticky="e")
             else:
-                ctk.CTkLabel(card, text=self.bi("未检测到存档路径", "No save path detected"), font=font(11),
-                             text_color=("#ea580c", "#fb923c")).grid(
-                    row=1, column=0, padx=14, pady=(0, 10), sticky="w")
-                ctk.CTkButton(card, text="📁", width=36, height=28,
-                              font=font(14), corner_radius=6,
-                              fg_color=BTN_WARN, hover_color=BTN_WARN_H,
-                              command=lambda a=appid, n=name:
-                              self._override_scan_result_path(a, n)
-                              ).grid(row=0, column=1, padx=14, pady=6, sticky="e")
+                item["path"].configure(
+                    text=self.bi("未检测到存档路径", "No save path detected"),
+                    text_color=("#ea580c", "#fb923c"),
+                )
+                item["meta"].configure(text="")
+                item["meta"].grid_remove()
+                if item["option"] is not None:
+                    item["option"].pack_forget()
+                if item["add_btn"] is not None:
+                    item["add_btn"].pack_forget()
+                if item["folder_btn"] is None:
+                    item["folder_btn"] = ctk.CTkButton(
+                        item["right_bottom"], text="📁", width=36, height=28,
+                        font=font(14), corner_radius=6,
+                        fg_color=BTN_WARN, hover_color=BTN_WARN_H,
+                    )
+                    item["folder_btn"].pack(side="left")
+                item["folder_btn"].configure(command=lambda a=appid, n=name: self._override_scan_result_path(a, n))
+                if item["status"] is not None:
+                    item["status"].grid_remove()
+
+            item["card"].pack(fill="x", padx=4, pady=2)
+
+        stale_keys = [key for key in self._scan_cards.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._scan_cards.pop(key, None)
+            if item:
+                item["card"].destroy()
+            self._scan_choice_vars.pop(key, None)
 
         if not self._scan_in_progress:
             self._scan_status.configure(
@@ -6925,17 +7114,17 @@ class SteamSaveManager(ctk.CTk):
         self._scan_lib_folders = []
         self._scan_worker_count = 0
         self._scan_storage_profile = "unknown"
-        for w in self._scan_scroll.winfo_children():
-            w.destroy()
-        ic = ctk.CTkFrame(self._scan_scroll, fg_color=("#fef2f2", "#450a0a"),
-                          corner_radius=10)
-        ic.pack(fill="x", padx=4, pady=(0, 8))
-        ctk.CTkLabel(
-            ic,
+        for item in self._scan_cards.values():
+            item["card"].destroy()
+        self._scan_cards.clear()
+        self._scan_choice_vars = {}
+        self._scan_empty_label.pack_forget()
+        self._scan_info_banner.configure(fg_color=("#fef2f2", "#450a0a"))
+        self._scan_info_label.configure(
             text=self.t("scan_missing_steam"),
-            font=font(12), text_color=("#dc2626", "#fca5a5"),
-            justify="left",
-        ).pack(padx=14, pady=10, anchor="w")
+            font=font(12), text_color=("#dc2626", "#fca5a5"), justify="left",
+        )
+        self._scan_info_banner.pack(fill="x", padx=4, pady=(0, 8))
         self._scan_status.configure(text=message)
         self._set_scan_busy(False)
 
@@ -7022,11 +7211,14 @@ class SteamSaveManager(ctk.CTk):
         self._scan_results = []
         self._scan_lib_folders = []
         self._scan_choice_vars = {}
+        for item in self._scan_cards.values():
+            item["card"].destroy()
+        self._scan_cards.clear()
         self._scan_worker_count = 0
         self._scan_storage_profile = "unknown"
         steam_path = self.cfg.get("steam_path", "")
-        for w in self._scan_scroll.winfo_children():
-            w.destroy()
+        self._scan_info_banner.pack_forget()
+        self._scan_empty_label.pack_forget()
         self._set_scan_busy(True)
         self._scan_status.configure(text=self.bi("扫描中...", "Scanning..."))
         self.update_idletasks()
@@ -7219,17 +7411,30 @@ class SteamSaveManager(ctk.CTk):
             frame, height=440, corner_radius=12, fg_color=C_CARD_BG)
         self._games_scroll.grid(row=2, column=0, padx=30, pady=4, sticky="nsew")
         frame.grid_rowconfigure(2, weight=1)
+        self._game_cards = {}
+        self._games_empty_label = ctk.CTkLabel(
+            self._games_scroll,
+            text="",
+            text_color=C_SUBTLE_TEXT,
+            font=font(13),
+        )
 
     def _refresh_games_list(self):
-        for w in self._games_scroll.winfo_children(): w.destroy()
         games = self.cfg.get("games", [])
         search_text = self._games_search_var.get().strip().lower() if hasattr(self, "_games_search_var") else ""
+        active_keys = set()
+        for item in self._game_cards.values():
+            item["card"].pack_forget()
         if not games:
-            ctk.CTkLabel(self._games_scroll,
-                text=self.bi("还没有添加游戏，请前往「扫描游戏」自动检测或手动添加",
-                             "No games added yet. Go to Scan Games to detect them automatically or add one manually."),
-                text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
+            self._games_empty_label.configure(
+                text=self.bi(
+                    "还没有添加游戏，请前往「扫描游戏」自动检测或手动添加",
+                    "No games added yet. Go to Scan Games to detect them automatically or add one manually.",
+                )
+            )
+            self._games_empty_label.pack(pady=40)
             return
+        filtered_games = []
         for idx, g in enumerate(games):
             haystack = g.get("_search_blob")
             if haystack is None:
@@ -7237,56 +7442,97 @@ class SteamSaveManager(ctk.CTk):
                 g["_search_blob"] = haystack
             if search_text and search_text not in haystack:
                 continue
-            card = ctk.CTkFrame(self._games_scroll,
-                                fg_color=("#f1f5f9", "#252640"), corner_radius=12)
-            card.pack(fill="x", padx=4, pady=3)
-            card.grid_columnconfigure(1, weight=1)
+            filtered_games.append((idx, g))
+
+        for idx, g in filtered_games:
+            key = str(g.get("appid") or f"{g.get('name', '')}::{g.get('save_path', '')}")
+            active_keys.add(key)
+            item = self._game_cards.get(key)
+            if item is None:
+                card = ctk.CTkFrame(self._games_scroll,
+                                    fg_color=("#f1f5f9", "#252640"), corner_radius=12)
+                card.grid_columnconfigure(1, weight=1)
+                title = ctk.CTkLabel(card, text="", font=font(14, "bold"),
+                                     text_color=C_BODY_TEXT)
+                title.grid(row=0, column=0, columnspan=2, padx=14, pady=(10, 2), sticky="w")
+                path_label = ctk.CTkLabel(card, text="", font=font(11),
+                                          text_color=C_SUBTLE_TEXT)
+                path_label.grid(row=1, column=0, columnspan=2, padx=14, pady=(0, 3), sticky="w")
+                backup_label = ctk.CTkLabel(card, text="", font=font(11),
+                                            text_color=C_SUBTLE_TEXT)
+                backup_label.grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+                bb = ctk.CTkFrame(card, fg_color="transparent")
+                bb.grid(row=2, column=1, padx=14, pady=(0, 10), sticky="e")
+                detail_btn = ctk.CTkButton(
+                    bb, text=self.bi("详情", "Details"), width=64, height=28,
+                    font=font(12, "bold"), corner_radius=6,
+                    fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H)
+                detail_btn.pack(side="left", padx=2)
+                backup_btn = ctk.CTkButton(
+                    bb, text=self.bi("备份", "Backup"), width=56, height=28,
+                    font=font(12), corner_radius=6,
+                    fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H)
+                backup_btn.pack(side="left", padx=2)
+                delete_btn = ctk.CTkButton(
+                    bb, text=self.bi("删除", "Delete"), width=56, height=28,
+                    font=font(12), corner_radius=6,
+                    fg_color=BTN_DANGER, hover_color=BTN_DANGER_H)
+                delete_btn.pack(side="left", padx=2)
+                item = {
+                    "card": card,
+                    "title": title,
+                    "path": path_label,
+                    "backup": backup_label,
+                    "detail_btn": detail_btn,
+                    "backup_btn": backup_btn,
+                    "delete_btn": delete_btn,
+                }
+                self._game_cards[key] = item
 
             nm = g["name"]
-            if g.get("appid"): nm += f"  (AppID: {g['appid']})"
-            ctk.CTkLabel(card, text=nm, font=font(14, "bold"),
-                         text_color=C_BODY_TEXT).grid(
-                row=0, column=0, columnspan=2, padx=14, pady=(10, 2), sticky="w")
+            if g.get("appid"):
+                nm += f"  (AppID: {g['appid']})"
+            item["title"].configure(text=nm)
 
             save_paths = get_game_save_paths(g, existing_only=False)
             p = save_paths[0] if save_paths else g.get("save_path", "")
-            if len(p) > 68: p = "..." + p[-65:]
+            if len(p) > 68:
+                p = "..." + p[-65:]
             if len(save_paths) > 1:
                 p += self.bi(f"  (+{len(save_paths)-1} 个目录)", f"  (+{len(save_paths)-1} folders)")
-            ctk.CTkLabel(card, text=f"📁 {p}", font=font(11),
-                         text_color=C_SUBTLE_TEXT).grid(
-                row=1, column=0, columnspan=2, padx=14, pady=(0, 3), sticky="w")
+            item["path"].configure(text=f"📁 {p}")
 
             bc = self._get_game_backup_count_cached(g["name"])
-            ctk.CTkLabel(card, text=self.bi(f"备份数：{bc}", f"Backups: {bc}"), font=font(11),
-                         text_color=C_SUBTLE_TEXT).grid(
-                row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+            item["backup"].configure(text=self.bi(f"备份数：{bc}", f"Backups: {bc}"))
 
-            bb = ctk.CTkFrame(card, fg_color="transparent")
-            bb.grid(row=2, column=1, padx=14, pady=(0, 10), sticky="e")
-            ctk.CTkButton(bb, text=self.bi("详情", "Details"), width=64, height=28,
-                          font=font(12, "bold"), corner_radius=6,
-                          fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                          command=lambda i=idx: self._show_game_detail(i)).pack(
-                side="left", padx=2)
-            ctk.CTkButton(bb, text=self.bi("备份", "Backup"), width=56, height=28,
-                          font=font(12), corner_radius=6,
-                          fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-                          command=lambda i=idx: self._manual_backup(i)).pack(
-                side="left", padx=2)
-            ctk.CTkButton(bb, text=self.bi("删除", "Delete"), width=56, height=28,
-                          font=font(12), corner_radius=6,
-                          fg_color=BTN_DANGER, hover_color=BTN_DANGER_H,
-                          command=lambda i=idx: self._delete_game(i)).pack(
-                side="left", padx=2)
-            # 整个卡片可点击进入详情
-            _click = lambda e, i=idx: self._show_game_detail(i)
-            card.bind("<Button-1>", _click)
-            card.configure(cursor="hand2")
-            for _w in card.winfo_children():
-                if isinstance(_w, ctk.CTkLabel):
-                    _w.bind("<Button-1>", _click)
-                    _w.configure(cursor="hand2")
+            item["detail_btn"].configure(command=lambda i=idx: self._show_game_detail(i))
+            item["backup_btn"].configure(command=lambda i=idx: self._manual_backup(i))
+            item["delete_btn"].configure(command=lambda i=idx: self._delete_game(i))
+
+            click_handler = lambda _e=None, i=idx: self._show_game_detail(i)
+            item["card"].bind("<Button-1>", click_handler)
+            item["card"].configure(cursor="hand2")
+            item["title"].bind("<Button-1>", click_handler)
+            item["path"].bind("<Button-1>", click_handler)
+            item["backup"].bind("<Button-1>", click_handler)
+            item["title"].configure(cursor="hand2")
+            item["path"].configure(cursor="hand2")
+            item["backup"].configure(cursor="hand2")
+            item["card"].pack(fill="x", padx=4, pady=3)
+
+        stale_keys = [key for key in self._game_cards.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._game_cards.pop(key, None)
+            if item:
+                item["card"].destroy()
+
+        if filtered_games:
+            self._games_empty_label.pack_forget()
+        else:
+            self._games_empty_label.configure(
+                text=self.bi("没有匹配的游戏", "No matching games")
+            )
+            self._games_empty_label.pack(pady=40)
 
     def _create_save_paths_editor(self, parent, initial_paths=None, width=420):
         state = {"rows": []}
@@ -7454,6 +7700,7 @@ class SteamSaveManager(ctk.CTk):
             set_game_save_paths(game, save_paths)
             self.cfg.setdefault("games", []).append(game)
             remember_recognition_path(self.cfg, appid, n, game["save_path"])
+            self._invalidate_game_backup_count_cache()
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("确认添加", "Add Game"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -7484,6 +7731,7 @@ class SteamSaveManager(ctk.CTk):
             if old_game.get("save_path") and old_game.get("save_path") != self.cfg["games"][idx].get("save_path"):
                 exclude_recognition_path(self.cfg, old_game.get("appid", ""), old_game.get("name", ""), old_game.get("save_path", ""))
             remember_recognition_path(self.cfg, self.cfg["games"][idx].get("appid", ""), new_name, self.cfg["games"][idx].get("save_path", ""))
+            self._invalidate_game_backup_count_cache()
             save_config(self.cfg); self._refresh_games_list(); d.destroy()
         ctk.CTkButton(d, text=self.bi("保存", "Save"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
@@ -7495,6 +7743,7 @@ class SteamSaveManager(ctk.CTk):
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi(f"删除「{n}」？（备份保留）", f"Delete {n}? Existing backups will be kept.")):
             clear_game_sync_state(self.cfg, g)
             self.cfg["games"].pop(idx)
+            self._invalidate_game_backup_count_cache()
             save_config(self.cfg); self._refresh_games_list()
 
     def _browse(self, entry, callback=None):
@@ -7712,24 +7961,19 @@ class SteamSaveManager(ctk.CTk):
         g = self.cfg["games"][idx]
         self._detail_title.configure(text=f"🎮 {g['name']}")
 
-        backups = get_backups(g["name"])
+        backups = self._get_game_backups_cached(g["name"])
         total_size = sum(b["size"] for b in backups)
+        detail_metrics = self._get_game_detail_metrics_cached(g)
 
         # 统计卡片
         self._detail_stats["appid"].configure(
             text=g.get("appid", "") or self.bi("未设置", "Not set"))
         self._detail_stats["backups"].configure(text=str(len(backups)))
         self._detail_stats["size"].configure(text=fmt_size(total_size))
-        save_paths = get_game_save_paths(g, existing_only=False)
-        existing_paths = [p for p in save_paths if os.path.isdir(p)]
-        path_ok = bool(existing_paths)
-        file_count = 0
-        for path in existing_paths:
-            try:
-                for _, _, fs in os.walk(path):
-                    file_count += len(fs)
-            except Exception:
-                continue
+        save_paths = detail_metrics.get("save_paths", [])
+        existing_paths = detail_metrics.get("existing_paths", [])
+        path_ok = bool(detail_metrics.get("path_ok", False))
+        file_count = int(detail_metrics.get("file_count", 0))
         self._detail_stats["files"].configure(
             text=self.bi(f"{file_count} 个", f"{file_count}") if path_ok else "—")
 
@@ -7802,7 +8046,7 @@ class SteamSaveManager(ctk.CTk):
     def _show_backup_history(self):
         """弹窗显示当前游戏的完整备份历史"""
         g = self.cfg["games"][self._detail_idx]
-        backups = get_backups(g["name"])
+        backups = self._get_game_backups_cached(g["name"])
 
         d = self._create_popup(self.bi(f"备份历史 — {g['name']}", f"Backup History — {g['name']}"), "680x520")
         d.grid_columnconfigure(0, weight=1)
@@ -8669,53 +8913,88 @@ class SteamSaveManager(ctk.CTk):
             frame, height=440, corner_radius=12, fg_color=C_CARD_BG)
         self._bk_scroll.grid(row=1, column=0, padx=30, pady=10, sticky="nsew")
         frame.grid_rowconfigure(1, weight=1)
+        self._backup_rows = {}
+        self._backup_empty_label = ctk.CTkLabel(
+            self._bk_scroll,
+            text="",
+            text_color=C_SUBTLE_TEXT,
+            font=font(13),
+        )
 
     def _refresh_backup_list(self):
         games = self.cfg.get("games", [])
         all_games_label = self.t("backup_all_games")
         self._bk_filter.configure(values=[all_games_label] + [g["name"] for g in games])
-        for w in self._bk_scroll.winfo_children(): w.destroy()
 
         sel = self._bk_var.get()
         targets = games if sel == all_games_label else [g for g in games if g["name"] == sel]
         all_b = []
+        for item in self._backup_rows.values():
+            item["card"].pack_forget()
         for g in targets:
-            for b in get_backups(g["name"]):
+            save_paths = get_game_save_paths(g, existing_only=False)
+            save_specs = get_game_save_specs(g, existing_only=False)
+            primary_path = save_paths[0] if save_paths else g.get("save_path", "")
+            for b in self._get_game_backups_cached(g["name"]):
                 b["game"] = g["name"]
-                save_paths = get_game_save_paths(g, existing_only=False)
-                save_specs = get_game_save_specs(g, existing_only=False)
-                b["save_path"] = save_paths[0] if save_paths else g.get("save_path", "")
+                b["save_path"] = primary_path
                 b["save_paths"] = save_paths
                 b["save_specs"] = save_specs
                 all_b.append(b)
         all_b.sort(key=lambda x: x["timestamp"], reverse=True)
 
         if not all_b:
-            ctk.CTkLabel(self._bk_scroll, text=self.t("backup_empty"),
-                         text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
+            self._backup_empty_label.configure(text=self.t("backup_empty"))
+            self._backup_empty_label.pack(pady=40)
             return
+        self._backup_empty_label.pack_forget()
+        active_keys = set()
         for b in all_b:
-            card = ctk.CTkFrame(self._bk_scroll,
-                                fg_color=("#f1f5f9", "#252640"), corner_radius=10)
-            card.pack(fill="x", padx=4, pady=2)
-            card.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(card, text=f"🎮 {b['game']}", font=font(13, "bold"),
-                         text_color=C_BODY_TEXT).grid(
-                row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
+            active_keys.add(key)
+            item = self._backup_rows.get(key)
+            if item is None:
+                card = ctk.CTkFrame(self._bk_scroll,
+                                    fg_color=("#f1f5f9", "#252640"), corner_radius=10)
+                card.grid_columnconfigure(1, weight=1)
+                title = ctk.CTkLabel(card, text="", font=font(13, "bold"),
+                                     text_color=C_BODY_TEXT)
+                title.grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+                info_label = ctk.CTkLabel(card, text="", font=font(11),
+                                          text_color=C_SUBTLE_TEXT)
+                info_label.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+                bb = ctk.CTkFrame(card, fg_color="transparent")
+                bb.grid(row=0, column=1, rowspan=2, padx=14, pady=10, sticky="e")
+                restore_btn = ctk.CTkButton(
+                    bb, text=self.bi("还原", "Restore"), width=60, height=28, font=font(12),
+                    corner_radius=6, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H)
+                restore_btn.pack(side="left", padx=2)
+                delete_btn = ctk.CTkButton(
+                    bb, text=self.bi("删除", "Delete"), width=60, height=28, font=font(12),
+                    corner_radius=6, fg_color=BTN_DANGER, hover_color=BTN_DANGER_H)
+                delete_btn.pack(side="left", padx=2)
+                item = {
+                    "card": card,
+                    "title": title,
+                    "info": info_label,
+                    "restore_btn": restore_btn,
+                    "delete_btn": delete_btn,
+                }
+                self._backup_rows[key] = item
+            item["title"].configure(text=f"🎮 {b['game']}")
             info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
             note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
-            if note_text: info += f"  ·  📝 {note_text}"
-            ctk.CTkLabel(card, text=info, font=font(11),
-                         text_color=C_SUBTLE_TEXT).grid(
-                row=1, column=0, padx=14, pady=(0, 10), sticky="w")
-            bb = ctk.CTkFrame(card, fg_color="transparent")
-            bb.grid(row=0, column=1, rowspan=2, padx=14, pady=10, sticky="e")
-            ctk.CTkButton(bb, text=self.bi("还原", "Restore"), width=60, height=28, font=font(12),
-                          corner_radius=6, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-                          command=lambda bp=b: self._restore(bp)).pack(side="left", padx=2)
-            ctk.CTkButton(bb, text=self.bi("删除", "Delete"), width=60, height=28, font=font(12),
-                          corner_radius=6, fg_color=BTN_DANGER, hover_color=BTN_DANGER_H,
-                          command=lambda bp=b: self._del_bk(bp)).pack(side="left", padx=2)
+            if note_text:
+                info += f"  ·  📝 {note_text}"
+            item["info"].configure(text=info)
+            item["restore_btn"].configure(command=lambda bp=b: self._restore(bp))
+            item["delete_btn"].configure(command=lambda bp=b: self._del_bk(bp))
+            item["card"].pack(fill="x", padx=4, pady=2)
+        stale_keys = [key for key in self._backup_rows.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._backup_rows.pop(key, None)
+            if item:
+                item["card"].destroy()
 
     def _restore(self, b):
         if self._io_busy: return
@@ -9844,18 +10123,33 @@ class SteamSaveManager(ctk.CTk):
         if not HAS_WATCHDOG: return
         self._stop_watchers()
         cd = self.cfg.get("watch_cooldown", 60)
+        observer = Observer()
+        handler_count = 0
         for g in self.cfg.get("games", []):
             if not g.get("auto_backup", True):
                 continue
             for save_path in get_game_save_paths(g, existing_only=True):
-                obs = Observer()
-                obs.schedule(SaveChangeHandler(g, cd), save_path, recursive=True)
-                obs.start()
-                self._watchers.append(obs)
+                handler = SaveChangeHandler(g, cd)
+                observer.schedule(handler, save_path, recursive=True)
+                self._watch_handlers.append(handler)
+                handler_count += 1
+        if handler_count:
+            observer.start()
+            self._watchers.append(observer)
 
     def _stop_watchers(self):
-        for obs in self._watchers: obs.stop()
+        for obs in self._watchers:
+            try:
+                obs.stop()
+            except Exception:
+                pass
+        for obs in self._watchers:
+            try:
+                obs.join(timeout=1.0)
+            except Exception:
+                pass
         self._watchers.clear()
+        self._watch_handlers.clear()
 
     # ─── 系统托盘 & 关闭 ───
     def _on_close(self):
