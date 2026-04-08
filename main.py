@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.3.1 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.2 — 通用版"""
 
 import os
 import sys
@@ -79,10 +79,49 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.3.1"
-CONFIG_DIR = Path.home() / ".steam_save_manager"
+VERSION = "1.3.2"
+APP_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
+LEGACY_CONFIG_DIR = Path.home() / ".steam_save_manager"
+STARTUP_AUTOSTART_FLAG = "--startup-launch"
+STARTUP_LAUNCH = STARTUP_AUTOSTART_FLAG in sys.argv
+
+
+def _can_write_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".ssm_write_test.tmp"
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_config_dir() -> Path:
+    portable_cfg = APP_DIR / "config.json"
+    legacy_cfg = LEGACY_CONFIG_DIR / "config.json"
+    if portable_cfg.exists():
+        return APP_DIR
+    if legacy_cfg.exists():
+        return LEGACY_CONFIG_DIR
+    if _can_write_dir(APP_DIR):
+        return APP_DIR
+    return LEGACY_CONFIG_DIR
+
+
+def _build_autostart_command(script_path: str, python_path: str) -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{script_path}" {STARTUP_AUTOSTART_FLAG}'
+    pythonw = python_path.replace("python.exe", "pythonw.exe")
+    if not os.path.isfile(pythonw):
+        pythonw = python_path
+    return f'"{pythonw}" "{script_path}" {STARTUP_AUTOSTART_FLAG}'
+
+
+CONFIG_DIR = _resolve_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
-BACKUP_ROOT = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
+BACKUP_ROOT = APP_DIR / "backups"
 LOCK_FILE = CONFIG_DIR / ".lock"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Kiowx/save_manager/refs/heads/main/update/update.json"
 
@@ -687,11 +726,7 @@ def set_autostart_enabled(enable: bool):
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY,
                                  0, winreg.KEY_SET_VALUE)
             if enable:
-                # 使用 pythonw 避免弹出命令行窗口
-                pythonw = python_path.replace("python.exe", "pythonw.exe")
-                if not os.path.isfile(pythonw):
-                    pythonw = python_path
-                cmd = f'"{pythonw}" "{script_path}"'
+                cmd = _build_autostart_command(script_path, python_path)
                 winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, cmd)
             else:
                 try:
@@ -717,6 +752,7 @@ def set_autostart_enabled(enable: bool):
     <array>
         <string>{python_path}</string>
         <string>{script_path}</string>
+        <string>{STARTUP_AUTOSTART_FLAG}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -734,7 +770,7 @@ def set_autostart_enabled(enable: bool):
             content = f"""[Desktop Entry]
 Type=Application
 Name=Steam Save Manager
-Exec={python_path} {script_path}
+Exec={python_path} {script_path} {STARTUP_AUTOSTART_FLAG}
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
@@ -780,53 +816,6 @@ def detect_steam_path() -> str:
 
 
 _REGISTRY_INSTALL_CACHE: dict[str, list[str]] = {}
-
-
-def _normalize_recognition_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", (name or "").lower())
-
-
-_ROMAN_MAP = {
-    "ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6",
-    "vii": "7", "viii": "8", "ix": "9", "x": "10", "xi": "11",
-    "xii": "12", "xiii": "13", "xiv": "14", "xv": "15", "xvi": "16",
-}
-_NOISE_WORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "for", "by"}
-
-
-def _extract_search_keywords(game_name: str) -> list[str]:
-    """
-    从游戏名中提取增强关键词列表，包括：
-    - 原始词（去标点）
-    - 罗马数字转阿拉伯数字
-    - 首字母缩写
-    - 去掉噪音词后的连续形式
-    """
-    if not game_name:
-        return []
-    raw_words = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", game_name)
-    keywords = []
-    seen = set()
-
-    def _add(w: str):
-        w = w.lower()
-        if w and len(w) > 1 and w not in seen:
-            seen.add(w)
-            keywords.append(w)
-
-    for w in raw_words:
-        wl = w.lower()
-        _add(wl)
-        if wl in _ROMAN_MAP:
-            _add(_ROMAN_MAP[wl])
-
-    meaningful = [w for w in raw_words if w.lower() not in _NOISE_WORDS and len(w) > 1]
-    if len(meaningful) >= 2:
-        acronym = "".join(w[0] for w in meaningful).lower()
-        if len(acronym) >= 2:
-            _add(acronym)
-
-    return keywords
 
 
 def _detect_install_paths_from_registry(game_name: str, appid: str = "") -> list[str]:
@@ -1005,14 +994,6 @@ def _accountid_from_steam64(steamid64: str) -> str:
         return ""
 
 
-
-def _steam64_from_accountid(accountid: str) -> str:
-    try:
-        return str(76561197960265728 + int(str(accountid).strip()))
-    except Exception:
-        return ""
-
-
 def get_steam_accounts(steam_path: str) -> list[dict]:
     """读取 Steam 多账号列表，并尽量补齐账号昵称。"""
     accounts: dict[str, dict] = {}
@@ -1116,7 +1097,6 @@ def _get_volume_root(path: str) -> str:
         if len(parts) >= 2:
             return f"\\\\{parts[0]}\\{parts[1]}\\"
     return ""
-_STORAGE_KIND_CACHE: dict[str, str] = {}
 
 
 def classify_storage_path(path: str) -> str:
@@ -1393,6 +1373,7 @@ COMMON_SAVE_BASES = [
     PUBLIC_DOCUMENTS,
 ]
 _STEAM_AUTOCLOUD_CACHE: Optional[list[dict]] = None
+_STORAGE_KIND_CACHE: dict[str, str] = {}
 _SAVE_DETECTION_CACHE: dict[str, list[dict]] = {}
 _STEAMDB_UFS_CACHE: dict[str, list[str]] = {}
 _STEAMDB_UFS_ENTRY_CACHE: dict[str, list[dict]] = {}
@@ -1403,6 +1384,68 @@ _APPINFO_LOADED = False
 _APPINFO_LOADED_PATH = ""
 _APPINFO_DATA: dict[str, list[dict]] = {}
 _INSTALLED_GAME_INFO_CACHE: dict[str, dict[str, dict]] = {}
+
+
+def _load_appinfo_vdf(steam_path: str):
+    """
+    解析 Steam appinfo.vdf 二进制文件，提取每个 appid 的 UFS savefiles 配置。
+    格式: magic(4B) + universe(4B) + records...
+    每条记录: appid(4B LE) + size(4B LE) + ... + binary KV data + 0x00 sentinel
+    appinfo.vdf v28/v29 格式（Steam 2024+）：
+      header: magic(4B) + universe(4B)
+      record: appid(4B) + size(4B) + state(4B) + last_updated(4B) + token(8B)
+              + sha1(20B) + change_number(4B) + sha1_2(20B) + binary_kv_data
+    """
+    global _APPINFO_LOADED, _APPINFO_DATA, _APPINFO_UFS_CACHE, _APPINFO_LOADED_PATH
+    normalized_steam_path = os.path.normpath(steam_path) if steam_path else ""
+    if _APPINFO_LOADED and normalized_steam_path == _APPINFO_LOADED_PATH:
+        return
+    _APPINFO_DATA = {}
+    _APPINFO_UFS_CACHE.clear()
+    _APPINFO_LOADED = True
+    _APPINFO_LOADED_PATH = normalized_steam_path
+
+    appinfo_path = os.path.join(steam_path, "appcache", "appinfo.vdf")
+    if not os.path.isfile(appinfo_path):
+        return
+
+    try:
+        import struct
+        with open(appinfo_path, "rb") as f:
+            data = f.read()
+
+        if len(data) < 8:
+            return
+        magic = struct.unpack_from("<I", data, 0)[0]
+        # Magic: 0x07564428 (v28) or 0x07564429 (v29)
+        if magic not in (0x07564428, 0x07564429):
+            return
+
+        pos = 8  # skip magic + universe
+        while pos + 4 <= len(data):
+            appid = struct.unpack_from("<I", data, pos)[0]
+            if appid == 0:
+                break
+            pos += 4
+            if pos + 4 > len(data):
+                break
+            size = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            if pos + size > len(data):
+                break
+            record_data = data[pos:pos + size]
+            pos += size
+
+            # 快速检查：只处理包含 "savefiles" 的记录
+            if b"savefiles" not in record_data:
+                continue
+
+            # 从二进制 KV 数据中提取 UFS savefiles
+            savefiles = _extract_ufs_savefiles(record_data)
+            if savefiles:
+                _APPINFO_DATA[str(appid)] = savefiles
+    except Exception:
+        pass
 
 
 def _extract_ufs_savefiles(record_data: bytes) -> list[dict]:
@@ -1518,68 +1561,6 @@ def _extract_ufs_savefiles(record_data: bytes) -> list[dict]:
     except Exception:
         pass
     return results
-
-
-def _load_appinfo_vdf(steam_path: str):
-    """
-    解析 Steam appinfo.vdf 二进制文件，提取每个 appid 的 UFS savefiles 配置。
-    格式: magic(4B) + universe(4B) + records...
-    每条记录: appid(4B LE) + size(4B LE) + ... + binary KV data + 0x00 sentinel
-    appinfo.vdf v28/v29 格式（Steam 2024+）：
-      header: magic(4B) + universe(4B)
-      record: appid(4B) + size(4B) + state(4B) + last_updated(4B) + token(8B)
-              + sha1(20B) + change_number(4B) + sha1_2(20B) + binary_kv_data
-    """
-    global _APPINFO_LOADED, _APPINFO_DATA, _APPINFO_UFS_CACHE, _APPINFO_LOADED_PATH
-    normalized_steam_path = os.path.normpath(steam_path) if steam_path else ""
-    if _APPINFO_LOADED and normalized_steam_path == _APPINFO_LOADED_PATH:
-        return
-    _APPINFO_DATA = {}
-    _APPINFO_UFS_CACHE.clear()
-    _APPINFO_LOADED = True
-    _APPINFO_LOADED_PATH = normalized_steam_path
-
-    appinfo_path = os.path.join(steam_path, "appcache", "appinfo.vdf")
-    if not os.path.isfile(appinfo_path):
-        return
-
-    try:
-        import struct
-        with open(appinfo_path, "rb") as f:
-            data = f.read()
-
-        if len(data) < 8:
-            return
-        magic = struct.unpack_from("<I", data, 0)[0]
-        # Magic: 0x07564428 (v28) or 0x07564429 (v29)
-        if magic not in (0x07564428, 0x07564429):
-            return
-
-        pos = 8  # skip magic + universe
-        while pos + 4 <= len(data):
-            appid = struct.unpack_from("<I", data, pos)[0]
-            if appid == 0:
-                break
-            pos += 4
-            if pos + 4 > len(data):
-                break
-            size = struct.unpack_from("<I", data, pos)[0]
-            pos += 4
-            if pos + size > len(data):
-                break
-            record_data = data[pos:pos + size]
-            pos += size
-
-            # 快速检查：只处理包含 "savefiles" 的记录
-            if b"savefiles" not in record_data:
-                continue
-
-            # 从二进制 KV 数据中提取 UFS savefiles
-            savefiles = _extract_ufs_savefiles(record_data)
-            if savefiles:
-                _APPINFO_DATA[str(appid)] = savefiles
-    except Exception:
-        pass
 
 
 _APPINFO_ROOT_MAP = {
@@ -1748,6 +1729,53 @@ def expand_path(template: str, install_dir: str = "") -> str:
             .replace("{INSTALL}", install_dir if install_dir else "__NO_INSTALL__"))
 
 
+def _normalize_recognition_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", (name or "").lower())
+
+
+_ROMAN_MAP = {
+    "ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6",
+    "vii": "7", "viii": "8", "ix": "9", "x": "10", "xi": "11",
+    "xii": "12", "xiii": "13", "xiv": "14", "xv": "15", "xvi": "16",
+}
+_NOISE_WORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "for", "by"}
+
+
+def _extract_search_keywords(game_name: str) -> list[str]:
+    """
+    从游戏名中提取增强关键词列表，包括：
+    - 原始词（去标点）
+    - 罗马数字转阿拉伯数字
+    - 首字母缩写
+    - 去掉噪音词后的连续形式
+    """
+    if not game_name:
+        return []
+    raw_words = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", game_name)
+    keywords = []
+    seen = set()
+
+    def _add(w: str):
+        w = w.lower()
+        if w and len(w) > 1 and w not in seen:
+            seen.add(w)
+            keywords.append(w)
+
+    for w in raw_words:
+        wl = w.lower()
+        _add(wl)
+        if wl in _ROMAN_MAP:
+            _add(_ROMAN_MAP[wl])
+
+    meaningful = [w for w in raw_words if w.lower() not in _NOISE_WORDS and len(w) > 1]
+    if len(meaningful) >= 2:
+        acronym = "".join(w[0] for w in meaningful).lower()
+        if len(acronym) >= 2:
+            _add(acronym)
+
+    return keywords
+
+
 def _recognition_key(appid: str, game_name: str) -> str:
     appid = str(appid or "").strip()
     if appid:
@@ -1826,6 +1854,21 @@ def exclude_recognition_path(cfg: Optional[dict], appid: str, game_name: str, pa
     if isinstance(cached, dict) and os.path.normpath(cached.get("path", "")) == norm:
         get_recognition_cache(cfg).pop(key, None)
     _SAVE_DETECTION_CACHE.clear()
+
+
+def get_confirmed_game_path(cfg: Optional[dict], appid: str, game_name: str) -> str:
+    if not cfg:
+        return ""
+    target_appid = str(appid or "").strip()
+    target_name = (game_name or "").strip().lower()
+    for game in cfg.get("games", []):
+        game_appid = str(game.get("appid") or "").strip()
+        game_name_norm = str(game.get("name") or "").strip().lower()
+        if (target_appid and game_appid == target_appid) or (not target_appid and target_name and game_name_norm == target_name):
+            save_paths = get_game_save_paths(game, existing_only=True)
+            if save_paths:
+                return save_paths[0]
+    return ""
 
 
 def _normalize_unique_paths(paths: list[str]) -> list[str]:
@@ -1907,6 +1950,26 @@ def _normalize_unique_save_specs(specs: list[dict]) -> list[dict]:
     return normalized
 
 
+def _default_save_spec(path: str) -> dict:
+    return {
+        "base": os.path.normpath(path),
+        "includes": [],
+        "recursive": True,
+    }
+
+
+def get_game_save_specs(game: Optional[dict], existing_only: bool = False) -> list[dict]:
+    if not isinstance(game, dict):
+        return []
+    raw_specs = game.get("save_specs", [])
+    specs = _normalize_unique_save_specs(raw_specs if isinstance(raw_specs, list) else [])
+    if not specs:
+        specs = [_default_save_spec(path) for path in get_game_save_paths(game, existing_only=False)]
+    if existing_only:
+        specs = [spec for spec in specs if os.path.isdir(spec["base"])]
+    return specs
+
+
 def get_game_save_paths(game: Optional[dict], existing_only: bool = False) -> list[str]:
     if not isinstance(game, dict):
         return []
@@ -1926,41 +1989,6 @@ def get_game_save_paths(game: Optional[dict], existing_only: bool = False) -> li
     if existing_only:
         result = [p for p in result if os.path.isdir(p)]
     return result
-
-
-def get_confirmed_game_path(cfg: Optional[dict], appid: str, game_name: str) -> str:
-    if not cfg:
-        return ""
-    target_appid = str(appid or "").strip()
-    target_name = (game_name or "").strip().lower()
-    for game in cfg.get("games", []):
-        game_appid = str(game.get("appid") or "").strip()
-        game_name_norm = str(game.get("name") or "").strip().lower()
-        if (target_appid and game_appid == target_appid) or (not target_appid and target_name and game_name_norm == target_name):
-            save_paths = get_game_save_paths(game, existing_only=True)
-            if save_paths:
-                return save_paths[0]
-    return ""
-
-
-def _default_save_spec(path: str) -> dict:
-    return {
-        "base": os.path.normpath(path),
-        "includes": [],
-        "recursive": True,
-    }
-
-
-def get_game_save_specs(game: Optional[dict], existing_only: bool = False) -> list[dict]:
-    if not isinstance(game, dict):
-        return []
-    raw_specs = game.get("save_specs", [])
-    specs = _normalize_unique_save_specs(raw_specs if isinstance(raw_specs, list) else [])
-    if not specs:
-        specs = [_default_save_spec(path) for path in get_game_save_paths(game, existing_only=False)]
-    if existing_only:
-        specs = [spec for spec in specs if os.path.isdir(spec["base"])]
-    return specs
 
 
 def set_game_save_specs(game: dict, specs: list[dict]):
@@ -2086,20 +2114,6 @@ def compute_save_spec_latest_mtime(specs: list[dict]) -> float:
     return latest
 
 
-def _remove_tree_contents(path: Path):
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-        return
-    for item in path.iterdir():
-        try:
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-        except Exception:
-            pass
-
-
 def _remove_matching_spec_files(spec: dict):
     base = Path(spec["base"])
     if not base.is_dir():
@@ -2130,134 +2144,6 @@ def get_installed_game_info(steam_path: str, appid: str) -> Optional[dict]:
     return cached.get(appid)
 
 
-def expand_steamdb_template(template: str, appid: str,
-                            install_dir: str = "", steam_path: str = "",
-                            library_path: str = "",
-                            preferred_accountids: Optional[list[str]] = None) -> list[str]:
-    if not template:
-        return []
-    library_root = _get_steam_library_root(install_dir, steam_path, library_path)
-    values = {
-        "%USERPROFILE%": str(USER_HOME),
-        "%APPDATA%": str(APPDATA),
-        "%LOCALAPPDATA%": str(LOCAL_APPDATA),
-        "%PROGRAMDATA%": str(PROGRAMDATA),
-        "%PUBLIC%": str(PUBLIC_HOME),
-        "%DOCUMENTS%": str(DOCUMENTS),
-        "%MYDOCUMENTS%": str(DOCUMENTS),
-        "%SAVEDGAMES%": str(SAVED_GAMES),
-        "%SAVED GAMES%": str(SAVED_GAMES),
-        "%LOCALLOW%": str(LOCAL_LOW),
-        "[Steam Install]": steam_path or "",
-        "[Steam Library]": library_root,
-        "[Game Install]": install_dir or "",
-        "[WinMyDocuments]": str(DOCUMENTS),
-        "[WinDocuments]": str(DOCUMENTS),
-        "[Documents]": str(DOCUMENTS),
-        "[My Documents]": str(DOCUMENTS),
-        "[WinUserProfile]": str(USER_HOME),
-        "[UserProfile]": str(USER_HOME),
-        "[WinAppData]": str(APPDATA),
-        "[AppData]": str(APPDATA),
-        "[AppDataRoaming]": str(APPDATA),
-        "[WinAppDataRoaming]": str(APPDATA),
-        "[LocalAppData]": str(LOCAL_APPDATA),
-        "[WinAppDataLocal]": str(LOCAL_APPDATA),
-        "[LocalLow]": str(LOCAL_LOW),
-        "[WinAppDataLocalLow]": str(LOCAL_LOW),
-        "[Saved Games]": str(SAVED_GAMES),
-        "[WinSavedGames]": str(SAVED_GAMES),
-        "[ProgramData]": str(PROGRAMDATA),
-        "[WinProgramData]": str(PROGRAMDATA),
-        "[Public]": str(PUBLIC_HOME),
-        "[Public Documents]": str(PUBLIC_DOCUMENTS),
-        "{AppID}": str(appid or "").strip(),
-        "{appid}": str(appid or "").strip(),
-    }
-    normalized = template.replace("\\", os.sep).replace("/", os.sep)
-    normalized = normalized.replace("%USERPROFILE%\\AppData\\LocalLow", str(LOCAL_LOW))
-    normalized = normalized.replace("%USERPROFILE%/AppData/LocalLow", str(LOCAL_LOW))
-    candidates = [normalized]
-    for token, replacement in values.items():
-        next_candidates = []
-        for candidate in candidates:
-            if token in candidate and replacement:
-                next_candidates.append(candidate.replace(token, replacement))
-            else:
-                next_candidates.append(candidate)
-        candidates = next_candidates
-    candidates = [os.path.expandvars(candidate) for candidate in candidates]
-
-    account_ids = get_steam_user_ids(steam_path) if steam_path else []
-    preferred_accountids = [
-        str(aid or "").strip()
-        for aid in (preferred_accountids or [])
-        if str(aid or "").strip()
-    ]
-    prioritized = [aid for aid in preferred_accountids if aid in account_ids]
-    if prioritized:
-        account_ids = prioritized + [aid for aid in account_ids if aid not in prioritized]
-    expanded = []
-    for candidate in candidates:
-        queue_items = [candidate]
-        if "{Steam3AccountID}" in candidate:
-            queue_items = [candidate.replace("{Steam3AccountID}", aid) for aid in account_ids]
-        if "{64BitSteamID}" in candidate:
-            replaced = []
-            for item in queue_items:
-                if "{64BitSteamID}" in item:
-                    for aid in account_ids:
-                        steam64 = _steam64_from_accountid(aid)
-                        if steam64:
-                            replaced.append(item.replace("{64BitSteamID}", steam64))
-                else:
-                    replaced.append(item)
-            queue_items = replaced
-        expanded.extend(queue_items)
-
-    final = []
-    seen = set()
-    for candidate in expanded:
-        if any(token in candidate for token in ("{Steam3AccountID}", "{64BitSteamID}")):
-            continue
-        norm = os.path.normpath(candidate)
-        if norm not in seen and os.path.exists(norm):
-            seen.add(norm)
-            final.append(norm)
-    return final
-
-
-def infer_install_dir_from_steamdb_template(template: str, install_dir: str = "",
-                                            library_path: str = "") -> str:
-    template = str(template or "").replace("\\", "/").strip().strip("/")
-    install_dir = os.path.normpath(install_dir or "")
-    library_path = os.path.normpath(library_path or "")
-    if not template:
-        return ""
-
-    lowered = template.lower()
-    if install_dir and os.path.isdir(install_dir):
-        install_name = os.path.basename(install_dir).lower()
-        install_norm = install_dir.replace("\\", "/").lower().strip("/")
-
-        if "[game install]" in lowered:
-            return install_dir
-        if install_name and lowered.endswith(f"/{install_name}"):
-            return install_dir
-        if install_name and f"/steamapps/common/{install_name}" in lowered:
-            return install_dir
-        if install_name and install_norm.endswith(install_name) and install_name in lowered:
-            return install_dir
-
-    if library_path and os.path.isdir(library_path) and "[steam library]" in lowered:
-        rel = re.sub(r"(?i)^.*?\[steam library\]\s*", "", template).lstrip("/").strip()
-        if rel:
-            candidate = os.path.normpath(os.path.join(library_path, *rel.replace("\\", "/").split("/")))
-            if os.path.isdir(candidate):
-                return candidate
-    return ""
-
-
 def _resolve_metadata_entry_specs(entry: dict, appid: str, primary_path: str,
                                   install_dir: str, steam_path: str,
                                   library_path: str = "",
@@ -2286,6 +2172,80 @@ def _resolve_metadata_entry_specs(entry: dict, appid: str, primary_path: str,
             "recursive": entry.get("recursive", True),
         })
     return _normalize_unique_save_specs(resolved)
+
+
+def _infer_precise_metadata_specs_for_game(game: Optional[dict], steam_path: str,
+                                           cfg: Optional[dict] = None) -> list[dict]:
+    if not isinstance(game, dict):
+        return []
+    appid = str(game.get("appid", "") or "").strip()
+    if not appid or not steam_path:
+        return []
+    current_specs = get_game_save_specs(game, existing_only=False)
+    if not current_specs:
+        return []
+    current_paths = get_game_save_paths(game, existing_only=False)
+    if not current_paths:
+        return []
+    primary_path = current_paths[0]
+    installed_game = get_installed_game_info(steam_path, appid)
+    install_dir = str(installed_game.get("install_dir", "") or "").strip() if installed_game else ""
+    library_path = str(
+        game.get("library_path", "")
+        or (installed_game.get("library_path", "") if installed_game else "")
+        or ""
+    ).strip()
+    if not install_dir:
+        return []
+    if os.path.normcase(os.path.normpath(primary_path)) != os.path.normcase(os.path.normpath(install_dir)):
+        return []
+    candidate_specs = []
+    preferred_accountids = _preferred_steam_account_ids(cfg, steam_path)
+    for entry in parse_appinfo_ufs_entries(steam_path, appid):
+        candidate_specs.extend(
+            _resolve_metadata_entry_specs(
+                entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
+            )
+        )
+    if cfg and cfg.get("steamdb_detection_enabled"):
+        for entry in fetch_steamdb_ufs_entries(appid):
+            candidate_specs.extend(
+                _resolve_metadata_entry_specs(
+                    entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
+                )
+            )
+    candidate_specs = _normalize_unique_save_specs(candidate_specs)
+    if candidate_specs:
+        return [
+            spec for spec in candidate_specs
+            if compute_save_spec_file_count([spec]) > 0
+        ]
+    return []
+
+
+def try_upgrade_game_save_specs_from_appinfo(game: Optional[dict], steam_path: str,
+                                             cfg: Optional[dict] = None) -> bool:
+    if not isinstance(game, dict):
+        return False
+    current_paths = get_game_save_paths(game, existing_only=False)
+    if not current_paths:
+        return False
+    candidate_specs = _infer_precise_metadata_specs_for_game(game, steam_path, cfg)
+    if candidate_specs:
+        rebuilt_specs = list(candidate_specs)
+        for extra_path in current_paths[1:]:
+            rebuilt_specs.append(_default_save_spec(extra_path))
+        set_game_save_specs(game, rebuilt_specs)
+        return True
+    return False
+
+
+
+def _steam64_from_accountid(accountid: str) -> str:
+    try:
+        return str(76561197960265728 + int(str(accountid).strip()))
+    except Exception:
+        return ""
 
 
 def _preferred_steam_account_ids(cfg: Optional[dict], steam_path: str) -> list[str]:
@@ -2426,102 +2386,136 @@ def fetch_steamdb_ufs_entries(appid: str) -> list[dict]:
     return list(deduped)
 
 
-def _infer_precise_metadata_specs_for_game(game: Optional[dict], steam_path: str,
-                                           cfg: Optional[dict] = None) -> list[dict]:
-    if not isinstance(game, dict):
-        return []
-    appid = str(game.get("appid", "") or "").strip()
-    if not appid or not steam_path:
-        return []
-    current_specs = get_game_save_specs(game, existing_only=False)
-    if not current_specs:
-        return []
-    current_paths = get_game_save_paths(game, existing_only=False)
-    if not current_paths:
-        return []
-    primary_path = current_paths[0]
-    installed_game = get_installed_game_info(steam_path, appid)
-    install_dir = str(installed_game.get("install_dir", "") or "").strip() if installed_game else ""
-    library_path = str(
-        game.get("library_path", "")
-        or (installed_game.get("library_path", "") if installed_game else "")
-        or ""
-    ).strip()
-    if not install_dir:
-        return []
-    if os.path.normcase(os.path.normpath(primary_path)) != os.path.normcase(os.path.normpath(install_dir)):
-        return []
-    candidate_specs = []
-    preferred_accountids = _preferred_steam_account_ids(cfg, steam_path)
-    for entry in parse_appinfo_ufs_entries(steam_path, appid):
-        candidate_specs.extend(
-            _resolve_metadata_entry_specs(
-                entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
-            )
-        )
-    if cfg and cfg.get("steamdb_detection_enabled"):
-        for entry in fetch_steamdb_ufs_entries(appid):
-            candidate_specs.extend(
-                _resolve_metadata_entry_specs(
-                    entry, appid, primary_path, install_dir, steam_path, library_path, preferred_accountids
-                )
-            )
-    candidate_specs = _normalize_unique_save_specs(candidate_specs)
-    if candidate_specs:
-        return [
-            spec for spec in candidate_specs
-            if compute_save_spec_file_count([spec]) > 0
-        ]
-    return []
-
-
-def try_upgrade_game_save_specs_from_appinfo(game: Optional[dict], steam_path: str,
-                                             cfg: Optional[dict] = None) -> bool:
-    if not isinstance(game, dict):
-        return False
-    current_paths = get_game_save_paths(game, existing_only=False)
-    if not current_paths:
-        return False
-    candidate_specs = _infer_precise_metadata_specs_for_game(game, steam_path, cfg)
-    if candidate_specs:
-        rebuilt_specs = list(candidate_specs)
-        for extra_path in current_paths[1:]:
-            rebuilt_specs.append(_default_save_spec(extra_path))
-        set_game_save_specs(game, rebuilt_specs)
-        return True
-    return False
-
-
 def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
     return [item["template"] for item in fetch_steamdb_ufs_entries(appid)]
 
 
-def _walk_limited(base: str, max_depth: int = 6):
-    """限制深度的目录遍历，避免全盘深扫过慢。"""
-    if not os.path.isdir(base):
-        return
-    base = os.path.normpath(base)
-    base_depth = base.count(os.sep)
-    for root, dirs, files in os.walk(base):
-        depth = os.path.normpath(root).count(os.sep) - base_depth
-        if depth >= max_depth:
-            dirs[:] = []
-        else:
-            dirs[:] = [d for d in dirs if d.lower() not in {
-                "cache", "caches", "temp", "tmp", "logs", "log",
-                "crashdumps", "dumpcache", "webcache", "__pycache__",
-                "node_modules", "venv", ".venv", "site-packages",
-                ".git", ".svn", ".hg",
-                "shader", "shaders", "shadercache", "gpucache",
-                "thumbnails", "screenshots", "crash", "crashreports",
-                "telemetry", "analytics",
-                "_commonredist", "redist", "directx", "dotnet",
-                "__macosx", "bin", "obj", ".vs", ".idea",
-                "localization", "locales", "i18n",
-                "video", "videos", "movies", "cinematics",
-                "music", "soundtrack",
-            }]
-        yield root, dirs, files
+def expand_steamdb_template(template: str, appid: str,
+                            install_dir: str = "", steam_path: str = "",
+                            library_path: str = "",
+                            preferred_accountids: Optional[list[str]] = None) -> list[str]:
+    if not template:
+        return []
+    library_root = _get_steam_library_root(install_dir, steam_path, library_path)
+    values = {
+        "%USERPROFILE%": str(USER_HOME),
+        "%APPDATA%": str(APPDATA),
+        "%LOCALAPPDATA%": str(LOCAL_APPDATA),
+        "%PROGRAMDATA%": str(PROGRAMDATA),
+        "%PUBLIC%": str(PUBLIC_HOME),
+        "%DOCUMENTS%": str(DOCUMENTS),
+        "%MYDOCUMENTS%": str(DOCUMENTS),
+        "%SAVEDGAMES%": str(SAVED_GAMES),
+        "%SAVED GAMES%": str(SAVED_GAMES),
+        "%LOCALLOW%": str(LOCAL_LOW),
+        "[Steam Install]": steam_path or "",
+        "[Steam Library]": library_root,
+        "[Game Install]": install_dir or "",
+        "[WinMyDocuments]": str(DOCUMENTS),
+        "[WinDocuments]": str(DOCUMENTS),
+        "[Documents]": str(DOCUMENTS),
+        "[My Documents]": str(DOCUMENTS),
+        "[WinUserProfile]": str(USER_HOME),
+        "[UserProfile]": str(USER_HOME),
+        "[WinAppData]": str(APPDATA),
+        "[AppData]": str(APPDATA),
+        "[AppDataRoaming]": str(APPDATA),
+        "[WinAppDataRoaming]": str(APPDATA),
+        "[LocalAppData]": str(LOCAL_APPDATA),
+        "[WinAppDataLocal]": str(LOCAL_APPDATA),
+        "[LocalLow]": str(LOCAL_LOW),
+        "[WinAppDataLocalLow]": str(LOCAL_LOW),
+        "[Saved Games]": str(SAVED_GAMES),
+        "[WinSavedGames]": str(SAVED_GAMES),
+        "[ProgramData]": str(PROGRAMDATA),
+        "[WinProgramData]": str(PROGRAMDATA),
+        "[Public]": str(PUBLIC_HOME),
+        "[Public Documents]": str(PUBLIC_DOCUMENTS),
+        "{AppID}": str(appid or "").strip(),
+        "{appid}": str(appid or "").strip(),
+    }
+    normalized = template.replace("\\", os.sep).replace("/", os.sep)
+    normalized = normalized.replace("%USERPROFILE%\\AppData\\LocalLow", str(LOCAL_LOW))
+    normalized = normalized.replace("%USERPROFILE%/AppData/LocalLow", str(LOCAL_LOW))
+    candidates = [normalized]
+    for token, replacement in values.items():
+        next_candidates = []
+        for candidate in candidates:
+            if token in candidate and replacement:
+                next_candidates.append(candidate.replace(token, replacement))
+            else:
+                next_candidates.append(candidate)
+        candidates = next_candidates
+    candidates = [os.path.expandvars(candidate) for candidate in candidates]
+
+    account_ids = get_steam_user_ids(steam_path) if steam_path else []
+    preferred_accountids = [
+        str(aid or "").strip()
+        for aid in (preferred_accountids or [])
+        if str(aid or "").strip()
+    ]
+    prioritized = [aid for aid in preferred_accountids if aid in account_ids]
+    if prioritized:
+        account_ids = prioritized + [aid for aid in account_ids if aid not in prioritized]
+    expanded = []
+    for candidate in candidates:
+        queue_items = [candidate]
+        if "{Steam3AccountID}" in candidate:
+            queue_items = [candidate.replace("{Steam3AccountID}", aid) for aid in account_ids]
+        if "{64BitSteamID}" in candidate:
+            replaced = []
+            for item in queue_items:
+                if "{64BitSteamID}" in item:
+                    for aid in account_ids:
+                        steam64 = _steam64_from_accountid(aid)
+                        if steam64:
+                            replaced.append(item.replace("{64BitSteamID}", steam64))
+                else:
+                    replaced.append(item)
+            queue_items = replaced
+        expanded.extend(queue_items)
+
+    final = []
+    seen = set()
+    for candidate in expanded:
+        if any(token in candidate for token in ("{Steam3AccountID}", "{64BitSteamID}")):
+            continue
+        norm = os.path.normpath(candidate)
+        if norm not in seen and os.path.exists(norm):
+            seen.add(norm)
+            final.append(norm)
+    return final
+
+
+def infer_install_dir_from_steamdb_template(template: str, install_dir: str = "",
+                                            library_path: str = "") -> str:
+    template = str(template or "").replace("\\", "/").strip().strip("/")
+    install_dir = os.path.normpath(install_dir or "")
+    library_path = os.path.normpath(library_path or "")
+    if not template:
+        return ""
+
+    lowered = template.lower()
+    if install_dir and os.path.isdir(install_dir):
+        install_name = os.path.basename(install_dir).lower()
+        install_norm = install_dir.replace("\\", "/").lower().strip("/")
+
+        if "[game install]" in lowered:
+            return install_dir
+        if install_name and lowered.endswith(f"/{install_name}"):
+            return install_dir
+        if install_name and f"/steamapps/common/{install_name}" in lowered:
+            return install_dir
+        if install_name and install_norm.endswith(install_name) and install_name in lowered:
+            return install_dir
+
+    if library_path and os.path.isdir(library_path) and "[steam library]" in lowered:
+        rel = re.sub(r"(?i)^.*?\[steam library\]\s*", "", template).lstrip("/").strip()
+        if rel:
+            candidate = os.path.normpath(os.path.join(library_path, *rel.replace("\\", "/").split("/")))
+            if os.path.isdir(candidate):
+                return candidate
+    return ""
 
 
 def get_steam_userdata_roots(steam_path: str) -> list[str]:
@@ -2562,6 +2556,34 @@ def get_steam_userdata_roots(steam_path: str) -> list[str]:
         except Exception:
             continue
     return roots
+
+
+def _walk_limited(base: str, max_depth: int = 6):
+    """限制深度的目录遍历，避免全盘深扫过慢。"""
+    if not os.path.isdir(base):
+        return
+    base = os.path.normpath(base)
+    base_depth = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        depth = os.path.normpath(root).count(os.sep) - base_depth
+        if depth >= max_depth:
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs if d.lower() not in {
+                "cache", "caches", "temp", "tmp", "logs", "log",
+                "crashdumps", "dumpcache", "webcache", "__pycache__",
+                "node_modules", "venv", ".venv", "site-packages",
+                ".git", ".svn", ".hg",
+                "shader", "shaders", "shadercache", "gpucache",
+                "thumbnails", "screenshots", "crash", "crashreports",
+                "telemetry", "analytics",
+                "_commonredist", "redist", "directx", "dotnet",
+                "__macosx", "bin", "obj", ".vs", ".idea",
+                "localization", "locales", "i18n",
+                "video", "videos", "movies", "cinematics",
+                "music", "soundtrack",
+            }]
+        yield root, dirs, files
 
 
 def _read_account_id_from_autocloud(vdf_path: str) -> str:
@@ -3338,144 +3360,6 @@ def ensure_dirs():
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def save_config(cfg: dict):
-    ensure_dirs()
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-
-# ══════════════════════════════════════════════
-#  备份/还原核心
-# ══════════════════════════════════════════════
-
-# ══════════════════════════════════════════════
-#  存档同步核心
-# ══════════════════════════════════════════════
-
-def detect_cloud_folder() -> str:
-    """
-    自动检测本地云盘同步文件夹，按优先级返回第一个找到的路径。
-    支持：OneDrive、Dropbox、Google Drive、iCloud、坚果云
-    """
-    candidates = []
-
-    # ─── OneDrive ───
-    # 1) 环境变量（最可靠）
-    for env_key in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]:
-        p = os.environ.get(env_key, "")
-        if p and os.path.isdir(p):
-            candidates.append(("OneDrive", p))
-    # 2) 注册表
-    if winreg:
-        for reg_path in [
-            r"SOFTWARE\Microsoft\OneDrive",
-            r"SOFTWARE\Microsoft\OneDrive\Accounts\Personal",
-        ]:
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_READ)
-                val, _ = winreg.QueryValueEx(key, "UserFolder")
-                winreg.CloseKey(key)
-                if val and os.path.isdir(val):
-                    candidates.append(("OneDrive", val))
-            except Exception:
-                pass
-    # 3) 常见路径
-    for name in ["OneDrive", "OneDrive - Personal"]:
-        p = str(USER_HOME / name)
-        if os.path.isdir(p):
-            candidates.append(("OneDrive", p))
-
-    # ─── Dropbox ───
-    # 1) Dropbox info.json
-    for base in [APPDATA, LOCAL_APPDATA]:
-        info_json = base / "Dropbox" / "info.json"
-        if info_json.is_file():
-            try:
-                with open(info_json, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for acct in ["personal", "business"]:
-                    if acct in data and "path" in data[acct]:
-                        dp = data[acct]["path"]
-                        if os.path.isdir(dp):
-                            candidates.append(("Dropbox", dp))
-            except Exception:
-                pass
-    # 2) 常见路径
-    for name in ["Dropbox"]:
-        p = str(USER_HOME / name)
-        if os.path.isdir(p):
-            candidates.append(("Dropbox", p))
-
-    # ─── Google Drive ───
-    # Google Drive for Desktop 默认挂载为虚拟盘符或 ~/Google Drive
-    for name in ["Google Drive", "My Drive", "GoogleDrive"]:
-        p = str(USER_HOME / name)
-        if os.path.isdir(p):
-            candidates.append(("Google Drive", p))
-    # Windows: Google Drive 虚拟盘符 (G:\My Drive 等)
-    if sys.platform == "win32":
-        import string
-        for letter in string.ascii_uppercase:
-            for sub in ["My Drive", "我的云端硬盘"]:
-                gd = f"{letter}:\\{sub}"
-                if os.path.isdir(gd):
-                    candidates.append(("Google Drive", gd))
-                    break
-
-    # ─── iCloud (Windows) ───
-    icloud = USER_HOME / "iCloudDrive"
-    if icloud.is_dir():
-        candidates.append(("iCloud", str(icloud)))
-
-    # ─── 坚果云 (Nutstore) ───
-    for name in ["Nutstore", "Nutstore Files", "坚果云"]:
-        p = str(USER_HOME / name)
-        if os.path.isdir(p):
-            candidates.append(("坚果云", p))
-
-    # 去重，返回第一个
-    seen = set()
-    for provider, path in candidates:
-        norm = os.path.normpath(path)
-        if norm not in seen:
-            seen.add(norm)
-            return norm
-    return ""
-
-
-def load_json_file_tolerant(path: Path | str, default=None, repair: bool = True):
-    """宽容读取 JSON，允许尾部出现额外字符，并可自动修复文件。"""
-    file_path = Path(path)
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        pass
-    except Exception:
-        return default
-
-    try:
-        raw = file_path.read_text(encoding="utf-8")
-    except Exception:
-        return default
-
-    cleaned = raw.lstrip("\ufeff")
-    decoder = json.JSONDecoder()
-    try:
-        obj, end = decoder.raw_decode(cleaned)
-    except Exception:
-        return default
-
-    trailing = cleaned[end:].strip()
-    if trailing and repair:
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-    return obj
-
-
 def load_config() -> dict:
     ensure_dirs()
     changed = False
@@ -3578,6 +3462,12 @@ def load_config() -> dict:
     return cfg
 
 
+def save_config(cfg: dict):
+    ensure_dirs()
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
 def clear_startup_caches(cfg: Optional[dict] = None):
     global _STEAM_AUTOCLOUD_CACHE, _APPINFO_LOADED, _APPINFO_DATA, _APPINFO_LOADED_PATH, _INSTALLED_GAME_INFO_CACHE
 
@@ -3598,6 +3488,105 @@ def clear_startup_caches(cfg: Optional[dict] = None):
         if isinstance(cache, dict) and cache:
             cfg["recognition_cache"] = {}
             save_config(cfg)
+
+
+# ══════════════════════════════════════════════
+#  备份/还原核心
+# ══════════════════════════════════════════════
+
+# ══════════════════════════════════════════════
+#  存档同步核心
+# ══════════════════════════════════════════════
+
+def detect_cloud_folder() -> str:
+    """
+    自动检测本地云盘同步文件夹，按优先级返回第一个找到的路径。
+    支持：OneDrive、Dropbox、Google Drive、iCloud、坚果云
+    """
+    candidates = []
+
+    # ─── OneDrive ───
+    # 1) 环境变量（最可靠）
+    for env_key in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]:
+        p = os.environ.get(env_key, "")
+        if p and os.path.isdir(p):
+            candidates.append(("OneDrive", p))
+    # 2) 注册表
+    if winreg:
+        for reg_path in [
+            r"SOFTWARE\Microsoft\OneDrive",
+            r"SOFTWARE\Microsoft\OneDrive\Accounts\Personal",
+        ]:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_READ)
+                val, _ = winreg.QueryValueEx(key, "UserFolder")
+                winreg.CloseKey(key)
+                if val and os.path.isdir(val):
+                    candidates.append(("OneDrive", val))
+            except Exception:
+                pass
+    # 3) 常见路径
+    for name in ["OneDrive", "OneDrive - Personal"]:
+        p = str(USER_HOME / name)
+        if os.path.isdir(p):
+            candidates.append(("OneDrive", p))
+
+    # ─── Dropbox ───
+    # 1) Dropbox info.json
+    for base in [APPDATA, LOCAL_APPDATA]:
+        info_json = base / "Dropbox" / "info.json"
+        if info_json.is_file():
+            try:
+                with open(info_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for acct in ["personal", "business"]:
+                    if acct in data and "path" in data[acct]:
+                        dp = data[acct]["path"]
+                        if os.path.isdir(dp):
+                            candidates.append(("Dropbox", dp))
+            except Exception:
+                pass
+    # 2) 常见路径
+    for name in ["Dropbox"]:
+        p = str(USER_HOME / name)
+        if os.path.isdir(p):
+            candidates.append(("Dropbox", p))
+
+    # ─── Google Drive ───
+    # Google Drive for Desktop 默认挂载为虚拟盘符或 ~/Google Drive
+    for name in ["Google Drive", "My Drive", "GoogleDrive"]:
+        p = str(USER_HOME / name)
+        if os.path.isdir(p):
+            candidates.append(("Google Drive", p))
+    # Windows: Google Drive 虚拟盘符 (G:\My Drive 等)
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase:
+            for sub in ["My Drive", "我的云端硬盘"]:
+                gd = f"{letter}:\\{sub}"
+                if os.path.isdir(gd):
+                    candidates.append(("Google Drive", gd))
+                    break
+
+    # ─── iCloud (Windows) ───
+    icloud = USER_HOME / "iCloudDrive"
+    if icloud.is_dir():
+        candidates.append(("iCloud", str(icloud)))
+
+    # ─── 坚果云 (Nutstore) ───
+    for name in ["Nutstore", "Nutstore Files", "坚果云"]:
+        p = str(USER_HOME / name)
+        if os.path.isdir(p):
+            candidates.append(("坚果云", p))
+
+    # 去重，返回第一个
+    seen = set()
+    for provider, path in candidates:
+        norm = os.path.normpath(path)
+        if norm not in seen:
+            seen.add(norm)
+            return norm
+    return ""
 
 
 def send_desktop_notification(title: str, message: str):
@@ -3705,12 +3694,6 @@ def send_desktop_notification(title: str, message: str):
             _try_pystray()
 
 
-def sanitize(name: str) -> str:
-    return "".join(
-        c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name
-    ).strip()[:80]
-
-
 def get_sync_game_dir(sync_folder: str, game_name: str) -> Path:
     """获取同步目标中该游戏的子文件夹"""
     return Path(sync_folder) / "SteamSaveSync" / sanitize(game_name)
@@ -3781,215 +3764,6 @@ def enforce_sync_archive_limits(sync_game_dir: Path, keep_count: int = 3):
                 pass
 
 
-def _webdav_decode_password(encoded: str) -> str:
-    if not encoded:
-        return ""
-    try:
-        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
-    except Exception:
-        return ""
-
-
-def _webdav_normalize_url(url: str, preset: str = "generic", username: str = "") -> str:
-    raw = str(url or "").strip().rstrip("/")
-    if not raw:
-        return ""
-    try:
-        parts = urllib.parse.urlsplit(raw)
-    except Exception:
-        return raw
-    if not parts.scheme or not parts.netloc:
-        return raw
-    path = parts.path or ""
-    preset_key = preset if preset in WEBDAV_PRESET_OPTIONS else "generic"
-    if not path or path == "/":
-        suffix = WEBDAV_PRESET_SUFFIXES.get(preset_key, "")
-        if preset_key in ("nextcloud", "openmediavault") and username:
-            suffix = f"/remote.php/dav/files/{urllib.parse.quote(username)}"
-        if suffix:
-            parts = parts._replace(path=suffix)
-            return urllib.parse.urlunsplit(parts).rstrip("/")
-    return raw
-
-
-def _webdav_split_url(url: str) -> tuple[str, str]:
-    raw = str(url or "").strip()
-    parts = urllib.parse.urlsplit(raw)
-    if not parts.scheme or not parts.netloc:
-        return raw.rstrip("/"), "/"
-    hostname = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
-    root = parts.path or "/"
-    if not root.startswith("/"):
-        root = "/" + root
-    root = root.rstrip("/") or "/"
-    return hostname, root
-
-
-def _webdav_apply_client_options(client, cfg: Optional[dict]):
-    verify_ssl = bool((cfg or {}).get("webdav_verify_ssl", True))
-    preset = str((cfg or {}).get("webdav_preset", "generic") or "generic").strip()
-    try:
-        client.verify = verify_ssl
-    except Exception:
-        pass
-    try:
-        session = getattr(client, "session", None)
-        if session is not None:
-            session.verify = verify_ssl
-    except Exception:
-        pass
-    if preset != "generic":
-        try:
-            client.webdav.disable_check = True
-        except Exception:
-            pass
-
-
-def _webdav_make_client(cfg: dict):
-    if not HAS_WEBDAV or not cfg.get("webdav_enabled"):
-        return None
-    url = _webdav_normalize_url(
-        str(cfg.get("webdav_url", "") or "").strip(),
-        str(cfg.get("webdav_preset", "generic") or "generic").strip(),
-        str(cfg.get("webdav_username", "") or "").strip(),
-    )
-    if not url:
-        return None
-    hostname, root = _webdav_split_url(url)
-    client = WebDAVClient({
-        "webdav_hostname": hostname,
-        "webdav_root": root,
-        "webdav_login": str(cfg.get("webdav_username", "") or "").strip(),
-        "webdav_password": _webdav_decode_password(cfg.get("webdav_password", "")),
-    })
-    _webdav_apply_client_options(client, cfg)
-    return client
-
-
-def _webdav_base_path(cfg: Optional[dict]) -> str:
-    raw = str((cfg or {}).get("webdav_base_path", "") or "").strip().replace("\\", "/")
-    if not raw:
-        raw = "/SteamSaveSync"
-    if not raw.startswith("/"):
-        raw = "/" + raw
-    return raw.rstrip("/") or "/SteamSaveSync"
-
-
-def webdav_is_ready(cfg: Optional[dict]) -> bool:
-    if not cfg or not HAS_WEBDAV or not cfg.get("webdav_enabled"):
-        return False
-    return bool(str(cfg.get("webdav_url", "") or "").strip())
-
-
-def get_effective_sync_root(sync_folder: str, cfg: Optional[dict] = None,
-                            ensure: bool = False) -> str:
-    local_root = str(sync_folder or "").strip()
-    if local_root and os.path.isdir(local_root):
-        return local_root
-    if webdav_is_ready(cfg):
-        cache_root = CONFIG_DIR / "webdav_sync_cache"
-        if ensure:
-            cache_root.mkdir(parents=True, exist_ok=True)
-        return str(cache_root)
-    return ""
-
-
-def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
-    return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
-
-
-def _webdav_path_variants(remote_path: str) -> list[str]:
-    raw = str(remote_path or "").strip().replace("\\", "/")
-    if not raw:
-        return ["/", ""]
-    absolute = "/" + raw.strip("/")
-    relative = raw.strip("/")
-    variants = []
-    for item in (absolute, relative):
-        if item not in variants:
-            variants.append(item)
-    return variants
-
-
-def _webdav_find_existing_variant(client, remote_path: str) -> str:
-    last_error = None
-    for candidate in _webdav_path_variants(remote_path):
-        try:
-            if client.check(candidate):
-                return candidate
-        except Exception as e:
-            last_error = e
-    if last_error:
-        raise last_error
-    raise FileNotFoundError(remote_path)
-
-
-def _webdav_clean_with_variants(client, remote_path: str):
-    last_error = None
-    for candidate in _webdav_path_variants(remote_path):
-        try:
-            client.clean(candidate)
-            return candidate
-        except Exception as e:
-            last_error = e
-    if last_error:
-        raise last_error
-    raise RuntimeError("invalid_webdav_clean_path")
-
-
-def webdav_list_archives(cfg: dict, game_name: str) -> list:
-    """列出 WebDAV 上的 .zip 存档文件名（排序后）"""
-    client = _webdav_make_client(cfg)
-    if not client:
-        return []
-    try:
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        try:
-            archive_dir = _webdav_find_existing_variant(client, archive_dir)
-        except Exception:
-            return []
-        items = client.list(archive_dir)
-        names = []
-        for item in items:
-            name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
-            if name.endswith(".zip"):
-                names.append(name)
-        return sorted(names)
-    except Exception:
-        return []
-
-
-def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3):
-    """执行 WebDAV 远端归档轮转，只保留最近 keep_count 个 ZIP。"""
-    if keep_count <= 0:
-        return
-    client = _webdav_make_client(cfg)
-    if not client:
-        return
-    try:
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        archive_dir = _webdav_find_existing_variant(client, archive_dir)
-    except Exception:
-        return
-
-    try:
-        archive_names = sorted(webdav_list_archives(cfg, game_name), reverse=True)
-    except Exception:
-        archive_names = []
-    if len(archive_names) <= keep_count:
-        return
-
-    for name in archive_names[keep_count:]:
-        try:
-            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}")
-        except Exception:
-            pass
-        try:
-            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}.meta.json")
-        except Exception:
-            pass
-
-
 def enforce_all_sync_archive_limits(cfg: Optional[dict]):
     if not cfg:
         return
@@ -4023,40 +3797,26 @@ def enforce_all_sync_archive_limits(cfg: Optional[dict]):
                 pass
 
 
+def _remove_tree_contents(path: Path):
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for item in path.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception:
+            pass
+
+
 def _iter_sync_payload_files(save_specs: list[dict]):
     multi = len(save_specs) > 1
     for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
         prefix = Path("_paths") / f"p{idx}" if multi else Path()
         arcname = prefix / Path(rel)
         yield idx, abs_f, arcname.as_posix()
-
-
-def _zip_safe_datetime(timestamp: float) -> tuple[int, int, int, int, int, int]:
-    try:
-        dt = datetime.datetime.fromtimestamp(max(float(timestamp), 0.0))
-    except Exception:
-        dt = datetime.datetime.now()
-    if dt.year < 1980:
-        dt = datetime.datetime(1980, 1, 1, 0, 0, 0)
-    elif dt.year > 2107:
-        dt = datetime.datetime(2107, 12, 31, 23, 59, 58)
-    return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
-
-
-def _open_zip_for_write(zip_path: Path | str):
-    return zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False)
-
-
-def _zip_write_file(zf: zipfile.ZipFile, file_path: Path | str, arcname: Path | str):
-    src_path = Path(file_path)
-    arcname_str = Path(arcname).as_posix()
-    st = src_path.stat()
-    info = zipfile.ZipInfo(filename=arcname_str, date_time=_zip_safe_datetime(st.st_mtime))
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.create_system = 3
-    info.external_attr = (st.st_mode & 0xFFFF) << 16
-    with src_path.open("rb") as src, zf.open(info, "w") as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
 def create_sync_archive(game: dict, sync_game_dir: Path,
@@ -4124,99 +3884,6 @@ def get_latest_sync_archive(sync_game_dir: Path) -> Optional[dict]:
             "paths": meta.get("paths", []),
         }
     return None
-
-
-def compute_dir_hash(directory: str) -> str:
-    """
-    递归计算目录内所有文件的内容 MD5 校验和。
-    将每个文件的相对路径 + 内容 MD5 拼接后再算总 hash，
-    100% 准确检测内容变化，不依赖 mtime 或文件大小。
-    """
-    h = hashlib.md5()
-    try:
-        all_files = []
-        for root, _, files in os.walk(directory):
-            for f in files:
-                fp = os.path.join(root, f)
-                rel = os.path.relpath(fp, directory)
-                all_files.append((rel, fp))
-        # 按相对路径排序，保证顺序一致
-        all_files.sort(key=lambda x: x[0])
-        for rel, fp in all_files:
-            h.update(rel.encode("utf-8"))
-            _streaming_file_hash(fp, h)
-    except OSError:
-        pass
-    return h.hexdigest()
-
-
-def compute_dir_file_count(directory: str) -> int:
-    """统计目录内文件数量"""
-    count = 0
-    try:
-        for _, _, files in os.walk(directory):
-            count += len(files)
-    except OSError:
-        pass
-    return count
-
-
-def compute_dir_latest_mtime(directory: str) -> float:
-    """返回目录内最新文件修改时间；目录为空时返回 0。"""
-    latest = 0.0
-    try:
-        for root, _, files in os.walk(directory):
-            for f in files:
-                fp = os.path.join(root, f)
-                try:
-                    latest = max(latest, os.path.getmtime(fp))
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return latest
-
-
-def combine_sync_hash(parts: list[tuple[str, str]]) -> str:
-    """
-    组合多个目录 hash，得到稳定总 hash。
-    parts: [(key, hash), ...]
-    """
-    if not parts:
-        return ""
-    h = hashlib.md5()
-    for key, value in sorted(parts, key=lambda item: item[0].lower()):
-        h.update(key.encode("utf-8", errors="ignore"))
-        h.update(b"\0")
-        h.update((value or "").encode("utf-8", errors="ignore"))
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-def snapshot_sync_paths(paths: list[str], label: str) -> dict:
-    """采集多个目录的同步摘要。"""
-    existing = [os.path.normpath(p) for p in paths if os.path.isdir(p)]
-    if not existing:
-        return {
-            "path": label,
-            "file_count": 0,
-            "hash": "",
-            "latest_mtime": 0.0,
-        }
-    hash_parts = []
-    total_files = 0
-    latest_mtime = 0.0
-    for idx, path in enumerate(existing, start=1):
-        file_count = compute_dir_file_count(path)
-        total_files += file_count
-        latest_mtime = max(latest_mtime, compute_dir_latest_mtime(path))
-        hash_parts.append((f"{idx}:{path}", compute_dir_hash(path) if file_count else ""))
-    return {
-        "path": label,
-        "file_count": total_files,
-        "hash": combine_sync_hash(hash_parts),
-        "latest_mtime": latest_mtime,
-    }
 
 
 def get_legacy_sync_snapshot(sync_game_dir: Path, path_count: int) -> Optional[dict]:
@@ -4348,6 +4015,119 @@ def _webdav_encode_password(plain: str) -> str:
     return base64.b64encode(plain.encode("utf-8")).decode("ascii")
 
 
+def _webdav_decode_password(encoded: str) -> str:
+    if not encoded:
+        return ""
+    try:
+        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _webdav_make_client(cfg: dict):
+    if not HAS_WEBDAV or not cfg.get("webdav_enabled"):
+        return None
+    url = _webdav_normalize_url(
+        str(cfg.get("webdav_url", "") or "").strip(),
+        str(cfg.get("webdav_preset", "generic") or "generic").strip(),
+        str(cfg.get("webdav_username", "") or "").strip(),
+    )
+    if not url:
+        return None
+    hostname, root = _webdav_split_url(url)
+    client = WebDAVClient({
+        "webdav_hostname": hostname,
+        "webdav_root": root,
+        "webdav_login": str(cfg.get("webdav_username", "") or "").strip(),
+        "webdav_password": _webdav_decode_password(cfg.get("webdav_password", "")),
+    })
+    _webdav_apply_client_options(client, cfg)
+    return client
+
+
+def _webdav_base_path(cfg: Optional[dict]) -> str:
+    raw = str((cfg or {}).get("webdav_base_path", "") or "").strip().replace("\\", "/")
+    if not raw:
+        raw = "/SteamSaveSync"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw.rstrip("/") or "/SteamSaveSync"
+
+
+def _webdav_normalize_url(url: str, preset: str = "generic", username: str = "") -> str:
+    raw = str(url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except Exception:
+        return raw
+    if not parts.scheme or not parts.netloc:
+        return raw
+    path = parts.path or ""
+    preset_key = preset if preset in WEBDAV_PRESET_OPTIONS else "generic"
+    if not path or path == "/":
+        suffix = WEBDAV_PRESET_SUFFIXES.get(preset_key, "")
+        if preset_key in ("nextcloud", "openmediavault") and username:
+            suffix = f"/remote.php/dav/files/{urllib.parse.quote(username)}"
+        if suffix:
+            parts = parts._replace(path=suffix)
+            return urllib.parse.urlunsplit(parts).rstrip("/")
+    return raw
+
+
+def _webdav_split_url(url: str) -> tuple[str, str]:
+    raw = str(url or "").strip()
+    parts = urllib.parse.urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return raw.rstrip("/"), "/"
+    hostname = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+    root = parts.path or "/"
+    if not root.startswith("/"):
+        root = "/" + root
+    root = root.rstrip("/") or "/"
+    return hostname, root
+
+
+def _webdav_apply_client_options(client, cfg: Optional[dict]):
+    verify_ssl = bool((cfg or {}).get("webdav_verify_ssl", True))
+    preset = str((cfg or {}).get("webdav_preset", "generic") or "generic").strip()
+    try:
+        client.verify = verify_ssl
+    except Exception:
+        pass
+    try:
+        session = getattr(client, "session", None)
+        if session is not None:
+            session.verify = verify_ssl
+    except Exception:
+        pass
+    if preset != "generic":
+        try:
+            client.webdav.disable_check = True
+        except Exception:
+            pass
+
+
+def webdav_is_ready(cfg: Optional[dict]) -> bool:
+    if not cfg or not HAS_WEBDAV or not cfg.get("webdav_enabled"):
+        return False
+    return bool(str(cfg.get("webdav_url", "") or "").strip())
+
+
+def get_effective_sync_root(sync_folder: str, cfg: Optional[dict] = None,
+                            ensure: bool = False) -> str:
+    local_root = str(sync_folder or "").strip()
+    if local_root and os.path.isdir(local_root):
+        return local_root
+    if webdav_is_ready(cfg):
+        cache_root = CONFIG_DIR / "webdav_sync_cache"
+        if ensure:
+            cache_root.mkdir(parents=True, exist_ok=True)
+        return str(cache_root)
+    return ""
+
+
 def has_sync_backend(sync_folder: str, cfg: Optional[dict] = None) -> bool:
     return bool(get_effective_sync_root(sync_folder, cfg, ensure=False))
 
@@ -4364,59 +4144,6 @@ def get_sync_backend_issue(sync_folder: str, cfg: Optional[dict] = None) -> str:
     if local_root:
         return "sync_folder_missing"
     return "not_configured"
-
-
-def _webdav_upload_with_variants(client, remote_path: str, local_path: str):
-    last_error = None
-    for candidate in _webdav_path_variants(remote_path):
-        try:
-            result = client.upload_sync(remote_path=candidate, local_path=local_path)
-            if result is False:
-                last_error = RuntimeError(f"upload returned False for {candidate}")
-                continue
-            return candidate
-        except Exception as e:
-            last_error = e
-    if last_error:
-        raise last_error
-    raise RuntimeError("invalid_webdav_upload_path")
-
-
-def _webdav_ensure_remote_dir(client, remote_dir: str):
-    normalized = str(remote_dir or "").strip().strip("/")
-    if not normalized:
-        return
-    current = ""
-    for part in [p for p in normalized.split("/") if p]:
-        current = f"{current}/{part}" if current else part
-        last_error = None
-        created = False
-        for candidate in _webdav_path_variants(current):
-            try:
-                result = client.mkdir(candidate)
-                if result is False:
-                    last_error = RuntimeError(f"mkdir returned False for {candidate}")
-                    continue
-                created = True
-                break
-            except Exception as e:
-                err_text = str(e).lower()
-                if any(token in err_text for token in (
-                    "already exists",
-                    "file exists",
-                    "405",
-                    "301",
-                    "302",
-                    "method not allowed",
-                    "conflict",
-                )):
-                    created = True
-                    break
-                last_error = e
-        if not created:
-            if last_error:
-                raise last_error
-            raise RuntimeError(f"unable to create remote directory: {current}")
 
 
 def webdav_test_connection(url: str, username: str, password: str,
@@ -4466,6 +4193,23 @@ def webdav_test_connection(url: str, username: str, password: str,
                 pass
 
 
+def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
+    return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
+
+
+def _webdav_path_variants(remote_path: str) -> list[str]:
+    raw = str(remote_path or "").strip().replace("\\", "/")
+    if not raw:
+        return ["/", ""]
+    absolute = "/" + raw.strip("/")
+    relative = raw.strip("/")
+    variants = []
+    for item in (absolute, relative):
+        if item not in variants:
+            variants.append(item)
+    return variants
+
+
 def _webdav_try_variants(func, remote_path: str):
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
@@ -4480,6 +4224,35 @@ def _webdav_try_variants(func, remote_path: str):
     if last_error:
         raise last_error
     raise RuntimeError("invalid_webdav_path")
+
+
+def _webdav_find_existing_variant(client, remote_path: str) -> str:
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            if client.check(candidate):
+                return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise FileNotFoundError(remote_path)
+
+
+def _webdav_upload_with_variants(client, remote_path: str, local_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            result = client.upload_sync(remote_path=candidate, local_path=local_path)
+            if result is False:
+                last_error = RuntimeError(f"upload returned False for {candidate}")
+                continue
+            return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_upload_path")
 
 
 def _webdav_download_with_variants(client, remote_path: str, local_path: str):
@@ -4498,6 +4271,19 @@ def _webdav_download_with_variants(client, remote_path: str, local_path: str):
     raise RuntimeError("invalid_webdav_download_path")
 
 
+def _webdav_clean_with_variants(client, remote_path: str):
+    last_error = None
+    for candidate in _webdav_path_variants(remote_path):
+        try:
+            client.clean(candidate)
+            return candidate
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("invalid_webdav_clean_path")
+
+
 def _webdav_info_with_variants(client, remote_path: str) -> dict:
     last_error = None
     for candidate in _webdav_path_variants(remote_path):
@@ -4508,6 +4294,43 @@ def _webdav_info_with_variants(client, remote_path: str) -> dict:
     if last_error:
         raise last_error
     raise RuntimeError("invalid_webdav_info_path")
+
+
+def _webdav_ensure_remote_dir(client, remote_dir: str):
+    normalized = str(remote_dir or "").strip().strip("/")
+    if not normalized:
+        return
+    current = ""
+    for part in [p for p in normalized.split("/") if p]:
+        current = f"{current}/{part}" if current else part
+        last_error = None
+        created = False
+        for candidate in _webdav_path_variants(current):
+            try:
+                result = client.mkdir(candidate)
+                if result is False:
+                    last_error = RuntimeError(f"mkdir returned False for {candidate}")
+                    continue
+                created = True
+                break
+            except Exception as e:
+                err_text = str(e).lower()
+                if any(token in err_text for token in (
+                    "already exists",
+                    "file exists",
+                    "405",
+                    "301",
+                    "302",
+                    "method not allowed",
+                    "conflict",
+                )):
+                    created = True
+                    break
+                last_error = e
+        if not created:
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"unable to create remote directory: {current}")
 
 
 def _webdav_verify_remote_file(client, remote_path: str, expected_size: int = 0) -> tuple[bool, str]:
@@ -4563,6 +4386,59 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
         return True, ""
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def webdav_list_archives(cfg: dict, game_name: str) -> list:
+    """列出 WebDAV 上的 .zip 存档文件名（排序后）"""
+    client = _webdav_make_client(cfg)
+    if not client:
+        return []
+    try:
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
+        try:
+            archive_dir = _webdav_find_existing_variant(client, archive_dir)
+        except Exception:
+            return []
+        items = client.list(archive_dir)
+        names = []
+        for item in items:
+            name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
+            if name.endswith(".zip"):
+                names.append(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3):
+    """执行 WebDAV 远端归档轮转，只保留最近 keep_count 个 ZIP。"""
+    if keep_count <= 0:
+        return
+    client = _webdav_make_client(cfg)
+    if not client:
+        return
+    try:
+        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
+        archive_dir = _webdav_find_existing_variant(client, archive_dir)
+    except Exception:
+        return
+
+    try:
+        archive_names = sorted(webdav_list_archives(cfg, game_name), reverse=True)
+    except Exception:
+        archive_names = []
+    if len(archive_names) <= keep_count:
+        return
+
+    for name in archive_names[keep_count:]:
+        try:
+            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}")
+        except Exception:
+            pass
+        try:
+            _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}.meta.json")
+        except Exception:
+            pass
 
 
 def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
@@ -4663,6 +4539,57 @@ def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
         return None
 
 
+def compute_dir_hash(directory: str) -> str:
+    """
+    递归计算目录内所有文件的内容 MD5 校验和。
+    将每个文件的相对路径 + 内容 MD5 拼接后再算总 hash，
+    100% 准确检测内容变化，不依赖 mtime 或文件大小。
+    """
+    h = hashlib.md5()
+    try:
+        all_files = []
+        for root, _, files in os.walk(directory):
+            for f in files:
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, directory)
+                all_files.append((rel, fp))
+        # 按相对路径排序，保证顺序一致
+        all_files.sort(key=lambda x: x[0])
+        for rel, fp in all_files:
+            h.update(rel.encode("utf-8"))
+            _streaming_file_hash(fp, h)
+    except OSError:
+        pass
+    return h.hexdigest()
+
+
+def compute_dir_file_count(directory: str) -> int:
+    """统计目录内文件数量"""
+    count = 0
+    try:
+        for _, _, files in os.walk(directory):
+            count += len(files)
+    except OSError:
+        pass
+    return count
+
+
+def compute_dir_latest_mtime(directory: str) -> float:
+    """返回目录内最新文件修改时间；目录为空时返回 0。"""
+    latest = 0.0
+    try:
+        for root, _, files in os.walk(directory):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    latest = max(latest, os.path.getmtime(fp))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return latest
+
+
 def snapshot_sync_side(directory: str) -> dict:
     """采集目录的同步摘要，用于冲突展示。"""
     return {
@@ -4670,6 +4597,48 @@ def snapshot_sync_side(directory: str) -> dict:
         "file_count": compute_dir_file_count(directory) if os.path.isdir(directory) else 0,
         "hash": compute_dir_hash(directory) if os.path.isdir(directory) else "",
         "latest_mtime": compute_dir_latest_mtime(directory) if os.path.isdir(directory) else 0.0,
+    }
+
+
+def combine_sync_hash(parts: list[tuple[str, str]]) -> str:
+    """
+    组合多个目录 hash，得到稳定总 hash。
+    parts: [(key, hash), ...]
+    """
+    if not parts:
+        return ""
+    h = hashlib.md5()
+    for key, value in sorted(parts, key=lambda item: item[0].lower()):
+        h.update(key.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update((value or "").encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def snapshot_sync_paths(paths: list[str], label: str) -> dict:
+    """采集多个目录的同步摘要。"""
+    existing = [os.path.normpath(p) for p in paths if os.path.isdir(p)]
+    if not existing:
+        return {
+            "path": label,
+            "file_count": 0,
+            "hash": "",
+            "latest_mtime": 0.0,
+        }
+    hash_parts = []
+    total_files = 0
+    latest_mtime = 0.0
+    for idx, path in enumerate(existing, start=1):
+        file_count = compute_dir_file_count(path)
+        total_files += file_count
+        latest_mtime = max(latest_mtime, compute_dir_latest_mtime(path))
+        hash_parts.append((f"{idx}:{path}", compute_dir_hash(path) if file_count else ""))
+    return {
+        "path": label,
+        "file_count": total_files,
+        "hash": combine_sync_hash(hash_parts),
+        "latest_mtime": latest_mtime,
     }
 
 
@@ -4852,106 +4821,70 @@ def clear_sync_retry(cfg: Optional[dict], game: dict, mode: Optional[str] = None
         save_config(cfg)
 
 
-def get_backups(game_name: str) -> list:
-    game_dir = BACKUP_ROOT / sanitize(game_name)
-    if not game_dir.exists():
+def run_sync_retries(cfg: Optional[dict], sync_folder: str,
+                     log_cb=None) -> list[tuple[str, str]]:
+    """重试此前排队的自动同步任务。"""
+    effective_root = get_effective_sync_root(sync_folder, cfg, ensure=True)
+    if not cfg or not effective_root:
         return []
-    backups = []
-    for f in sorted(game_dir.glob("*.zip"), reverse=True):
-        meta_file = f.with_suffix(".meta.json")
-        meta = {}
-        if meta_file.exists():
-            meta = load_json_file_tolerant(meta_file, default={}) or {}
-        backups.append({
-            "path": str(f), "filename": f.name,
-            "timestamp": meta.get("timestamp", f.stem),
-            "note": meta.get("note", ""),
-            "size": meta.get("size", f.stat().st_size),
-            "backup_kind": meta.get("backup_kind", ""),
-            "linked_sync_archive": meta.get("linked_sync_archive", ""),
-        })
-    return backups
-
-
-def delete_backup(zip_path: str):
-    p = Path(zip_path)
-    if p.exists(): p.unlink()
-    m = p.with_suffix(".meta.json")
-    if m.exists(): m.unlink()
-
-
-def enforce_backup_limits(game_name: str = None):
-    """
-    执行备份轮转策略：
-    1. 每个游戏最多保留 max_backups_per_game 个备份（超出删除最旧的）
-    2. 所有备份总大小不超过 max_backup_size_gb GB（超出从最旧开始删除）
-    设为 0 表示不限制。
-    """
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = load_json_file_tolerant(CONFIG_FILE, default={}) or {}
-    except Exception:
-        return
-    max_per_game = cfg.get("max_backups_per_game", 20)
-    max_total_gb = cfg.get("max_backup_size_gb", 10.0)
-    max_total_bytes = max_total_gb * 1024 * 1024 * 1024
-    game_names = [g["name"] for g in cfg.get("games", [])]
-    # 1) 单游戏轮转：只清理触发备份的那个游戏（或全部）
-    targets = [game_name] if game_name else game_names
-    for gn in targets:
-        if not gn:
+    q = list(get_sync_retry_queue(cfg))
+    if not q:
+        return []
+    keep = []
+    results = []
+    changed = False
+    for item in q:
+        game = find_game_by_sync_key(cfg, item.get("game_key", ""))
+        if not game:
+            changed = True
             continue
-        backups = get_backups(gn)  # 已按时间倒序
-        if max_per_game > 0 and len(backups) > max_per_game:
-            for b in backups[max_per_game:]:
-                delete_backup(b["path"])
-    # 2) 总容量限制
-    if max_total_gb <= 0:
+        mode = item.get("mode", "upload")
+        try:
+            result = sync_game_save(game, effective_root, mode, auto=True, cfg=cfg)
+            results.append((game["name"], result))
+            if log_cb:
+                log_cb(bilingual_cfg(
+                    cfg,
+                    f"↻ 重试 {game['name']} ({mode}): {result}",
+                    f"↻ Retried {game['name']} ({mode}): {result}",
+                ))
+            changed = True
+        except Exception as e:
+            item = dict(item)
+            item["reason"] = str(e)
+            item["attempts"] = int(item.get("attempts", 0)) + 1
+            item["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+            keep.append(item)
+            if log_cb:
+                log_cb(bilingual_cfg(
+                    cfg,
+                    f"❌ 重试失败 {game['name']} ({mode}): {e}",
+                    f"❌ Retry failed for {game['name']} ({mode}): {e}",
+                ))
+    if changed or len(keep) != len(q):
+        cfg["sync_retry_queue"] = keep
+        save_config(cfg)
+    return results
+
+
+def clear_game_sync_state(cfg: Optional[dict], game: dict):
+    if not cfg:
         return
-    all_backups = []
-    for gn in game_names:
-        for b in get_backups(gn):
-            all_backups.append(b)
-    total_size = sum(b["size"] for b in all_backups)
-    if total_size > max_total_bytes:
-        # 从最旧的开始删除，直到总大小低于上限
-        all_backups.sort(key=lambda x: x["timestamp"])
-        for b in all_backups:
-            if total_size <= max_total_bytes:
-                break
-            total_size -= b["size"]
-            delete_backup(b["path"])
-
-
-def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None) -> Optional[str]:
-    save_specs = get_game_save_specs(game, existing_only=True)
-    if not save_specs:
-        return None
-    save_paths = [spec["base"] for spec in save_specs]
-    game_dir = BACKUP_ROOT / sanitize(game["name"])
-    game_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_path = game_dir / f"{ts}.zip"
-    is_multi = len(save_specs) > 1
-    with _open_zip_for_write(zip_path) as zf:
-        for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
-            arc_prefix = Path("__multi__") / f"p{idx}" if is_multi else Path()
-            arcname = arc_prefix / Path(rel) if is_multi else Path(rel)
-            _zip_write_file(zf, abs_f, arcname)
-    meta = {
-        "game": game["name"], "appid": game.get("appid", ""),
-        "timestamp": ts, "note": note,
-        "source": str(save_paths[0]), "sources": save_paths,
-        "save_specs": _normalize_unique_save_specs(save_specs),
-        "multi_path": is_multi,
-        "size": zip_path.stat().st_size,
-    }
-    if isinstance(extra_meta, dict):
-        meta.update(extra_meta)
-    with open(zip_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    enforce_backup_limits(game["name"])
-    return str(zip_path)
+    store = cfg.get("sync_state", {})
+    if not isinstance(store, dict):
+        return
+    key = get_game_sync_key(game)
+    changed = False
+    if key in store:
+        store.pop(key, None)
+        changed = True
+    q = get_sync_retry_queue(cfg)
+    new_q = [item for item in q if item.get("game_key") != key]
+    if len(new_q) != len(q):
+        cfg["sync_retry_queue"] = new_q
+        changed = True
+    if changed:
+        save_config(cfg)
 
 
 def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
@@ -5258,72 +5191,6 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     return bilingual_text(lang, "同步完成", "Sync completed")
 
 
-def run_sync_retries(cfg: Optional[dict], sync_folder: str,
-                     log_cb=None) -> list[tuple[str, str]]:
-    """重试此前排队的自动同步任务。"""
-    effective_root = get_effective_sync_root(sync_folder, cfg, ensure=True)
-    if not cfg or not effective_root:
-        return []
-    q = list(get_sync_retry_queue(cfg))
-    if not q:
-        return []
-    keep = []
-    results = []
-    changed = False
-    for item in q:
-        game = find_game_by_sync_key(cfg, item.get("game_key", ""))
-        if not game:
-            changed = True
-            continue
-        mode = item.get("mode", "upload")
-        try:
-            result = sync_game_save(game, effective_root, mode, auto=True, cfg=cfg)
-            results.append((game["name"], result))
-            if log_cb:
-                log_cb(bilingual_cfg(
-                    cfg,
-                    f"↻ 重试 {game['name']} ({mode}): {result}",
-                    f"↻ Retried {game['name']} ({mode}): {result}",
-                ))
-            changed = True
-        except Exception as e:
-            item = dict(item)
-            item["reason"] = str(e)
-            item["attempts"] = int(item.get("attempts", 0)) + 1
-            item["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            keep.append(item)
-            if log_cb:
-                log_cb(bilingual_cfg(
-                    cfg,
-                    f"❌ 重试失败 {game['name']} ({mode}): {e}",
-                    f"❌ Retry failed for {game['name']} ({mode}): {e}",
-                ))
-    if changed or len(keep) != len(q):
-        cfg["sync_retry_queue"] = keep
-        save_config(cfg)
-    return results
-
-
-def clear_game_sync_state(cfg: Optional[dict], game: dict):
-    if not cfg:
-        return
-    store = cfg.get("sync_state", {})
-    if not isinstance(store, dict):
-        return
-    key = get_game_sync_key(game)
-    changed = False
-    if key in store:
-        store.pop(key, None)
-        changed = True
-    q = get_sync_retry_queue(cfg)
-    new_q = [item for item in q if item.get("game_key") != key]
-    if len(new_q) != len(q):
-        cfg["sync_retry_queue"] = new_q
-        changed = True
-    if changed:
-        save_config(cfg)
-
-
 def sync_all_games(cfg: dict, auto: bool = False) -> list[tuple[str, str]]:
     """同步所有已添加游戏，返回 [(game_name, result_msg), ...]"""
     results = []
@@ -5344,6 +5211,12 @@ def sync_all_games(cfg: dict, auto: bool = False) -> list[tuple[str, str]]:
     return results
 
 
+def sanitize(name: str) -> str:
+    return "".join(
+        c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name
+    ).strip()[:80]
+
+
 def fmt_size(size: int) -> str:
     s = float(size)
     for unit in ("B", "KB", "MB", "GB"):
@@ -5351,6 +5224,141 @@ def fmt_size(size: int) -> str:
             return f"{s:.1f} {unit}"
         s /= 1024
     return f"{s:.1f} TB"
+
+
+def _zip_safe_datetime(timestamp: float) -> tuple[int, int, int, int, int, int]:
+    try:
+        dt = datetime.datetime.fromtimestamp(max(float(timestamp), 0.0))
+    except Exception:
+        dt = datetime.datetime.now()
+    if dt.year < 1980:
+        dt = datetime.datetime(1980, 1, 1, 0, 0, 0)
+    elif dt.year > 2107:
+        dt = datetime.datetime(2107, 12, 31, 23, 59, 58)
+    return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+
+
+def _open_zip_for_write(zip_path: Path | str):
+    return zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False)
+
+
+def _zip_write_file(zf: zipfile.ZipFile, file_path: Path | str, arcname: Path | str):
+    src_path = Path(file_path)
+    arcname_str = Path(arcname).as_posix()
+    st = src_path.stat()
+    info = zipfile.ZipInfo(filename=arcname_str, date_time=_zip_safe_datetime(st.st_mtime))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = (st.st_mode & 0xFFFF) << 16
+    with src_path.open("rb") as src, zf.open(info, "w") as dst:
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+
+def load_json_file_tolerant(path: Path | str, default=None, repair: bool = True):
+    """宽容读取 JSON，允许尾部出现额外字符，并可自动修复文件。"""
+    file_path = Path(path)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        pass
+    except Exception:
+        return default
+
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return default
+
+    cleaned = raw.lstrip("\ufeff")
+    decoder = json.JSONDecoder()
+    try:
+        obj, end = decoder.raw_decode(cleaned)
+    except Exception:
+        return default
+
+    trailing = cleaned[end:].strip()
+    if trailing and repair:
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return obj
+
+
+def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None) -> Optional[str]:
+    save_specs = get_game_save_specs(game, existing_only=True)
+    if not save_specs:
+        return None
+    save_paths = [spec["base"] for spec in save_specs]
+    game_dir = BACKUP_ROOT / sanitize(game["name"])
+    game_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = game_dir / f"{ts}.zip"
+    is_multi = len(save_specs) > 1
+    with _open_zip_for_write(zip_path) as zf:
+        for idx, _, abs_f, rel in iter_save_spec_files(save_specs):
+            arc_prefix = Path("__multi__") / f"p{idx}" if is_multi else Path()
+            arcname = arc_prefix / Path(rel) if is_multi else Path(rel)
+            _zip_write_file(zf, abs_f, arcname)
+    meta = {
+        "game": game["name"], "appid": game.get("appid", ""),
+        "timestamp": ts, "note": note,
+        "source": str(save_paths[0]), "sources": save_paths,
+        "save_specs": _normalize_unique_save_specs(save_specs),
+        "multi_path": is_multi,
+        "size": zip_path.stat().st_size,
+    }
+    if isinstance(extra_meta, dict):
+        meta.update(extra_meta)
+    with open(zip_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    enforce_backup_limits(game["name"])
+    return str(zip_path)
+
+
+def enforce_backup_limits(game_name: str = None):
+    """
+    执行备份轮转策略：
+    1. 每个游戏最多保留 max_backups_per_game 个备份（超出删除最旧的）
+    2. 所有备份总大小不超过 max_backup_size_gb GB（超出从最旧开始删除）
+    设为 0 表示不限制。
+    """
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = load_json_file_tolerant(CONFIG_FILE, default={}) or {}
+    except Exception:
+        return
+    max_per_game = cfg.get("max_backups_per_game", 20)
+    max_total_gb = cfg.get("max_backup_size_gb", 10.0)
+    max_total_bytes = max_total_gb * 1024 * 1024 * 1024
+    game_names = [g["name"] for g in cfg.get("games", [])]
+    # 1) 单游戏轮转：只清理触发备份的那个游戏（或全部）
+    targets = [game_name] if game_name else game_names
+    for gn in targets:
+        if not gn:
+            continue
+        backups = get_backups(gn)  # 已按时间倒序
+        if max_per_game > 0 and len(backups) > max_per_game:
+            for b in backups[max_per_game:]:
+                delete_backup(b["path"])
+    # 2) 总容量限制
+    if max_total_gb <= 0:
+        return
+    all_backups = []
+    for gn in game_names:
+        for b in get_backups(gn):
+            all_backups.append(b)
+    total_size = sum(b["size"] for b in all_backups)
+    if total_size > max_total_bytes:
+        # 从最旧的开始删除，直到总大小低于上限
+        all_backups.sort(key=lambda x: x["timestamp"])
+        for b in all_backups:
+            if total_size <= max_total_bytes:
+                break
+            total_size -= b["size"]
+            delete_backup(b["path"])
 
 
 def migrate_backups(old_root: Path, new_root: Path) -> int:
@@ -5442,6 +5450,34 @@ def restore_backup(zip_path: str, target_dir):
                 shutil.copyfileobj(src, dst)
 
 
+def get_backups(game_name: str) -> list:
+    game_dir = BACKUP_ROOT / sanitize(game_name)
+    if not game_dir.exists():
+        return []
+    backups = []
+    for f in sorted(game_dir.glob("*.zip"), reverse=True):
+        meta_file = f.with_suffix(".meta.json")
+        meta = {}
+        if meta_file.exists():
+            meta = load_json_file_tolerant(meta_file, default={}) or {}
+        backups.append({
+            "path": str(f), "filename": f.name,
+            "timestamp": meta.get("timestamp", f.stem),
+            "note": meta.get("note", ""),
+            "size": meta.get("size", f.stat().st_size),
+            "backup_kind": meta.get("backup_kind", ""),
+            "linked_sync_archive": meta.get("linked_sync_archive", ""),
+        })
+    return backups
+
+
+def delete_backup(zip_path: str):
+    p = Path(zip_path)
+    if p.exists(): p.unlink()
+    m = p.with_suffix(".meta.json")
+    if m.exists(): m.unlink()
+
+
 def delete_linked_sync_archive(cfg: Optional[dict], game_name: str, archive_name: str) -> dict:
     result = {"local_deleted": False, "webdav_deleted": False, "errors": []}
     if not cfg or not game_name or not archive_name:
@@ -5507,23 +5543,6 @@ class GameProcessMonitor:
     3. 进程名关键词模糊匹配（兜底，覆盖非 Steam 启动的场景）
     """
 
-    # ── 策略 3: 进程名关键词匹配（兜底） ──
-    SKIP_PROCESSES = {
-        "steam.exe", "steamwebhelper.exe", "steamerrorreporter.exe",
-        "steamservice.exe", "gameoverlayui.exe", "uninstall.exe",
-        "crashhandler.exe", "vc_redist", "dxsetup.exe",
-        "dotnetfx", "directx", "setup.exe", "installer.exe",
-        "redist.exe", "vcredist.exe", "update.exe", "updater.exe",
-        "launcher.exe",
-    }
-    SKIP_PREFIXES = (
-        "svchost", "csrss", "wininit", "services", "lsass",
-        "explorer", "dwm", "taskhostw", "runtimebroker",
-        "searchhost", "ctfmon", "conhost", "cmd", "powershell",
-        "python", "node", "code", "chrome", "firefox", "edge",
-        "msedge", "discord", "spotify", "wechat", "qq",
-    )
-
     def __init__(self, cfg: dict, poll_interval: int = 10):
         self.cfg = cfg
         self.poll_interval = poll_interval  # 秒
@@ -5531,6 +5550,18 @@ class GameProcessMonitor:
         self._running_games: set[str] = set()  # 当前正在运行的 appid 集合
         self._thread: Optional[threading.Thread] = None
         self.sync_log: list[str] = []  # 同步活动日志（最近50条）
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread = None
+        self._running_games.clear()
 
     def _wait_for_save_settle(self, game: dict,
                               timeout: float = 12.0,
@@ -5654,6 +5685,23 @@ class GameProcessMonitor:
                 continue
         return appids
 
+    # ── 策略 3: 进程名关键词匹配（兜底） ──
+    SKIP_PROCESSES = {
+        "steam.exe", "steamwebhelper.exe", "steamerrorreporter.exe",
+        "steamservice.exe", "gameoverlayui.exe", "uninstall.exe",
+        "crashhandler.exe", "vc_redist", "dxsetup.exe",
+        "dotnetfx", "directx", "setup.exe", "installer.exe",
+        "redist.exe", "vcredist.exe", "update.exe", "updater.exe",
+        "launcher.exe",
+    }
+    SKIP_PREFIXES = (
+        "svchost", "csrss", "wininit", "services", "lsass",
+        "explorer", "dwm", "taskhostw", "runtimebroker",
+        "searchhost", "ctfmon", "conhost", "cmd", "powershell",
+        "python", "node", "code", "chrome", "firefox", "edge",
+        "msedge", "discord", "spotify", "wechat", "qq",
+    )
+
     @staticmethod
     def _extract_keywords(game_name: str) -> list[str]:
         GENERIC_WORDS = {
@@ -5732,6 +5780,108 @@ class GameProcessMonitor:
             running.update(proc_appids)
 
         return running
+
+    def diagnose(self) -> str:
+        """诊断进程检测，返回详细调试信息"""
+        zh = cfg_language(self.cfg) == "zh-CN"
+        lines = []
+        lines.append("=== 游戏进程诊断 ===" if zh else "=== Game Process Diagnostics ===")
+        lines.append(f"{'winreg 可用' if zh else 'winreg available'}: {winreg is not None}")
+        lines.append(f"{'psutil 可用' if zh else 'psutil available'}: {HAS_PSUTIL}")
+        lines.append("")
+
+        # 已添加游戏
+        games = self.cfg.get("games", [])
+        known = {g.get("appid"): g.get("name", "?") for g in games if g.get("appid")}
+        lines.append(f"已添加游戏 ({len(known)} 个):" if zh else f"Tracked games ({len(known)}):")
+        for aid, name in known.items():
+            kws = self._extract_keywords(name)
+            lines.append(
+                f"  🎮 {name} (AppID: {aid}) -> 关键词: {kws}"
+                if zh else
+                f"  🎮 {name} (AppID: {aid}) -> keywords: {kws}"
+            )
+        lines.append("")
+
+        # 策略 1a: 注册表 RunningAppID
+        reg_appid = self._get_running_appid_from_registry()
+        if reg_appid:
+            reg_name = known.get(reg_appid, "未添加" if zh else "Not tracked")
+            lines.append(
+                f"✅ 注册表 RunningAppID = {reg_appid} ({reg_name})"
+                if zh else
+                f"✅ Registry RunningAppID = {reg_appid} ({reg_name})"
+            )
+        else:
+            lines.append("❌ 注册表 RunningAppID = 0（无游戏运行）" if zh else "❌ Registry RunningAppID = 0 (no game running)")
+        lines.append("")
+
+        # 策略 1b: Steam Apps 注册表 Running 值
+        apps_running = self._get_running_appids_from_apps_registry(set(known.keys()))
+        if apps_running:
+            lines.append(
+                f"✅ Steam Apps 注册表检测到 {len(apps_running)} 个游戏运行中:"
+                if zh else
+                f"✅ Steam Apps registry detected {len(apps_running)} running game(s):"
+            )
+            for aid in apps_running:
+                name = known.get(aid, "未添加" if zh else "Not tracked")
+                lines.append(f"  AppID: {aid} ({name})")
+        else:
+            lines.append("❌ Steam Apps 注册表未检测到游戏运行" if zh else "❌ Steam Apps registry did not detect any running game")
+        lines.append("")
+
+        # 策略 2: overlay
+        overlay_ids = self._get_appids_from_overlay()
+        if overlay_ids:
+            lines.append(
+                f"✅ gameoverlayui.exe 检测到 {len(overlay_ids)} 个游戏:"
+                if zh else
+                f"✅ gameoverlayui.exe detected {len(overlay_ids)} game(s):"
+            )
+            for aid in overlay_ids:
+                name = known.get(aid, "未添加" if zh else "Not tracked")
+                lines.append(f"  AppID: {aid} ({name})")
+        else:
+            lines.append("❌ 未检测到 gameoverlayui.exe 或无 AppID 参数" if zh else "❌ gameoverlayui.exe was not found, or it had no AppID argument")
+        lines.append("")
+
+        # 策略 3: 进程名匹配
+        proc_ids = self._get_appids_from_process_names()
+        if proc_ids:
+            lines.append(
+                f"✅ 进程名关键词匹配到 {len(proc_ids)} 个游戏:"
+                if zh else
+                f"✅ Process-name matching found {len(proc_ids)} game(s):"
+            )
+            for aid in proc_ids:
+                name = known.get(aid, "未添加" if zh else "Not tracked")
+                lines.append(f"  AppID: {aid} ({name})")
+        else:
+            lines.append("❌ 进程名关键词未匹配到游戏" if zh else "❌ Process-name matching did not find any game")
+        lines.append("")
+
+        # 综合结果
+        total = self._find_running_games()
+        if total:
+            lines.append(
+                f"🎯 综合结果：检测到 {len(total)} 个游戏正在运行:"
+                if zh else
+                f"🎯 Final result: {len(total)} game(s) detected as running:"
+            )
+            for aid in total:
+                name = known.get(aid, "未添加" if zh else "Not tracked")
+                lines.append(f"  ✅ {name} (AppID: {aid})")
+        else:
+            lines.append("🎯 综合结果：未检测到游戏运行" if zh else "🎯 Final result: no running game detected")
+            lines.append("")
+            lines.append("排查建议:" if zh else "Troubleshooting:")
+            lines.append("  1. 确认游戏是否通过 Steam 启动" if zh else "  1. Make sure the game was launched through Steam")
+            lines.append("  2. 确认 Steam 客户端正在运行" if zh else "  2. Make sure the Steam client is running")
+            lines.append("  3. 确认同步模式为「智能云存档」且同步已启用" if zh else "  3. Make sure sync is enabled and the mode is set to Smart Cloud Save")
+            lines.append("  4. 如果游戏不通过 Steam 启动，进程名需包含游戏名关键词" if zh else "  4. If the game is launched outside Steam, its process name should still contain the game keywords")
+
+        return "\n".join(lines)
 
     def _monitor_loop(self):
         game_by_appid = {
@@ -5891,120 +6041,6 @@ class GameProcessMonitor:
 
             self._running_games = current
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        self._thread = None
-        self._running_games.clear()
-
-    def diagnose(self) -> str:
-        """诊断进程检测，返回详细调试信息"""
-        zh = cfg_language(self.cfg) == "zh-CN"
-        lines = []
-        lines.append("=== 游戏进程诊断 ===" if zh else "=== Game Process Diagnostics ===")
-        lines.append(f"{'winreg 可用' if zh else 'winreg available'}: {winreg is not None}")
-        lines.append(f"{'psutil 可用' if zh else 'psutil available'}: {HAS_PSUTIL}")
-        lines.append("")
-
-        # 已添加游戏
-        games = self.cfg.get("games", [])
-        known = {g.get("appid"): g.get("name", "?") for g in games if g.get("appid")}
-        lines.append(f"已添加游戏 ({len(known)} 个):" if zh else f"Tracked games ({len(known)}):")
-        for aid, name in known.items():
-            kws = self._extract_keywords(name)
-            lines.append(
-                f"  🎮 {name} (AppID: {aid}) -> 关键词: {kws}"
-                if zh else
-                f"  🎮 {name} (AppID: {aid}) -> keywords: {kws}"
-            )
-        lines.append("")
-
-        # 策略 1a: 注册表 RunningAppID
-        reg_appid = self._get_running_appid_from_registry()
-        if reg_appid:
-            reg_name = known.get(reg_appid, "未添加" if zh else "Not tracked")
-            lines.append(
-                f"✅ 注册表 RunningAppID = {reg_appid} ({reg_name})"
-                if zh else
-                f"✅ Registry RunningAppID = {reg_appid} ({reg_name})"
-            )
-        else:
-            lines.append("❌ 注册表 RunningAppID = 0（无游戏运行）" if zh else "❌ Registry RunningAppID = 0 (no game running)")
-        lines.append("")
-
-        # 策略 1b: Steam Apps 注册表 Running 值
-        apps_running = self._get_running_appids_from_apps_registry(set(known.keys()))
-        if apps_running:
-            lines.append(
-                f"✅ Steam Apps 注册表检测到 {len(apps_running)} 个游戏运行中:"
-                if zh else
-                f"✅ Steam Apps registry detected {len(apps_running)} running game(s):"
-            )
-            for aid in apps_running:
-                name = known.get(aid, "未添加" if zh else "Not tracked")
-                lines.append(f"  AppID: {aid} ({name})")
-        else:
-            lines.append("❌ Steam Apps 注册表未检测到游戏运行" if zh else "❌ Steam Apps registry did not detect any running game")
-        lines.append("")
-
-        # 策略 2: overlay
-        overlay_ids = self._get_appids_from_overlay()
-        if overlay_ids:
-            lines.append(
-                f"✅ gameoverlayui.exe 检测到 {len(overlay_ids)} 个游戏:"
-                if zh else
-                f"✅ gameoverlayui.exe detected {len(overlay_ids)} game(s):"
-            )
-            for aid in overlay_ids:
-                name = known.get(aid, "未添加" if zh else "Not tracked")
-                lines.append(f"  AppID: {aid} ({name})")
-        else:
-            lines.append("❌ 未检测到 gameoverlayui.exe 或无 AppID 参数" if zh else "❌ gameoverlayui.exe was not found, or it had no AppID argument")
-        lines.append("")
-
-        # 策略 3: 进程名匹配
-        proc_ids = self._get_appids_from_process_names()
-        if proc_ids:
-            lines.append(
-                f"✅ 进程名关键词匹配到 {len(proc_ids)} 个游戏:"
-                if zh else
-                f"✅ Process-name matching found {len(proc_ids)} game(s):"
-            )
-            for aid in proc_ids:
-                name = known.get(aid, "未添加" if zh else "Not tracked")
-                lines.append(f"  AppID: {aid} ({name})")
-        else:
-            lines.append("❌ 进程名关键词未匹配到游戏" if zh else "❌ Process-name matching did not find any game")
-        lines.append("")
-
-        # 综合结果
-        total = self._find_running_games()
-        if total:
-            lines.append(
-                f"🎯 综合结果：检测到 {len(total)} 个游戏正在运行:"
-                if zh else
-                f"🎯 Final result: {len(total)} game(s) detected as running:"
-            )
-            for aid in total:
-                name = known.get(aid, "未添加" if zh else "Not tracked")
-                lines.append(f"  ✅ {name} (AppID: {aid})")
-        else:
-            lines.append("🎯 综合结果：未检测到游戏运行" if zh else "🎯 Final result: no running game detected")
-            lines.append("")
-            lines.append("排查建议:" if zh else "Troubleshooting:")
-            lines.append("  1. 确认游戏是否通过 Steam 启动" if zh else "  1. Make sure the game was launched through Steam")
-            lines.append("  2. 确认 Steam 客户端正在运行" if zh else "  2. Make sure the Steam client is running")
-            lines.append("  3. 确认同步模式为「智能云存档」且同步已启用" if zh else "  3. Make sure sync is enabled and the mode is set to Smart Cloud Save")
-            lines.append("  4. 如果游戏不通过 Steam 启动，进程名需包含游戏名关键词" if zh else "  4. If the game is launched outside Steam, its process name should still contain the game keywords")
-
-        return "\n".join(lines)
-
 
 # ══════════════════════════════════════════════
 #  文件监控（watchdog）
@@ -6021,14 +6057,21 @@ class SaveChangeHandler(FileSystemEventHandler):
         self._timer_lock = threading.Lock()
         self._specs = get_game_save_specs(game, existing_only=False)
 
-    def _try_backup(self):
-        with self._timer_lock:
-            self._timer = None
-        now = datetime.datetime.now().timestamp()
-        if now - self._last_backup < self.cooldown:
+    def on_modified(self, event):
+        self._handle_event(event)
+
+    def on_created(self, event):
+        self._handle_event(event)
+
+    def _handle_event(self, event):
+        if getattr(event, "is_directory", False):
             return
-        self._last_backup = now
-        create_backup(self.game, localize_backup_note("文件变动自动备份", cfg_language(None)))
+        src_path = getattr(event, "src_path", "") or ""
+        if not src_path:
+            return
+        if self._specs and not _save_specs_match_path(self._specs, src_path):
+            return
+        self._schedule_backup()
 
     def _schedule_backup(self):
         with self._timer_lock:
@@ -6041,21 +6084,14 @@ class SaveChangeHandler(FileSystemEventHandler):
             self._timer.daemon = True
             self._timer.start()
 
-    def _handle_event(self, event):
-        if getattr(event, "is_directory", False):
+    def _try_backup(self):
+        with self._timer_lock:
+            self._timer = None
+        now = datetime.datetime.now().timestamp()
+        if now - self._last_backup < self.cooldown:
             return
-        src_path = getattr(event, "src_path", "") or ""
-        if not src_path:
-            return
-        if self._specs and not _save_specs_match_path(self._specs, src_path):
-            return
-        self._schedule_backup()
-
-    def on_modified(self, event):
-        self._handle_event(event)
-
-    def on_created(self, event):
-        self._handle_event(event)
+        self._last_backup = now
+        create_backup(self.game, localize_backup_note("文件变动自动备份", cfg_language(None)))
 
 
 # ══════════════════════════════════════════════
@@ -6106,12 +6142,111 @@ BTN_BLUE_H     = "#2563eb"
 # ══════════════════════════════════════════════
 
 class SteamSaveManager(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_config()
+        clear_startup_caches(self.cfg)
+        self.lang = normalize_language(self.cfg.get("language"))
+        self.auto_backup_running = False
+        self._stop_event = threading.Event()
+        self._watchers: list[Observer] = []
+        self._watch_handlers: list[SaveChangeHandler] = []
+        self._detail_refresh_job = None  # 详情页自动刷新定时器
+        self._sync_ui_queue: queue.Queue = queue.Queue()
+        self._open_conflict_dialogs: set[str] = set()
+        self._current_frame = "home"
+        self._about_update_status_label = None
+        self._about_update_btn = None
+        self._about_dialog = None
+        self._sidebar_version_label = None
+        self._sidebar_version_text = f"v{VERSION}"
+        self._sidebar_version_color = ("#cbd5e1", "#3f3f46")
+        self._update_manifest_cache: Optional[dict] = None
+        self._scan_results: list[dict] = []
+        self._scan_lib_folders: list[str] = []
+        self._scan_choice_vars: dict[str, ctk.StringVar] = {}
+        self._scan_cards: dict[str, dict] = {}
+        self._scan_info_banner = None
+        self._scan_empty_label = None
+        self._scan_search_job = None
+        self._games_search_job = None
+        self._game_backup_count_cache: dict[str, int] = {}
+        self._game_backups_cache: dict[str, list] = {}
+        self._recent_backups_cache: dict[int, list] = {}
+        self._game_detail_metrics_cache: dict[str, dict] = {}
+        self._game_cards: dict[str, dict] = {}
+        self._games_empty_label = None
+        self._home_recent_rows: dict[str, dict] = {}
+        self._home_recent_empty_label = None
+        self._backup_rows: dict[str, dict] = {}
+        self._backup_empty_label = None
+        self._scan_in_progress = False
+        self._scan_worker_count = 0
+        self._scan_storage_profile = "unknown"
+        self._scan_start_btn = None
+        self._scan_add_all_btn = None
+        self._io_busy = False
+        self._popup_windows: weakref.WeakSet = weakref.WeakSet()
+        self._popup_restore_grab: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+        self.title(self.t("product_title"))
+        self.geometry("1080x720")
+        self.minsize(920, 620)
+        self._center_main_window()
+        ctk.set_appearance_mode(self.cfg.get("theme", "light"))
+        ctk.set_default_color_theme("blue")
+        self.configure(fg_color=C_MAIN_BG)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Map>", self._on_root_map, add="+")
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._build_sidebar()
+        self._frames: dict[str, ctk.CTkFrame] = {}
+        self._build_home_frame()
+        self._build_scan_frame()
+        self._build_games_frame()
+        self._build_backup_frame()
+        self._build_settings_frame()
+        self._build_game_detail_frame()
+        self._show_frame("home")
+
+        if self.cfg.get("auto_backup_enabled"):
+            self._start_auto_backup()
+        if self.cfg.get("watch_enabled"):
+            self._start_watchers()
+        if self.cfg.get("sync_enabled"):
+            self._start_sync()
+
+        # 智能云存档进程监控
+        self._game_monitor: Optional[GameProcessMonitor] = None
+        self._ensure_game_monitor()
+        self.after(1200, self._drain_sync_ui_queue)
+        self.after(1800, self._check_for_updates_silent)
+        if STARTUP_LAUNCH:
+            self.after(200, self._apply_startup_launch_behavior)
+
+    def t(self, key: str, **kwargs) -> str:
+        return translate(self.lang, key, **kwargs)
+
+    def bi(self, zh: str, en: str) -> str:
+        return bilingual_text(self.lang, zh, en)
 
     def _theme_display(self, theme_code: str) -> str:
         return self.t("theme_dark" if theme_code == "dark" else "theme_light")
 
     def _theme_code(self, display: str) -> str:
         return "dark" if display == self.t("theme_dark") else "light"
+
+    def _apply_startup_launch_behavior(self):
+        if not STARTUP_LAUNCH:
+            return
+        if self.cfg.get("minimize_to_tray", True) and HAS_TRAY:
+            self.withdraw()
+            self._create_tray()
+            return
+        self.iconify()
 
     def _sync_mode_options(self) -> list[tuple[str, str]]:
         return [
@@ -6131,6 +6266,49 @@ class SteamSaveManager(ctk.CTk):
 
     def _language_display(self, lang_code: str) -> str:
         return LANGUAGE_NAMES.get(normalize_language(lang_code), "English")
+
+    def _language_code(self, display: str) -> str:
+        for code, label in LANGUAGE_NAMES.items():
+            if label == display:
+                return code
+        return "en"
+
+    def _rebuild_ui(self, target_frame: Optional[str] = None):
+        current = target_frame or getattr(self, "_current_frame", "home")
+        detail_idx = getattr(self, "_detail_idx", None)
+        self._stop_detail_refresh()
+        self.unbind_all("<MouseWheel>")
+        for child in list(self.winfo_children()):
+            child.destroy()
+        self.title(self.t("product_title"))
+        self._frames = {}
+        self._nav_buttons = {}
+        self._build_sidebar()
+        self._build_home_frame()
+        self._build_scan_frame()
+        self._build_games_frame()
+        self._build_backup_frame()
+        self._build_settings_frame()
+        self._build_game_detail_frame()
+        if current == "game_detail" and detail_idx is not None and 0 <= detail_idx < len(self.cfg.get("games", [])):
+            self._show_game_detail(detail_idx)
+        else:
+            self._show_frame(current if current in self._frames else "home")
+        self._update_status()
+        self._apply_sidebar_version_state()
+
+    def _center_main_window(self):
+        try:
+            self.update_idletasks()
+            width = max(self.winfo_width(), self.winfo_reqwidth(), 1080)
+            height = max(self.winfo_height(), self.winfo_reqheight(), 720)
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+            x = max((screen_width - width) // 2, 0)
+            y = max((screen_height - height) // 2, 0)
+            self.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
 
     def _center_window(self, window):
         try:
@@ -6157,6 +6335,61 @@ class SteamSaveManager(ctk.CTk):
             window.focus_force()
         except Exception:
             pass
+
+    def _prepare_dialog_parent(self):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+        except Exception:
+            pass
+        try:
+            self.lift()
+        except Exception:
+            pass
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+        self.after(60, self._restore_popup_windows)
+
+    def _track_popup(self, window):
+        try:
+            self._popup_windows.add(window)
+            self._popup_restore_grab[window] = False
+        except Exception:
+            pass
+        window.bind("<Unmap>", lambda e, w=window: self._on_popup_unmap(w), add="+")
+        window.bind("<Map>", lambda e, w=window: self._on_popup_map(w), add="+")
+        window.bind("<Destroy>", lambda e, w=window: self._on_popup_destroy(w), add="+")
+        return window
+
+    def _on_popup_destroy(self, window):
+        try:
+            self._popup_restore_grab.pop(window, None)
+        except Exception:
+            pass
+
+    def _on_popup_unmap(self, window):
+        try:
+            if not window.winfo_exists():
+                return
+            state = window.state()
+            current = self.grab_current()
+            if current == window and state == "iconic":
+                self._popup_restore_grab[window] = True
+                window.grab_release()
+        except Exception:
+            pass
+
+    def _on_popup_map(self, window):
+        self.after(80, lambda w=window: self._restore_single_popup(w))
+
+    def _on_root_map(self, _event=None):
+        self.after(80, self._restore_popup_windows)
 
     def _restore_single_popup(self, window):
         try:
@@ -6185,58 +6418,6 @@ class SteamSaveManager(ctk.CTk):
     def _restore_popup_windows(self):
         for window in list(self._popup_windows):
             self._restore_single_popup(window)
-
-    def _prepare_dialog_parent(self):
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
-        try:
-            if self.state() == "iconic":
-                self.deiconify()
-        except Exception:
-            pass
-        try:
-            self.lift()
-        except Exception:
-            pass
-        try:
-            self.focus_force()
-        except Exception:
-            pass
-        self.after(60, self._restore_popup_windows)
-
-    def _on_popup_destroy(self, window):
-        try:
-            self._popup_restore_grab.pop(window, None)
-        except Exception:
-            pass
-
-    def _on_popup_unmap(self, window):
-        try:
-            if not window.winfo_exists():
-                return
-            state = window.state()
-            current = self.grab_current()
-            if current == window and state == "iconic":
-                self._popup_restore_grab[window] = True
-                window.grab_release()
-        except Exception:
-            pass
-
-    def _on_popup_map(self, window):
-        self.after(80, lambda w=window: self._restore_single_popup(w))
-
-    def _track_popup(self, window):
-        try:
-            self._popup_windows.add(window)
-            self._popup_restore_grab[window] = False
-        except Exception:
-            pass
-        window.bind("<Unmap>", lambda e, w=window: self._on_popup_unmap(w), add="+")
-        window.bind("<Map>", lambda e, w=window: self._on_popup_map(w), add="+")
-        window.bind("<Destroy>", lambda e, w=window: self._on_popup_destroy(w), add="+")
-        return window
 
     def _prepare_popup(self, window):
         self._prepare_dialog_parent()
@@ -6352,539 +6533,19 @@ class SteamSaveManager(ctk.CTk):
         self._prepare_popup(dialog)
         return dialog.get_input() or ""
 
-    def _highlight_nav(self, active_key: str):
-        for key, btn in self._nav_buttons.items():
-            if key == active_key:
-                btn.configure(fg_color=C_NAV_ACTIVE,
-                              text_color=C_NAV_ACT_TEXT,
-                              font=font(13, "bold"))
-            else:
-                btn.configure(fg_color="transparent",
-                              text_color=C_NAV_TEXT,
-                              font=font(13))
-
-    def _get_game_backups_cached(self, game_name: str) -> list:
-        key = str(game_name or "")
-        cached = self._game_backups_cache.get(key)
-        if cached is not None:
-            return [dict(item) for item in cached]
-        backups = get_backups(key)
-        self._game_backups_cache[key] = [dict(item) for item in backups]
-        return [dict(item) for item in backups]
-
-    def _get_game_backup_count_cached(self, game_name: str) -> int:
-        key = str(game_name or "")
-        if key in self._game_backup_count_cache:
-            return self._game_backup_count_cache[key]
-        count = len(self._get_game_backups_cached(key))
-        self._game_backup_count_cache[key] = count
-        return count
-
-    def _get_recent_backups_cached(self, limit: int = 15) -> list:
-        cached = self._recent_backups_cache.get(limit)
-        if cached is not None:
-            return [dict(item) for item in cached]
-        all_b = []
-        for g in self.cfg.get("games", []):
-            for b in self._get_game_backups_cached(g["name"]):
-                item = dict(b)
-                item["game"] = g["name"]
-                all_b.append(item)
-        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
-        recent = all_b[:limit]
-        self._recent_backups_cache[limit] = [dict(item) for item in recent]
-        return [dict(item) for item in recent]
-
-    @staticmethod
-    def _fmt_ts(ts: str) -> str:
-        try: return datetime.datetime.strptime(ts, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-        except: return ts
-
-    def _refresh_home(self):
-        games = self.cfg.get("games", [])
-        total = sum(self._get_game_backup_count_cached(g["name"]) for g in games)
-        auto = self.t("switch_on") if self.cfg.get("auto_backup_enabled") else self.t("switch_off")
-        watch = self.t("switch_on") if self.cfg.get("watch_enabled") else self.t("switch_off")
-        self._stat_cards["games"].configure(text=self.t("value_games", count=len(games)))
-        self._stat_cards["backups"].configure(text=self.t("value_backups", count=total))
-        self._stat_cards["auto"].configure(text=auto)
-        self._stat_cards["watch"].configure(text=watch)
-
-        all_b = self._get_recent_backups_cached(15)
-        for item in self._home_recent_rows.values():
-            item["row"].pack_forget()
-        if not all_b:
-            self._home_recent_empty_label.configure(text=self.t("home_no_backups"))
-            self._home_recent_empty_label.pack(pady=40)
-            return
-        self._home_recent_empty_label.pack_forget()
-        active_keys = set()
-        for b in all_b[:15]:
-            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
-            active_keys.add(key)
-            item = self._home_recent_rows.get(key)
-            if item is None:
-                row = ctk.CTkFrame(self._home_recent,
-                                   fg_color=("#f1f5f9", "#252640"), corner_radius=8)
-                title = ctk.CTkLabel(
-                    row, text="", font=font(12, "bold"), text_color=C_BODY_TEXT
-                )
-                title.pack(side="left", padx=(12, 6), pady=7)
-                info_label = ctk.CTkLabel(
-                    row, text="", font=font(11), text_color=C_SUBTLE_TEXT
-                )
-                info_label.pack(side="left", padx=4, pady=7)
-                item = {"row": row, "title": title, "info": info_label}
-                self._home_recent_rows[key] = item
-            item["title"].configure(text=f"🎮 {b['game']}")
-            info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
-            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
-            if note_text:
-                info += f"  ·  📝 {note_text}"
-            item["info"].configure(text=info)
-            item["row"].pack(fill="x", padx=4, pady=2)
-        stale_keys = [key for key in self._home_recent_rows.keys() if key not in active_keys]
-        for key in stale_keys:
-            item = self._home_recent_rows.pop(key, None)
-            if item:
-                item["row"].destroy()
-
-    def _set_io_busy(self, busy: bool):
-        """标记 IO 操作进行中，防止重复触发"""
-        self._io_busy = busy
-
-    def _invalidate_game_backup_count_cache(self, game_name: Optional[str] = None):
-        if game_name:
-            key = str(game_name)
-            self._game_backup_count_cache.pop(key, None)
-            self._game_backups_cache.pop(key, None)
-            self._recent_backups_cache.clear()
-            self._game_detail_metrics_cache.pop(key, None)
-            return
-        self._game_backup_count_cache.clear()
-        self._game_backups_cache.clear()
-        self._recent_backups_cache.clear()
-        self._game_detail_metrics_cache.clear()
-
-    def _stop_detail_refresh(self):
-        """停止详情页自动刷新定时器"""
-        if self._detail_refresh_job:
-            self.after_cancel(self._detail_refresh_job)
-            self._detail_refresh_job = None
-
-    def _on_restore_done(self):
-        self._set_io_busy(False)
-        self._invalidate_game_backup_count_cache()
-        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
-
-    def _on_restore_failed(self, err):
-        self._set_io_busy(False)
-        self._show_error(self.bi("失败", "Failed"), err)
-
-    def _restore(self, b):
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
-                self.bi(f"还原「{b['game']}」的存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
-                        f"Restore the save for {b['game']}?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
-            backup_path = b["path"]
-            targets = b.get("save_specs", []) or [_default_save_spec(path) for path in b.get("save_paths", [])]
-            restore_target = targets if targets else b.get("save_path", "")
-            self._set_io_busy(True)
-            def _worker():
-                try:
-                    restore_backup(backup_path, restore_target)
-                    self.after(0, lambda: self._on_restore_done())
-                except Exception as e:
-                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _refresh_backup_list(self):
-        games = self.cfg.get("games", [])
-        all_games_label = self.t("backup_all_games")
-        self._bk_filter.configure(values=[all_games_label] + [g["name"] for g in games])
-
-        sel = self._bk_var.get()
-        targets = games if sel == all_games_label else [g for g in games if g["name"] == sel]
-        all_b = []
-        for item in self._backup_rows.values():
-            item["card"].pack_forget()
-        for g in targets:
-            save_paths = get_game_save_paths(g, existing_only=False)
-            save_specs = get_game_save_specs(g, existing_only=False)
-            primary_path = save_paths[0] if save_paths else g.get("save_path", "")
-            for b in self._get_game_backups_cached(g["name"]):
-                b["game"] = g["name"]
-                b["save_path"] = primary_path
-                b["save_paths"] = save_paths
-                b["save_specs"] = save_specs
-                all_b.append(b)
-        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
-
-        if not all_b:
-            self._backup_empty_label.configure(text=self.t("backup_empty"))
-            self._backup_empty_label.pack(pady=40)
-            return
-        self._backup_empty_label.pack_forget()
-        active_keys = set()
-        for b in all_b:
-            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
-            active_keys.add(key)
-            item = self._backup_rows.get(key)
-            if item is None:
-                card = ctk.CTkFrame(self._bk_scroll,
-                                    fg_color=("#f1f5f9", "#252640"), corner_radius=10)
-                card.grid_columnconfigure(1, weight=1)
-                title = ctk.CTkLabel(card, text="", font=font(13, "bold"),
-                                     text_color=C_BODY_TEXT)
-                title.grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
-                info_label = ctk.CTkLabel(card, text="", font=font(11),
-                                          text_color=C_SUBTLE_TEXT)
-                info_label.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="w")
-                bb = ctk.CTkFrame(card, fg_color="transparent")
-                bb.grid(row=0, column=1, rowspan=2, padx=14, pady=10, sticky="e")
-                restore_btn = ctk.CTkButton(
-                    bb, text=self.bi("还原", "Restore"), width=60, height=28, font=font(12),
-                    corner_radius=6, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H)
-                restore_btn.pack(side="left", padx=2)
-                delete_btn = ctk.CTkButton(
-                    bb, text=self.bi("删除", "Delete"), width=60, height=28, font=font(12),
-                    corner_radius=6, fg_color=BTN_DANGER, hover_color=BTN_DANGER_H)
-                delete_btn.pack(side="left", padx=2)
-                item = {
-                    "card": card,
-                    "title": title,
-                    "info": info_label,
-                    "restore_btn": restore_btn,
-                    "delete_btn": delete_btn,
-                }
-                self._backup_rows[key] = item
-            item["title"].configure(text=f"🎮 {b['game']}")
-            info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
-            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
-            if note_text:
-                info += f"  ·  📝 {note_text}"
-            item["info"].configure(text=info)
-            item["restore_btn"].configure(command=lambda bp=b: self._restore(bp))
-            item["delete_btn"].configure(command=lambda bp=b: self._del_bk(bp))
-            item["card"].pack(fill="x", padx=4, pady=2)
-        stale_keys = [key for key in self._backup_rows.keys() if key not in active_keys]
-        for key in stale_keys:
-            item = self._backup_rows.pop(key, None)
-            if item:
-                item["card"].destroy()
-
-    def _show_frame(self, name: str):
-        self._stop_detail_refresh()
-        for f in self._frames.values():
-            f.grid_forget()
-        self._frames[name].grid(row=0, column=1, sticky="nsew")
-        self._current_frame = name
-        self._highlight_nav(name)
-        if name == "backup":   self._refresh_backup_list()
-        elif name == "home":   self._refresh_home()
-        elif name == "games":  self._refresh_games_list()
-
-    def _set_about_update_state(self, text: Optional[str] = None, busy: Optional[bool] = None):
-        label = getattr(self, "_about_update_status_label", None)
-        if label is not None and label.winfo_exists() and text is not None:
-            label.configure(text=text)
-        button = getattr(self, "_about_update_btn", None)
-        if button is not None and button.winfo_exists() and busy is not None:
-            button.configure(state="disabled" if busy else "normal")
-
-    def _apply_sidebar_version_state(self):
-        label = getattr(self, "_sidebar_version_label", None)
-        if label is not None and label.winfo_exists():
-            label.configure(text=self._sidebar_version_text, text_color=self._sidebar_version_color)
-
-    def _set_sidebar_update_hint(self, text: str, color=None):
-        self._sidebar_version_text = text
-        if color is not None:
-            self._sidebar_version_color = color
-        self._apply_sidebar_version_state()
-
-    def _update_status(self):
-        if self.cfg.get("auto_backup_enabled"):
-            iv = self.cfg.get("auto_backup_interval", 30)
-            self._status_label.configure(
-                text=self.t("status_auto_on", minutes=iv), text_color=BTN_SUCCESS)
+    def _ensure_game_monitor(self):
+        """确保在同步启用且为智能模式时，游戏进程监控正在运行"""
+        should_run = (self.cfg.get("sync_enabled")
+                      and self.cfg.get("sync_mode") == "smart")
+        if should_run:
+            if (self._game_monitor is None
+                    or self._game_monitor._thread is None
+                    or not self._game_monitor._thread.is_alive()):
+                self._start_game_monitor()
         else:
-            self._status_label.configure(
-                text=self.t("status_auto_off"), text_color=C_SUBTLE_TEXT)
-
-    def _stop_auto_backup(self):
-        self._stop_event.set()
-        self.auto_backup_running = False
-        self._update_status()
-
-    def _stop_sync(self):
-        if hasattr(self, "_sync_stop"):
-            self._sync_stop.set()
-        self._sync_running = False
-
-    def _stop_game_monitor(self):
-        if self._game_monitor:
-            self._game_monitor.stop()
-            self._game_monitor = None
-
-    def _stop_watchers(self):
-        for obs in self._watchers:
-            try:
-                obs.stop()
-            except Exception:
-                pass
-        for obs in self._watchers:
-            try:
-                obs.join(timeout=1.0)
-            except Exception:
-                pass
-        self._watchers.clear()
-        self._watch_handlers.clear()
-
-    def _launch_downloaded_update(self, target: Path):
-        try:
-            if sys.platform == "win32":
-                escaped_target = str(target).replace("'", "''")
-                command = f"Start-Sleep -Seconds 1; Start-Process -FilePath '{escaped_target}'"
-                subprocess.Popen(
-                    ["powershell", "-WindowStyle", "Hidden", "-Command", command],
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            else:
-                subprocess.Popen([str(target)])
-        except Exception as e:
-            self._show_error(
-                self.bi("启动更新失败", "Failed to Launch Update"),
-                self.bi(f"无法启动下载的新版本：\n{type(e).__name__}: {e}",
-                        f"Could not launch the downloaded update:\n{type(e).__name__}: {e}"),
-                parent=self._about_dialog,
-            )
-            return
-
-        if hasattr(self, "_tray") and self._tray:
-            self._tray.stop()
-            self._tray = None
-        self._stop_auto_backup()
-        self._stop_watchers()
-        self._stop_game_monitor()
-        self._stop_sync()
-        self.after(0, self.destroy)
-
-    def _handle_update_downloaded(self, manifest: dict, target: Path):
-        self._set_about_update_state(
-            text=self.bi(f"更新状态：已下载 v{manifest['version']}", f"Update status: downloaded v{manifest['version']}"),
-            busy=False,
-        )
-        if self._ask_yes_no(
-                self.bi("下载完成", "Download Complete"),
-                self.bi(
-                    f"新版本已下载完成：\n{target}\n\n是否立即关闭当前程序并启动新版本？",
-                    f"The new version has been downloaded:\n{target}\n\nClose the current app and launch the new version now?",
-                ),
-                parent=self._about_dialog):
-            self._launch_downloaded_update(target)
-        else:
-            self._show_info(
-                self.bi("下载完成", "Download Complete"),
-                self.bi(f"更新文件已保存到：\n{target}",
-                        f"The update package has been saved to:\n{target}"),
-                parent=self._about_dialog,
-            )
-
-    def _download_update_worker(self, manifest: dict):
-        try:
-            target = download_update_package(manifest, CONFIG_DIR / "updates")
-        except Exception as e:
-            self.after(0, lambda: (
-                self._set_about_update_state(
-                    text=self.bi("更新状态：下载失败", "Update status: download failed"),
-                    busy=False,
-                ),
-                self._show_error(
-                    self.bi("下载更新失败", "Update Download Failed"),
-                    self.bi(f"下载更新时出错：\n{type(e).__name__}: {e}",
-                            f"An error occurred while downloading the update:\n{type(e).__name__}: {e}"),
-                    parent=self._about_dialog,
-                )
-            ))
-            return
-        self.after(0, lambda t=target, m=manifest: self._handle_update_downloaded(m, t))
-
-    def _download_update(self, manifest: dict):
-        self._set_about_update_state(
-            text=self.bi(f"更新状态：正在下载 v{manifest['version']}...", f"Update status: downloading v{manifest['version']}..."),
-            busy=True,
-        )
-        threading.Thread(target=self._download_update_worker, args=(manifest,), daemon=True).start()
-
-    def _prompt_update_download(self, manifest: dict):
-        notes = manifest.get("notes", "").strip() or self.bi("暂无更新说明", "No release notes")
-        self._set_about_update_state(
-            text=self.bi(f"更新状态：发现新版本 v{manifest['version']}",
-                         f"Update status: new version found v{manifest['version']}"),
-            busy=False,
-        )
-        ok = self._ask_yes_no(
-            self.bi("发现新版本", "Update Available"),
-            self.bi(
-                f"发现新版本：v{manifest['version']}\n当前版本：v{VERSION}\n\n更新说明：\n{notes}\n\n是否立即下载？",
-                f"New version found: v{manifest['version']}\nCurrent version: v{VERSION}\n\nRelease notes:\n{notes}\n\nDownload it now?",
-            ),
-            parent=self._about_dialog,
-        )
-        if ok:
-            self._download_update(manifest)
-
-    def _handle_update_available(self, manifest: dict, silent: bool):
-        self._update_manifest_cache = manifest
-        self._set_about_update_state(
-            text=self.bi(f"更新状态：发现新版本 v{manifest['version']}",
-                         f"Update status: new version found v{manifest['version']}"),
-            busy=False,
-        )
-        self._set_sidebar_update_hint(
-            self.bi(f"v{VERSION} · 有更新 v{manifest['version']}",
-                    f"v{VERSION} · Update v{manifest['version']}"),
-            ("#10b981", "#4ade80"),
-        )
-        if not silent:
-            self._prompt_update_download(manifest)
-
-    def _check_for_updates_worker(self, silent: bool = False):
-        try:
-            manifest = fetch_update_manifest()
-        except Exception as e:
-            def _on_error():
-                self._set_about_update_state(
-                    text=self.bi("更新状态：检查失败", "Update status: failed to check"),
-                    busy=False,
-                )
-                self._set_sidebar_update_hint(
-                    self.bi(f"v{VERSION} · 更新检查失败", f"v{VERSION} · Update check failed"),
-                    ("#f59e0b", "#fbbf24"),
-                )
-                if not silent:
-                    self._show_error(
-                        self.bi("检查更新失败", "Update Check Failed"),
-                        self.bi(f"无法读取远程更新信息：\n{type(e).__name__}: {e}",
-                                f"Could not read remote update info:\n{type(e).__name__}: {e}"),
-                        parent=self._about_dialog,
-                    )
-            self.after(0, _on_error)
-            return
-
-        if not is_remote_version_newer(manifest["version"], VERSION):
-            def _on_latest():
-                self._update_manifest_cache = manifest
-                self._set_about_update_state(
-                    text=self.bi(f"更新状态：已是最新版本 v{VERSION}",
-                                 f"Update status: already on the latest version v{VERSION}"),
-                    busy=False,
-                )
-                self._set_sidebar_update_hint(
-                    f"v{VERSION}",
-                    ("#cbd5e1", "#3f3f46"),
-                )
-                if not silent:
-                    self._show_info(
-                        self.bi("检查更新", "Check for Updates"),
-                        self.bi(f"当前已经是最新版本。\n\n当前版本：v{VERSION}",
-                                f"You're already on the latest version.\n\nCurrent version: v{VERSION}"),
-                        parent=self._about_dialog,
-                    )
-            self.after(0, _on_latest)
-            return
-
-        self.after(0, lambda m=manifest: self._handle_update_available(m, silent))
-
-    def _check_for_updates(self):
-        self._set_about_update_state(
-            text=self.bi("更新状态：正在检查...", "Update status: checking..."),
-            busy=True,
-        )
-        threading.Thread(target=self._check_for_updates_worker, kwargs={"silent": False}, daemon=True).start()
-
-    def _show_about_dialog(self, *a):
-        d = self._create_popup(self.bi("关于 Steam 存档管家", "About Steam Save Manager"), "560x360")
-        self._about_dialog = d
-        d.grid_columnconfigure(0, weight=1)
-        d.grid_rowconfigure(1, weight=1)
-        def _on_close():
-            self._about_update_status_label = None
-            self._about_update_btn = None
-            self._about_dialog = None
-            d.destroy()
-        d.protocol("WM_DELETE_WINDOW", _on_close)
-
-        hdr = ctk.CTkFrame(d, fg_color="transparent")
-        hdr.grid(row=0, column=0, padx=22, pady=(18, 10), sticky="ew")
-        hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            hdr,
-            text=self.bi("Steam 存档管家", "Steam Save Manager"),
-            font=font(20, "bold"),
-            text_color=C_BODY_TEXT,
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            hdr,
-            text=f"v{VERSION}",
-            font=font(12),
-            text_color=C_SUBTLE_TEXT,
-        ).grid(row=0, column=1, sticky="e")
-
-        body = ctk.CTkTextbox(d, font=font(12), wrap="word")
-        body.grid(row=1, column=0, padx=18, pady=(0, 14), sticky="nsew")
-        body.insert(
-            "1.0",
-            self.bi(
-                f"一个用于管理 Steam 游戏存档的桌面工具。\n\n"
-                f"当前版本：v{VERSION}\n"
-                f"配置目录：{CONFIG_DIR}\n"
-                f"备份目录：{BACKUP_ROOT}\n"
-                f"by：Kio\n\n"
-                f"主要功能：\n"
-                f"• 自动扫描常见存档目录\n"
-                f"• 手动备份、恢复和导入存档\n"
-                f"• 定时备份与文件变动监控\n"
-                f"• 本地与云盘同步、冲突处理和重试\n"
-                f"• 中英文界面与系统托盘运行",
-                f"A desktop utility for managing Steam game saves.\n\n"
-                f"Current version: v{VERSION}\n"
-                f"Config folder: {CONFIG_DIR}\n"
-                f"Backup folder: {BACKUP_ROOT}\n"
-                f"by：Kio\n\n"
-                f"Highlights:\n"
-                f"• Automatically scans common save locations\n"
-                f"• Manual backup, restore, and save import\n"
-                f"• Scheduled backup and file change monitoring\n"
-                f"• Local/cloud sync with conflict handling and retry\n"
-                f"• Bilingual UI and system tray support",
-            ),
-        )
-        body.configure(state="disabled")
-        self._about_update_status_label = ctk.CTkLabel(
-            d,
-            text=self.bi("更新状态：未检查", "Update status: not checked"),
-            font=font(11),
-            text_color=C_SUBTLE_TEXT,
-        )
-        self._about_update_status_label.grid(row=2, column=0, padx=22, pady=(0, 8), sticky="w")
-
-        btns = ctk.CTkFrame(d, fg_color="transparent")
-        btns.grid(row=3, column=0, padx=22, pady=(0, 18), sticky="e")
-        self._about_update_btn = ctk.CTkButton(
-            btns, text=self.bi("检查更新", "Check for Updates"),
-            width=150, height=36, font=font(13, "bold"),
-            corner_radius=8, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-            command=self._check_for_updates
-        )
-        self._about_update_btn.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(
-            btns, text=self.bi("关闭", "Close"),
-            width=100, height=36, font=font(13, "bold"),
-            corner_radius=8, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-            command=_on_close
-        ).pack(side="left")
+            if self._game_monitor is not None:
+                self._game_monitor.stop()
+                self._game_monitor = None
 
     # ─── 侧边栏 ───
     def _build_sidebar(self):
@@ -6947,277 +6608,27 @@ class SteamSaveManager(ctk.CTk):
         self._sidebar_version_label.bind("<Button-1>", lambda _e: self._show_about_dialog())
         self._apply_sidebar_version_state()
 
-    def _notify_io_busy(self):
-        self._show_warning(
-            self.bi("处理中", "Busy"),
-            self.bi(
-                "当前已有备份、恢复或同步任务正在进行，请稍候再试。",
-                "A backup, restore, or sync task is already running. Please try again in a moment.",
-            ),
-        )
-
-    def _refresh_proc_status(self):
-        """检测当前游戏的进程运行状态和同步监控状态并更新 UI"""
-        try:
-            g = self.cfg["games"][self._detail_idx]
-            appid = g.get("appid", "")
-            if not appid:
-                self._detail_proc_status.configure(text=self.bi("未设置 AppID，无法检测", "AppID is not set, so detection is unavailable"))
-                self._detail_proc_badge.configure(
-                    text=self.bi("⚠ 未知", "⚠ Unknown"), text_color=("#d97706", "#fbbf24"))
+    def _highlight_nav(self, active_key: str):
+        for key, btn in self._nav_buttons.items():
+            if key == active_key:
+                btn.configure(fg_color=C_NAV_ACTIVE,
+                              text_color=C_NAV_ACT_TEXT,
+                              font=font(13, "bold"))
             else:
-                # 创建临时监控器来检测
-                monitor = GameProcessMonitor(self.cfg)
-                running = monitor._find_running_games()
-                if appid in running:
-                    self._detail_proc_status.configure(
-                        text=self.bi(f"游戏进程运行中 (AppID: {appid})", f"Game process is running (AppID: {appid})"))
-                    self._detail_proc_badge.configure(
-                        text=self.bi("● 运行中", "● Running"), text_color=("#16a34a", "#4ade80"))
-                else:
-                    self._detail_proc_status.configure(
-                        text=self.bi(f"未检测到游戏进程 (AppID: {appid})", f"No game process detected (AppID: {appid})"))
-                    self._detail_proc_badge.configure(
-                        text=self.bi("○ 未运行", "○ Not Running"), text_color=C_SUBTLE_TEXT)
-        except Exception:
-            self._detail_proc_status.configure(text=self.bi("检测失败", "Detection failed"))
-            self._detail_proc_badge.configure(
-                text=self.bi("⚠ 错误", "⚠ Error"), text_color=("#dc2626", "#fca5a5"))
-        # 更新同步监控状态
-        try:
-            sync_enabled = self.cfg.get("sync_enabled", False)
-            sync_mode = self.cfg.get("sync_mode", "")
-            sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=False)
-            sync_issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
-            if not sync_enabled:
-                self._detail_sync_monitor_status.configure(text=self.bi("同步功能未启用，请在设置中开启", "Sync is disabled. Enable it in Settings."))
-                self._detail_sync_badge.configure(
-                    text=self.bi("⏸ 关闭", "⏸ Off"), text_color=C_SUBTLE_TEXT)
-            elif sync_mode != "smart":
-                mode_names = {
-                    "upload": self._sync_mode_display("upload"),
-                    "download": self._sync_mode_display("download"),
-                    "bidirectional": self._sync_mode_display("bidirectional"),
-                    "smart": self._sync_mode_display("smart"),
-                }
-                self._detail_sync_monitor_status.configure(
-                    text=self.bi(
-                        f"当前模式: {mode_names.get(sync_mode, sync_mode)}（非智能云存档，不监控进程）",
-                        f"Current mode: {mode_names.get(sync_mode, sync_mode)} (not Smart Cloud Save, so no process monitoring)",
-                    ))
-                self._detail_sync_badge.configure(
-                    text=self.bi("⏸ 非智能", "⏸ Non-smart"), text_color=("#d97706", "#fbbf24"))
-            elif not sync_folder:
-                if sync_issue == "webdav_component_missing":
-                    status_text = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
-                elif sync_issue == "webdav_url_missing":
-                    status_text = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
-                else:
-                    status_text = self.bi("同步目录与 WebDAV 均未配置，请在设置中启用其中一种", "Neither a sync folder nor WebDAV is configured. Enable one in Settings.")
-                self._detail_sync_monitor_status.configure(text=status_text)
-                self._detail_sync_badge.configure(
-                    text=self.bi("⚠ 未配置", "⚠ Not Configured"), text_color=("#dc2626", "#fca5a5"))
-            elif self._game_monitor and self._game_monitor._thread and self._game_monitor._thread.is_alive():
-                n_running = len(self._game_monitor._running_games)
-                self._detail_sync_monitor_status.configure(
-                    text=self.bi(f"智能监控运行中，正在追踪 {n_running} 个游戏进程",
-                                 f"Smart monitoring is running and tracking {n_running} game process(es)"))
-                self._detail_sync_badge.configure(
-                    text=self.bi("● 运行中", "● Running"), text_color=("#16a34a", "#4ade80"))
-            else:
-                self._detail_sync_monitor_status.configure(text=self.bi("监控未启动（请尝试重启应用）", "Monitoring is not running. Try restarting the app."))
-                self._detail_sync_badge.configure(
-                    text=self.bi("⚠ 未启动", "⚠ Not Running"), text_color=("#dc2626", "#fca5a5"))
-            # 显示最近同步日志
-            if self._game_monitor and self._game_monitor.sync_log:
-                recent = self._game_monitor.sync_log[-3:]
-                self._detail_sync_recent.configure(text="\n".join(recent))
-            else:
-                self._detail_sync_recent.configure(text=self.bi("暂无同步活动记录", "No sync activity yet"))
-        except Exception:
-            self._detail_sync_monitor_status.configure(text=self.bi("状态未知", "Status unknown"))
-            self._detail_sync_badge.configure(
-                text=self.bi("⚠ 错误", "⚠ Error"), text_color=("#dc2626", "#fca5a5"))
+                btn.configure(fg_color="transparent",
+                              text_color=C_NAV_TEXT,
+                              font=font(13))
 
-    def _format_sync_side_text(self, title: str, info: dict) -> str:
-        hash_short = (info.get("hash", "") or "—")[:12]
-        return (
-            f"{title}\n"
-            f"{self.bi('路径', 'Path')}: {info.get('path', '—')}\n"
-            f"{self.bi('文件数', 'Files')}: {info.get('file_count', 0)}\n"
-            f"{self.bi('最后修改', 'Last Modified')}: {format_sync_time(info.get('latest_mtime', 0))}\n"
-            f"{self.bi('内容摘要', 'Content Hash')}: {hash_short}"
-        )
-
-    def _resolve_sync_conflict(self, game: dict, mode: str, dialog):
-        try:
-            result = sync_game_save(
-                game,
-                get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True),
-                mode,
-                cfg=self.cfg
-            )
-            self._show_info(self.bi("冲突已处理", "Conflict Resolved"), self.bi(f"「{game['name']}」{result}", f"{game['name']}: {result}"))
-            self._refresh_proc_status()
-        except Exception as e:
-            self._show_error(self.bi("处理失败", "Resolution Failed"), self.bi(f"「{game['name']}」处理冲突失败：\n{type(e).__name__}: {e}", f"Failed to resolve conflict for {game['name']}:\n{type(e).__name__}: {e}"))
-            return
-        finally:
-            self._open_conflict_dialogs.discard(get_game_sync_key(game))
-        dialog.destroy()
-
-    def _show_sync_conflict_dialog(self, game: dict):
-        game_key = get_game_sync_key(game)
-        if game_key in self._open_conflict_dialogs:
-            return
-        state = get_game_sync_state(self.cfg, game)
-        conflict = state.get("pending_conflict")
-        if not isinstance(conflict, dict):
-            return
-
-        self._open_conflict_dialogs.add(game_key)
-        d = self._create_popup(self.bi(f"同步冲突 - {game['name']}", f"Sync Conflict - {game['name']}"), "760x460")
-        d.grid_columnconfigure((0, 1), weight=1)
-        d.grid_rowconfigure(2, weight=1)
-
-        def _close():
-            self._open_conflict_dialogs.discard(game_key)
-            d.destroy()
-
-        d.protocol("WM_DELETE_WINDOW", _close)
-
-        ctk.CTkLabel(
-            d,
-            text=self.bi(f"「{game['name']}」检测到同步冲突", f"Sync conflict detected for {game['name']}"),
-            font=font(16, "bold")
-        ).grid(row=0, column=0, columnspan=2, padx=20, pady=(18, 6), sticky="w")
-        reason = conflict.get("reason", self.bi("本地与云端内容不一致", "Local and cloud content differ"))
-        ctk.CTkLabel(
-            d,
-            text=self.bi(
-                f"{reason}。\n请选择要保留的版本。选择“仅下载”前会自动备份本地存档。",
-                f"{reason}.\nChoose which version to keep. A local backup will be created automatically before Download Only runs.",
-            ),
-            justify="left", wraplength=700, text_color=C_SUBTLE_TEXT,
-            font=font(12)
-        ).grid(row=1, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="w")
-
-        local_card = ctk.CTkTextbox(d, font=font(12), wrap="word")
-        local_card.grid(row=2, column=0, padx=(20, 10), pady=8, sticky="nsew")
-        local_card.insert("1.0", self._format_sync_side_text(self.bi("本地存档", "Local Save"), conflict.get("local", {})))
-        local_card.configure(state="disabled")
-
-        remote_card = ctk.CTkTextbox(d, font=font(12), wrap="word")
-        remote_card.grid(row=2, column=1, padx=(10, 20), pady=8, sticky="nsew")
-        remote_card.insert("1.0", self._format_sync_side_text(self.bi("云端存档", "Cloud Save"), conflict.get("remote", {})))
-        remote_card.configure(state="disabled")
-
-        btns = ctk.CTkFrame(d, fg_color="transparent")
-        btns.grid(row=3, column=0, columnspan=2, padx=20, pady=(8, 18), sticky="e")
-        ctk.CTkButton(
-            btns, text=self.bi("稍后处理", "Later"), width=100,
-            fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H, command=_close
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
-            btns, text=self.bi("仅下载云端", "Download Only"), width=120, fg_color=BTN_WARN,
-            hover_color=BTN_WARN_H,
-            command=lambda: self._resolve_sync_conflict(game, "download", d)
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
-            btns, text=self.bi("仅上传本地", "Upload Only"), width=120, fg_color=BTN_PRIMARY,
-            hover_color=BTN_PRIMARY_H,
-            command=lambda: self._resolve_sync_conflict(game, "upload", d)
-        ).pack(side="left", padx=6)
-
-    def _on_backup_all_done(self, total, ok, original_title, done_title, failed=None):
-        self._set_io_busy(False)
-        self.title(original_title)
-        self._invalidate_game_backup_count_cache()
-        failed = failed or []
-        message = self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}")
-        if failed:
-            details = "\n".join(failed[:8])
-            if len(failed) > 8:
-                details += "\n" + self.bi(f"……另有 {len(failed) - 8} 个失败项", f"...and {len(failed) - 8} more failures")
-            message += "\n\n" + self.bi("失败项目：", "Failed items:") + "\n" + details
-        self._show_info(done_title, message)
-
-    def _backup_all(self):
-        if self._io_busy:
-            self._notify_io_busy()
-            return
-        games = self.cfg.get("games", [])
-        if not games: self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
-        game_copies = [dict(g) for g in games]
-        default_note = self.bi("一键备份", "Back Up All")
-        original_title = self.t("product_title")
-        progress_tpl = self.bi("备份中 {cur}/{total}...", "Backing up {cur}/{total}...")
-        done_title = self.bi("完成", "Done")
-        self._set_io_busy(True)
-        def _worker():
-            ok = 0
-            total = len(game_copies)
-            failed: list[str] = []
-            try:
-                for i, g in enumerate(game_copies):
-                    try:
-                        r = create_backup(g, default_note)
-                        if r:
-                            ok += 1
-                        else:
-                            failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: " + self.bi("存档路径不存在", "Save path does not exist"))
-                    except Exception as e:
-                        failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: {type(e).__name__}: {e}")
-                    label = progress_tpl.format(cur=i + 1, total=total)
-                    self.after(0, lambda t=label: self.title(t))
-            finally:
-                self.after(0, lambda: self._on_backup_all_done(total, ok, original_title, done_title, failed))
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_sync_all_done(self, results):
-        self._set_io_busy(False)
-        lines = [self.bi(f"{name}：{msg}", f"{name}: {msg}") for name, msg in results]
-        self._show_info(self.bi("同步完成", "Sync Complete"), "\n".join(lines))
-        conflict_keys = {
-            get_game_sync_key(game)
-            for game in self.cfg.get("games", [])
-            if get_game_sync_state(self.cfg, game).get("pending_conflict")
-        }
-        for game in self.cfg.get("games", []):
-            if get_game_sync_key(game) in conflict_keys:
-                self._show_sync_conflict_dialog(game)
-
-    def _on_sync_failed(self, err):
-        self._set_io_busy(False)
-        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"同步过程中出错：\n{err}", f"An error occurred during sync:\n{err}"))
-
-    def _manual_sync_all(self):
-        if self._io_busy: return
-        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
-        if not sf:
-            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
-            if issue == "webdav_component_missing":
-                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
-            elif issue == "webdav_url_missing":
-                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
-            else:
-                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
-            self._show_warning(
-                self.bi("提示", "Notice"),
-                msg,
-            )
-            return
-        games = self.cfg.get("games", [])
-        if not games:
-            self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
-        self._set_io_busy(True)
-        def _worker():
-            try:
-                results = sync_all_games(self.cfg)
-                self.after(0, lambda: self._on_sync_all_done(results))
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._on_sync_failed(err))
-        threading.Thread(target=_worker, daemon=True).start()
+    def _show_frame(self, name: str):
+        self._stop_detail_refresh()
+        for f in self._frames.values():
+            f.grid_forget()
+        self._frames[name].grid(row=0, column=1, sticky="nsew")
+        self._current_frame = name
+        self._highlight_nav(name)
+        if name == "backup":   self._refresh_backup_list()
+        elif name == "home":   self._refresh_home()
+        elif name == "games":  self._refresh_games_list()
 
     # ─── 主页 ───
     def _build_home_frame(self):
@@ -7286,6 +6697,111 @@ class SteamSaveManager(ctk.CTk):
             font=font(13),
         )
 
+    def _refresh_home(self):
+        games = self.cfg.get("games", [])
+        total = sum(self._get_game_backup_count_cached(g["name"]) for g in games)
+        auto = self.t("switch_on") if self.cfg.get("auto_backup_enabled") else self.t("switch_off")
+        watch = self.t("switch_on") if self.cfg.get("watch_enabled") else self.t("switch_off")
+        self._stat_cards["games"].configure(text=self.t("value_games", count=len(games)))
+        self._stat_cards["backups"].configure(text=self.t("value_backups", count=total))
+        self._stat_cards["auto"].configure(text=auto)
+        self._stat_cards["watch"].configure(text=watch)
+
+        all_b = self._get_recent_backups_cached(15)
+        for item in self._home_recent_rows.values():
+            item["row"].pack_forget()
+        if not all_b:
+            self._home_recent_empty_label.configure(text=self.t("home_no_backups"))
+            self._home_recent_empty_label.pack(pady=40)
+            return
+        self._home_recent_empty_label.pack_forget()
+        active_keys = set()
+        for b in all_b[:15]:
+            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
+            active_keys.add(key)
+            item = self._home_recent_rows.get(key)
+            if item is None:
+                row = ctk.CTkFrame(self._home_recent,
+                                   fg_color=("#f1f5f9", "#252640"), corner_radius=8)
+                title = ctk.CTkLabel(
+                    row, text="", font=font(12, "bold"), text_color=C_BODY_TEXT
+                )
+                title.pack(side="left", padx=(12, 6), pady=7)
+                info_label = ctk.CTkLabel(
+                    row, text="", font=font(11), text_color=C_SUBTLE_TEXT
+                )
+                info_label.pack(side="left", padx=4, pady=7)
+                item = {"row": row, "title": title, "info": info_label}
+                self._home_recent_rows[key] = item
+            item["title"].configure(text=f"🎮 {b['game']}")
+            info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
+            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+            if note_text:
+                info += f"  ·  📝 {note_text}"
+            item["info"].configure(text=info)
+            item["row"].pack(fill="x", padx=4, pady=2)
+        stale_keys = [key for key in self._home_recent_rows.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._home_recent_rows.pop(key, None)
+            if item:
+                item["row"].destroy()
+
+    # ─── 扫描游戏 ───
+    def _build_scan_frame(self):
+        frame = ctk.CTkFrame(self, fg_color=C_MAIN_BG)
+        self._frames["scan"] = frame
+        frame.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(frame, fg_color="transparent")
+        hdr.grid(row=0, column=0, padx=32, pady=(28, 8), sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text=self.t("scan_title"),
+                     font=font(20, "bold")).grid(row=0, column=0, sticky="w")
+        self._scan_add_all_btn = ctk.CTkButton(
+            hdr, text=self.t("scan_add_all"), width=120, height=38,
+            font=font(13, "bold"), corner_radius=10,
+            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+            state="disabled", command=self._add_all_from_scan)
+        self._scan_add_all_btn.grid(row=0, column=1, padx=(0, 10), sticky="e")
+        self._scan_start_btn = ctk.CTkButton(
+            hdr, text=self.t("scan_start"), width=120, height=38,
+            font=font(13, "bold"), corner_radius=10,
+            fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
+            command=self._do_scan)
+        self._scan_start_btn.grid(row=0, column=2, sticky="e")
+
+        self._scan_status = ctk.CTkLabel(
+            frame, text=self.t("scan_hint"),
+            font=font(13), text_color=C_SUBTLE_TEXT)
+        self._scan_status.grid(row=1, column=0, padx=32, sticky="w")
+
+        self._scan_search_var = ctk.StringVar()
+        self._scan_search_var.trace_add("write", self._schedule_scan_search_render)
+        search_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        search_frame.grid(row=2, column=0, padx=32, pady=(6, 0), sticky="ew")
+        search_frame.grid_columnconfigure(0, weight=1)
+        self._scan_search_entry = ctk.CTkEntry(
+            search_frame, textvariable=self._scan_search_var,
+            placeholder_text=self.bi("🔍 搜索游戏名称或 AppID …", "🔍 Search by game name or AppID …"),
+            height=34, corner_radius=8, font=font(13))
+        self._scan_search_entry.grid(row=0, column=0, sticky="ew")
+
+        self._scan_scroll = ctk.CTkScrollableFrame(
+            frame, height=420, corner_radius=12, fg_color=C_CARD_BG)
+        self._scan_scroll.grid(row=3, column=0, padx=30, pady=10, sticky="nsew")
+        frame.grid_rowconfigure(3, weight=1)
+        self._scan_cards = {}
+        self._scan_info_banner = ctk.CTkFrame(
+            self._scan_scroll, fg_color=("#eef2ff", "#1e1b4b"), corner_radius=10
+        )
+        self._scan_info_label = ctk.CTkLabel(
+            self._scan_info_banner, text="", font=font(11), justify="left", text_color=C_BODY_TEXT
+        )
+        self._scan_info_label.pack(padx=14, pady=10, anchor="w")
+        self._scan_empty_label = ctk.CTkLabel(
+            self._scan_scroll, text="", font=font(13), text_color=C_SUBTLE_TEXT
+        )
+
     def _scan_profile_label(self, profile: str) -> str:
         labels = {
             "ssd": self.bi("SSD", "SSD"),
@@ -7297,20 +6813,6 @@ class SteamSaveManager(ctk.CTk):
             "unknown": self.bi("未知磁盘", "Unknown"),
         }
         return labels.get(profile, labels["unknown"])
-
-    def _get_filtered_scan_results(self):
-        search_text = self._scan_search_var.get().strip().lower() if hasattr(self, "_scan_search_var") else ""
-        results = []
-        for game in self._scan_results:
-            appid = game.get("appid")
-            haystack = game.get("_search_blob")
-            if haystack is None:
-                haystack = f"{str(game.get('name', '') or '').lower()} {str(appid or '').lower()}"
-                game["_search_blob"] = haystack
-            if search_text and search_text not in haystack:
-                continue
-            results.append(game)
-        return results
 
     def _set_scan_busy(self, busy: bool):
         self._scan_in_progress = busy
@@ -7326,6 +6828,129 @@ class SteamSaveManager(ctk.CTk):
                 )
             )
             self._scan_add_all_btn.configure(state="normal" if can_add else "disabled")
+
+    def _set_io_busy(self, busy: bool):
+        """标记 IO 操作进行中，防止重复触发"""
+        self._io_busy = busy
+
+    def _notify_io_busy(self):
+        self._show_warning(
+            self.bi("处理中", "Busy"),
+            self.bi(
+                "当前已有备份、恢复或同步任务正在进行，请稍候再试。",
+                "A backup, restore, or sync task is already running. Please try again in a moment.",
+            ),
+        )
+
+    def _schedule_scan_search_render(self, *_args):
+        if self._scan_search_job:
+            try:
+                self.after_cancel(self._scan_search_job)
+            except Exception:
+                pass
+        self._scan_search_job = self.after(180, self._run_scan_search_render)
+
+    def _run_scan_search_render(self):
+        self._scan_search_job = None
+        self._render_scan_results()
+
+    def _schedule_games_refresh(self, *_args):
+        if self._games_search_job:
+            try:
+                self.after_cancel(self._games_search_job)
+            except Exception:
+                pass
+        self._games_search_job = self.after(180, self._run_games_refresh)
+
+    def _run_games_refresh(self):
+        self._games_search_job = None
+        self._refresh_games_list()
+
+    def _invalidate_game_backup_count_cache(self, game_name: Optional[str] = None):
+        if game_name:
+            key = str(game_name)
+            self._game_backup_count_cache.pop(key, None)
+            self._game_backups_cache.pop(key, None)
+            self._recent_backups_cache.clear()
+            self._game_detail_metrics_cache.pop(key, None)
+            return
+        self._game_backup_count_cache.clear()
+        self._game_backups_cache.clear()
+        self._recent_backups_cache.clear()
+        self._game_detail_metrics_cache.clear()
+
+    def _get_game_backup_count_cached(self, game_name: str) -> int:
+        key = str(game_name or "")
+        if key in self._game_backup_count_cache:
+            return self._game_backup_count_cache[key]
+        count = len(self._get_game_backups_cached(key))
+        self._game_backup_count_cache[key] = count
+        return count
+
+    def _get_game_backups_cached(self, game_name: str) -> list:
+        key = str(game_name or "")
+        cached = self._game_backups_cache.get(key)
+        if cached is not None:
+            return [dict(item) for item in cached]
+        backups = get_backups(key)
+        self._game_backups_cache[key] = [dict(item) for item in backups]
+        return [dict(item) for item in backups]
+
+    def _get_recent_backups_cached(self, limit: int = 15) -> list:
+        cached = self._recent_backups_cache.get(limit)
+        if cached is not None:
+            return [dict(item) for item in cached]
+        all_b = []
+        for g in self.cfg.get("games", []):
+            for b in self._get_game_backups_cached(g["name"]):
+                item = dict(b)
+                item["game"] = g["name"]
+                all_b.append(item)
+        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
+        recent = all_b[:limit]
+        self._recent_backups_cache[limit] = [dict(item) for item in recent]
+        return [dict(item) for item in recent]
+
+    def _get_game_detail_metrics_cached(self, game: dict) -> dict:
+        key = str(game.get("name", "") or "")
+        now = time.time()
+        cached = self._game_detail_metrics_cache.get(key)
+        if cached and now - float(cached.get("ts", 0.0)) < 10.0:
+            return dict(cached.get("data", {}))
+
+        save_paths = get_game_save_paths(game, existing_only=False)
+        existing_paths = [p for p in save_paths if os.path.isdir(p)]
+        path_ok = bool(existing_paths)
+        file_count = 0
+        for path in existing_paths:
+            try:
+                for _, _, fs in os.walk(path):
+                    file_count += len(fs)
+            except Exception:
+                continue
+
+        data = {
+            "save_paths": save_paths,
+            "existing_paths": existing_paths,
+            "path_ok": path_ok,
+            "file_count": file_count,
+        }
+        self._game_detail_metrics_cache[key] = {"ts": now, "data": dict(data)}
+        return dict(data)
+
+    def _get_filtered_scan_results(self):
+        search_text = self._scan_search_var.get().strip().lower() if hasattr(self, "_scan_search_var") else ""
+        results = []
+        for game in self._scan_results:
+            appid = game.get("appid")
+            haystack = game.get("_search_blob")
+            if haystack is None:
+                haystack = f"{str(game.get('name', '') or '').lower()} {str(appid or '').lower()}"
+                game["_search_blob"] = haystack
+            if search_text and search_text not in haystack:
+                continue
+            results.append(game)
+        return results
 
     def _render_scan_results(self):
         for item in self._scan_cards.values():
@@ -7531,18 +7156,6 @@ class SteamSaveManager(ctk.CTk):
         if self._scan_add_all_btn is not None:
             self._scan_add_all_btn.configure(state="normal" if addable and not self._scan_in_progress else "disabled")
 
-    def _run_scan_search_render(self):
-        self._scan_search_job = None
-        self._render_scan_results()
-
-    def _schedule_scan_search_render(self, *_args):
-        if self._scan_search_job:
-            try:
-                self.after_cancel(self._scan_search_job)
-            except Exception:
-                pass
-        self._scan_search_job = self.after(180, self._run_scan_search_render)
-
     def _finish_scan_with_error(self, message: str):
         self._scan_results = []
         self._scan_lib_folders = []
@@ -7709,36 +7322,149 @@ class SteamSaveManager(ctk.CTk):
             return _normalize_unique_save_specs(selected_candidate.get("save_specs", []))
         return []
 
-    def _on_backup_done(self, result):
-        self._set_io_busy(False)
-        if result:
-            self._invalidate_game_backup_count_cache()
-            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
-        else:
-            self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
-
-    def _on_backup_failed(self, err, detail_idx=None):
-        self._set_io_busy(False)
-        if detail_idx is not None and detail_idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][detail_idx].get("name", ""))
-        self._show_error(self.bi("备份失败", "Backup Failed"), err)
-
-    def _manual_backup(self, idx):
-        if self._io_busy:
-            self._notify_io_busy()
+    def _add_from_scan(self, appid, name, save_path):
+        games = self.cfg.setdefault("games", [])
+        if any(g.get("appid") == appid for g in games):
+            self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
             return
-        g = dict(self.cfg["games"][idx])
-        note = self._input_dialog(
-            title=self.bi("备注", "Note"),
-            text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
-        self._set_io_busy(True)
-        def _worker():
-            try:
-                r = create_backup(g, note)
-                self.after(0, lambda: self._on_backup_done(r))
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._on_backup_failed(err))
-        threading.Thread(target=_worker, daemon=True).start()
+        save_paths = self._collect_scan_add_paths(appid, save_path)
+        game = {"appid": appid, "name": name}
+        save_specs = self._collect_scan_add_specs(appid, save_path)
+        if save_specs:
+            set_game_save_specs(game, save_specs)
+        else:
+            set_game_save_paths(game, save_paths if save_paths else [save_path])
+        result = next((r for r in self._scan_results if r.get("appid") == appid), None)
+        if result and result.get("library_path"):
+            game["library_path"] = result.get("library_path", "")
+        games.append(game)
+        remember_recognition_path(self.cfg, appid, name, game.get("save_path", ""))
+        save_config(self.cfg)
+        self._refresh_games_list()
+        self._render_scan_results()
+        if len(game.get("save_paths", [])) > 1:
+            self._show_info(
+                self.bi("成功", "Success"),
+                self.bi(
+                    f"已添加「{name}」，共 {len(game['save_paths'])} 个存档目录",
+                    f"Added {name} with {len(game['save_paths'])} save folders",
+                ),
+            )
+        else:
+            self._show_info(self.bi("成功", "Success"), self.bi(f"已添加「{name}」", f"Added {name}"))
+
+    def _add_all_from_scan(self):
+        if self._scan_in_progress:
+            return
+        games = self.cfg.setdefault("games", [])
+        existing = {g.get("appid") for g in games}
+        added = 0
+        for result in self._get_filtered_scan_results():
+            appid = result.get("appid")
+            if not result.get("save_paths") or appid in existing:
+                continue
+            selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
+            save_paths = self._collect_scan_add_paths(appid, selected)
+            game = {"appid": appid, "name": result["name"]}
+            save_specs = self._collect_scan_add_specs(appid, selected)
+            if save_specs:
+                set_game_save_specs(game, save_specs)
+            else:
+                set_game_save_paths(game, save_paths if save_paths else [selected])
+            if result.get("library_path"):
+                game["library_path"] = result.get("library_path", "")
+            games.append(game)
+            remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
+            existing.add(appid)
+            added += 1
+        if not added:
+            self._show_info(
+                self.bi("提示", "Notice"),
+                self.bi("当前没有可添加的已识别游戏", "There are no detected games available to add right now"),
+            )
+            return
+        save_config(self.cfg)
+        self._refresh_games_list()
+        self._render_scan_results()
+        self._show_info(
+            self.bi("成功", "Success"),
+            self.bi(f"已批量添加 {added} 款游戏", f"Added {added} games in bulk"),
+        )
+
+    def _manual_add_from_scan(self, appid, name):
+        d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
+        if d:
+            self._add_from_scan(appid, name, d)
+
+    def _override_scan_result_path(self, appid, name):
+        d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
+        if not d:
+            return
+        norm = os.path.normpath(d)
+        for result in self._scan_results:
+            if result.get("appid") != appid:
+                continue
+            existing_paths = [os.path.normpath(p) for p in result.get("save_paths", [])]
+            if norm in existing_paths:
+                idx = existing_paths.index(norm)
+                if idx != 0:
+                    result["save_paths"].insert(0, result["save_paths"].pop(idx))
+                    candidates = result.get("save_candidates", [])
+                    if idx < len(candidates):
+                        candidates.insert(0, candidates.pop(idx))
+            else:
+                result.setdefault("save_paths", [])
+                result["save_paths"] = [norm] + [p for p in result["save_paths"] if os.path.normpath(p) != norm]
+                result.setdefault("save_candidates", [])
+                result["save_candidates"] = [{
+                    "path": norm,
+                    "score": 999,
+                    "source": "manual",
+                    "confidence": "high",
+                    "reasons": ["manual"],
+                }] + [c for c in result["save_candidates"] if os.path.normpath(c.get("path", "")) != norm]
+            break
+        self._render_scan_results()
+
+    # ─── 游戏列表 ───
+    def _build_games_frame(self):
+        frame = ctk.CTkFrame(self, fg_color=C_MAIN_BG)
+        self._frames["games"] = frame
+        frame.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(frame, fg_color="transparent")
+        hdr.grid(row=0, column=0, padx=32, pady=(28, 10), sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text=self.bi("🎮 游戏列表", "🎮 Games"), font=font(20, "bold")).grid(
+            row=0, column=0, sticky="w")
+        ctk.CTkButton(hdr, text=self.bi("+ 手动添加", "+ Add Manually"), width=110, height=36,
+                      font=font(13), corner_radius=10,
+                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                      command=self._add_game_dialog).grid(
+            row=0, column=1, sticky="e")
+
+        self._games_search_var = ctk.StringVar()
+        self._games_search_var.trace_add("write", self._schedule_games_refresh)
+        search_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        search_frame.grid(row=1, column=0, padx=32, pady=(4, 0), sticky="ew")
+        search_frame.grid_columnconfigure(0, weight=1)
+        self._games_search_entry = ctk.CTkEntry(
+            search_frame, textvariable=self._games_search_var,
+            placeholder_text=self.bi("🔍 搜索游戏名称或 AppID …", "🔍 Search by game name or AppID …"),
+            height=34, corner_radius=8, font=font(13))
+        self._games_search_entry.grid(row=0, column=0, sticky="ew")
+
+        self._games_scroll = ctk.CTkScrollableFrame(
+            frame, height=440, corner_radius=12, fg_color=C_CARD_BG)
+        self._games_scroll.grid(row=2, column=0, padx=30, pady=4, sticky="nsew")
+        frame.grid_rowconfigure(2, weight=1)
+        self._game_cards = {}
+        self._games_empty_label = ctk.CTkLabel(
+            self._games_scroll,
+            text="",
+            text_color=C_SUBTLE_TEXT,
+            font=font(13),
+        )
 
     def _refresh_games_list(self):
         games = self.cfg.get("games", [])
@@ -7854,139 +7580,6 @@ class SteamSaveManager(ctk.CTk):
                 text=self.bi("没有匹配的游戏", "No matching games")
             )
             self._games_empty_label.pack(pady=40)
-
-    def _add_all_from_scan(self):
-        if self._scan_in_progress:
-            return
-        games = self.cfg.setdefault("games", [])
-        existing = {g.get("appid") for g in games}
-        added = 0
-        for result in self._get_filtered_scan_results():
-            appid = result.get("appid")
-            if not result.get("save_paths") or appid in existing:
-                continue
-            selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
-            save_paths = self._collect_scan_add_paths(appid, selected)
-            game = {"appid": appid, "name": result["name"]}
-            save_specs = self._collect_scan_add_specs(appid, selected)
-            if save_specs:
-                set_game_save_specs(game, save_specs)
-            else:
-                set_game_save_paths(game, save_paths if save_paths else [selected])
-            if result.get("library_path"):
-                game["library_path"] = result.get("library_path", "")
-            games.append(game)
-            remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
-            existing.add(appid)
-            added += 1
-        if not added:
-            self._show_info(
-                self.bi("提示", "Notice"),
-                self.bi("当前没有可添加的已识别游戏", "There are no detected games available to add right now"),
-            )
-            return
-        save_config(self.cfg)
-        self._refresh_games_list()
-        self._render_scan_results()
-        self._show_info(
-            self.bi("成功", "Success"),
-            self.bi(f"已批量添加 {added} 款游戏", f"Added {added} games in bulk"),
-        )
-
-    # ─── 扫描游戏 ───
-    def _build_scan_frame(self):
-        frame = ctk.CTkFrame(self, fg_color=C_MAIN_BG)
-        self._frames["scan"] = frame
-        frame.grid_columnconfigure(0, weight=1)
-
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.grid(row=0, column=0, padx=32, pady=(28, 8), sticky="ew")
-        hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hdr, text=self.t("scan_title"),
-                     font=font(20, "bold")).grid(row=0, column=0, sticky="w")
-        self._scan_add_all_btn = ctk.CTkButton(
-            hdr, text=self.t("scan_add_all"), width=120, height=38,
-            font=font(13, "bold"), corner_radius=10,
-            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-            state="disabled", command=self._add_all_from_scan)
-        self._scan_add_all_btn.grid(row=0, column=1, padx=(0, 10), sticky="e")
-        self._scan_start_btn = ctk.CTkButton(
-            hdr, text=self.t("scan_start"), width=120, height=38,
-            font=font(13, "bold"), corner_radius=10,
-            fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-            command=self._do_scan)
-        self._scan_start_btn.grid(row=0, column=2, sticky="e")
-
-        self._scan_status = ctk.CTkLabel(
-            frame, text=self.t("scan_hint"),
-            font=font(13), text_color=C_SUBTLE_TEXT)
-        self._scan_status.grid(row=1, column=0, padx=32, sticky="w")
-
-        self._scan_search_var = ctk.StringVar()
-        self._scan_search_var.trace_add("write", self._schedule_scan_search_render)
-        search_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        search_frame.grid(row=2, column=0, padx=32, pady=(6, 0), sticky="ew")
-        search_frame.grid_columnconfigure(0, weight=1)
-        self._scan_search_entry = ctk.CTkEntry(
-            search_frame, textvariable=self._scan_search_var,
-            placeholder_text=self.bi("🔍 搜索游戏名称或 AppID …", "🔍 Search by game name or AppID …"),
-            height=34, corner_radius=8, font=font(13))
-        self._scan_search_entry.grid(row=0, column=0, sticky="ew")
-
-        self._scan_scroll = ctk.CTkScrollableFrame(
-            frame, height=420, corner_radius=12, fg_color=C_CARD_BG)
-        self._scan_scroll.grid(row=3, column=0, padx=30, pady=10, sticky="nsew")
-        frame.grid_rowconfigure(3, weight=1)
-        self._scan_cards = {}
-        self._scan_info_banner = ctk.CTkFrame(
-            self._scan_scroll, fg_color=("#eef2ff", "#1e1b4b"), corner_radius=10
-        )
-        self._scan_info_label = ctk.CTkLabel(
-            self._scan_info_banner, text="", font=font(11), justify="left", text_color=C_BODY_TEXT
-        )
-        self._scan_info_label.pack(padx=14, pady=10, anchor="w")
-        self._scan_empty_label = ctk.CTkLabel(
-            self._scan_scroll, text="", font=font(13), text_color=C_SUBTLE_TEXT
-        )
-
-    def _run_games_refresh(self):
-        self._games_search_job = None
-        self._refresh_games_list()
-
-    def _schedule_games_refresh(self, *_args):
-        if self._games_search_job:
-            try:
-                self.after_cancel(self._games_search_job)
-            except Exception:
-                pass
-        self._games_search_job = self.after(180, self._run_games_refresh)
-
-    def _get_game_detail_metrics_cached(self, game: dict) -> dict:
-        key = str(game.get("name", "") or "")
-        now = time.time()
-        cached = self._game_detail_metrics_cache.get(key)
-        if cached and now - float(cached.get("ts", 0.0)) < 10.0:
-            return dict(cached.get("data", {}))
-
-        save_paths = get_game_save_paths(game, existing_only=False)
-        existing_paths = [p for p in save_paths if os.path.isdir(p)]
-        path_ok = bool(existing_paths)
-        file_count = 0
-        for path in existing_paths:
-            try:
-                for _, _, fs in os.walk(path):
-                    file_count += len(fs)
-            except Exception:
-                continue
-
-        data = {
-            "save_paths": save_paths,
-            "existing_paths": existing_paths,
-            "path_ok": path_ok,
-            "file_count": file_count,
-        }
-        self._game_detail_metrics_cache[key] = {"ts": now, "data": dict(data)}
-        return dict(data)
 
     def _create_save_paths_editor(self, parent, initial_paths=None, width=420):
         state = {"rows": []}
@@ -8160,46 +7753,6 @@ class SteamSaveManager(ctk.CTk):
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
                       command=_sv).grid(row=6, column=0, padx=24, pady=16)
 
-    # ─── 游戏列表 ───
-    def _build_games_frame(self):
-        frame = ctk.CTkFrame(self, fg_color=C_MAIN_BG)
-        self._frames["games"] = frame
-        frame.grid_columnconfigure(0, weight=1)
-
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.grid(row=0, column=0, padx=32, pady=(28, 10), sticky="ew")
-        hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hdr, text=self.bi("🎮 游戏列表", "🎮 Games"), font=font(20, "bold")).grid(
-            row=0, column=0, sticky="w")
-        ctk.CTkButton(hdr, text=self.bi("+ 手动添加", "+ Add Manually"), width=110, height=36,
-                      font=font(13), corner_radius=10,
-                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                      command=self._add_game_dialog).grid(
-            row=0, column=1, sticky="e")
-
-        self._games_search_var = ctk.StringVar()
-        self._games_search_var.trace_add("write", self._schedule_games_refresh)
-        search_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        search_frame.grid(row=1, column=0, padx=32, pady=(4, 0), sticky="ew")
-        search_frame.grid_columnconfigure(0, weight=1)
-        self._games_search_entry = ctk.CTkEntry(
-            search_frame, textvariable=self._games_search_var,
-            placeholder_text=self.bi("🔍 搜索游戏名称或 AppID …", "🔍 Search by game name or AppID …"),
-            height=34, corner_radius=8, font=font(13))
-        self._games_search_entry.grid(row=0, column=0, sticky="ew")
-
-        self._games_scroll = ctk.CTkScrollableFrame(
-            frame, height=440, corner_radius=12, fg_color=C_CARD_BG)
-        self._games_scroll.grid(row=2, column=0, padx=30, pady=4, sticky="nsew")
-        frame.grid_rowconfigure(2, weight=1)
-        self._game_cards = {}
-        self._games_empty_label = ctk.CTkLabel(
-            self._games_scroll,
-            text="",
-            text_color=C_SUBTLE_TEXT,
-            font=font(13),
-        )
-
     def _edit_game_dialog(self, idx):
         g = self.cfg["games"][idx]
         d = self._create_popup(self.bi("编辑游戏", "Edit Game"), "700x500")
@@ -8230,6 +7783,23 @@ class SteamSaveManager(ctk.CTk):
         ctk.CTkButton(d, text=self.bi("保存", "Save"), width=140, height=38, font=font(13, "bold"),
                       corner_radius=10, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
                       command=_sv).grid(row=4, column=0, padx=24, pady=16)
+
+    def _delete_game(self, idx):
+        g = self.cfg["games"][idx]
+        n = g["name"]
+        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi(f"删除「{n}」？（备份保留）", f"Delete {n}? Existing backups will be kept.")):
+            clear_game_sync_state(self.cfg, g)
+            self.cfg["games"].pop(idx)
+            self._invalidate_game_backup_count_cache()
+            save_config(self.cfg); self._refresh_games_list()
+
+    def _browse(self, entry, callback=None):
+        f = self._ask_directory()
+        if f:
+            entry.delete(0, "end")
+            entry.insert(0, f)
+            if callback:
+                callback()
 
     def _import_save(self, idx):
         g = self.cfg["games"][idx]
@@ -8282,349 +7852,6 @@ class SteamSaveManager(ctk.CTk):
                     restore_backup(str(zp), targets if targets else g.get("save_path", ""))
                     self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
                 except Exception as e: self._show_error(self.bi("失败", "Failed"), str(e))
-
-    def _open_save_folder(self, idx):
-        g = self.cfg["games"][idx]
-        save_paths = get_game_save_paths(g, existing_only=False)
-        p = save_paths[0] if save_paths else g.get("save_path", "")
-        if p and os.path.isdir(p):
-            if sys.platform == "win32":
-                os.startfile(p)
-            else:
-                import subprocess
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.Popen([opener, p])
-        else:
-            self._show_warning(self.bi("提示", "Notice"), self.bi("存档路径不存在", "The save path does not exist"))
-
-    def _on_sync_one_done(self, game_name, result, idx):
-        self._set_io_busy(False)
-        if result.startswith("冲突：") or result.startswith("Conflict:"):
-            live_game = self.cfg["games"][idx] if idx < len(self.cfg["games"]) else None
-            if live_game:
-                self._show_sync_conflict_dialog(live_game)
-        else:
-            self._show_info(self.bi("同步结果", "Sync Result"), self.bi(f"「{game_name}」{result}", f"{game_name}: {result}"))
-
-    def _on_sync_one_failed(self, game_name, err):
-        self._set_io_busy(False)
-        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"「{game_name}」同步出错：\n{err}", f"Sync failed for {game_name}:\n{err}"))
-
-    def _manual_sync_one(self, idx):
-        if self._io_busy: return
-        g = dict(self.cfg["games"][idx])
-        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
-        if not sf:
-            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
-            if issue == "webdav_component_missing":
-                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
-            elif issue == "webdav_url_missing":
-                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
-            else:
-                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
-            self._show_warning(
-                self.bi("提示", "Notice"),
-                msg,
-            )
-            return
-        mode = self.cfg.get("sync_mode", "bidirectional")
-        game_name = g.get("name", "")
-        self._set_io_busy(True)
-        def _worker():
-            try:
-                r = sync_game_save(g, sf, mode, cfg=self.cfg)
-                self.after(0, lambda: self._on_sync_one_done(game_name, r, idx))
-            except Exception as e:
-                self.after(0, lambda err=f"{type(e).__name__}: {e}", name=game_name:
-                    self._on_sync_one_failed(name, err))
-        threading.Thread(target=_worker, daemon=True).start()
-
-    # ─── 智能云存档进程监控 ───
-    def _start_game_monitor(self):
-        self._stop_game_monitor()
-        self._game_monitor = GameProcessMonitor(self.cfg)
-        self._game_monitor.start()
-
-    def _show_game_detail(self, idx):
-        self._detail_idx = idx
-        self._current_frame = "game_detail"
-        g = self.cfg["games"][idx]
-        self._detail_title.configure(text=f"🎮 {g['name']}")
-
-        backups = self._get_game_backups_cached(g["name"])
-        total_size = sum(b["size"] for b in backups)
-        detail_metrics = self._get_game_detail_metrics_cached(g)
-
-        # 统计卡片
-        self._detail_stats["appid"].configure(
-            text=g.get("appid", "") or self.bi("未设置", "Not set"))
-        self._detail_stats["backups"].configure(text=str(len(backups)))
-        self._detail_stats["size"].configure(text=fmt_size(total_size))
-        save_paths = detail_metrics.get("save_paths", [])
-        existing_paths = detail_metrics.get("existing_paths", [])
-        path_ok = bool(detail_metrics.get("path_ok", False))
-        file_count = int(detail_metrics.get("file_count", 0))
-        self._detail_stats["files"].configure(
-            text=self.bi(f"{file_count} 个", f"{file_count}") if path_ok else "—")
-
-        # 标题栏状态徽章
-        if path_ok:
-            self._detail_status_badge.configure(
-                text=self.bi("● 存档正常", "● Save OK"), text_color=("#16a34a", "#4ade80"))
-        else:
-            self._detail_status_badge.configure(
-                text=self.bi("● 路径异常", "● Path Error"), text_color=("#dc2626", "#fca5a5"))
-
-        # 路径
-        primary_path = save_paths[0] if save_paths else g.get("save_path", "")
-        if len(save_paths) > 1:
-            path_text = self.bi(
-                f"{primary_path}\n(+{len(save_paths) - 1} 个额外目录)",
-                f"{primary_path}\n(+{len(save_paths) - 1} additional folders)",
-            )
-        else:
-            path_text = primary_path
-        self._detail_path.configure(text=path_text)
-        self._detail_open_btn.configure(
-            command=lambda: self._open_save_folder(idx))
-
-        # 操作按钮 (grid 等宽排列)
-        for w in self._detail_btns.winfo_children(): w.destroy()
-        actions = [
-            (self.bi("💾 立即备份", "💾 Back Up Now"), BTN_SUCCESS, BTN_SUCCESS_H,
-             lambda: self._backup_from_detail(idx)),
-            (self.bi("🔄 同步存档", "🔄 Sync Saves"), BTN_BLUE, BTN_BLUE_H,
-             lambda: self._manual_sync_one(idx)),
-            (self.bi("📥 导入存档", "📥 Import Save"), BTN_WARN, BTN_WARN_H,
-             lambda: self._import_save(idx)),
-            (self.bi("📝 编辑信息", "📝 Edit"), BTN_PRIMARY, BTN_PRIMARY_H,
-             lambda: self._edit_game_dialog(idx)),
-            (self.bi("❌ 删除游戏", "❌ Delete Game"), BTN_DANGER, BTN_DANGER_H,
-             lambda: self._delete_game_from_detail(idx)),
-        ]
-        for i, (txt, clr, hclr, cmd) in enumerate(actions):
-            ctk.CTkButton(self._detail_btns, text=txt, height=36,
-                          font=font(12, "bold"), corner_radius=8,
-                          fg_color=clr, hover_color=hclr,
-                          command=cmd).grid(row=0, column=i, padx=3, sticky="ew")
-
-        # 单独设置：自动备份开关
-        auto_on = g.get("auto_backup", True)
-        self._detail_auto_var.set("on" if auto_on else "off")
-
-        # 备份历史：只更新计数标签
-        self._detail_bk_count_label.configure(
-            text=self.bi(f"{len(backups)} 条记录  ·  {fmt_size(total_size)}",
-                         f"{len(backups)} records  ·  {fmt_size(total_size)}") if backups else self.bi("暂无备份", "No backups"))
-
-        # 自动启动同步监控（如果条件满足但未启动）
-        if (self.cfg.get("sync_enabled") and self.cfg.get("sync_mode") == "smart"
-                and (self._game_monitor is None
-                     or self._game_monitor._thread is None
-                     or not self._game_monitor._thread.is_alive())):
-            self._start_game_monitor()
-
-        # 进程状态
-        self._refresh_proc_status()
-
-        # 显示详情页
-        for f in self._frames.values(): f.grid_forget()
-        self._frames["game_detail"].grid(row=0, column=1, sticky="nsew")
-        self._highlight_nav("games")
-        self._start_detail_refresh()
-
-    def _on_restore_popup_done(self, idx, dialog):
-        self._set_io_busy(False)
-        self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
-        dialog.destroy()
-        self._show_game_detail(idx)
-
-    def _on_restore_popup_failed(self, err):
-        self._set_io_busy(False)
-        self._show_error(self.bi("还原失败", "Restore Failed"), err)
-
-    def _restore_from_popup(self, backup, game, dialog):
-        """从弹窗中还原备份"""
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
-                self.bi(f"还原 {self._fmt_ts(backup['timestamp'])} 的备份？\n当前存档将被自动备份后覆盖",
-                        f"Restore the backup from {self._fmt_ts(backup['timestamp'])}?\nYour current save will be backed up automatically before being overwritten.")):
-            backup_path = backup["path"]
-            game_copy = dict(game)
-            detail_idx = self._detail_idx
-            self._set_io_busy(True)
-            def _worker():
-                try:
-                    targets = get_game_save_specs(game_copy, existing_only=False)
-                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
-                    self.after(0, lambda: self._on_restore_popup_done(detail_idx, dialog))
-                except Exception as e:
-                    self.after(0, lambda err=str(e): self._on_restore_popup_failed(err))
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _show_backup_history(self):
-        """弹窗显示当前游戏的完整备份历史"""
-        g = self.cfg["games"][self._detail_idx]
-        backups = self._get_game_backups_cached(g["name"])
-
-        d = self._create_popup(self.bi(f"备份历史 — {g['name']}", f"Backup History — {g['name']}"), "680x520")
-        d.grid_columnconfigure(0, weight=1)
-        d.grid_rowconfigure(1, weight=1)
-
-        # 标题栏
-        hdr = ctk.CTkFrame(d, fg_color="transparent")
-        hdr.grid(row=0, column=0, padx=20, pady=(16, 8), sticky="ew")
-        hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hdr, text=self.bi(f"📋 {g['name']} — 备份历史", f"📋 {g['name']} — Backup History"),
-                     font=font(16, "bold")).grid(row=0, column=0, sticky="w")
-        total_size = sum(b["size"] for b in backups)
-        ctk.CTkLabel(hdr, text=self.bi(f"{len(backups)} 条  ·  {fmt_size(total_size)}",
-                                       f"{len(backups)} items  ·  {fmt_size(total_size)}"),
-                     font=font(12), text_color=C_SUBTLE_TEXT).grid(
-            row=0, column=1, sticky="e")
-
-        # 备份列表
-        scroll = ctk.CTkScrollableFrame(d, corner_radius=12, fg_color=C_CARD_BG)
-        scroll.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="nsew")
-
-        if not backups:
-            ctk.CTkLabel(scroll, text=self.bi("暂无备份记录", "No backup history yet"),
-                         text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
-        else:
-            for b in backups:
-                row = ctk.CTkFrame(scroll, fg_color=("#f1f5f9", "#252640"),
-                                   corner_radius=10)
-                row.pack(fill="x", padx=4, pady=3)
-                row.grid_columnconfigure(0, weight=1)
-                ctk.CTkLabel(row, text=f"🕐 {self._fmt_ts(b['timestamp'])}",
-                             font=font(12, "bold"), text_color=C_BODY_TEXT).grid(
-                    row=0, column=0, padx=14, pady=(10, 0), sticky="w")
-                sub = fmt_size(b['size'])
-                note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
-                if note_text: sub += f"  ·  📝 {note_text}"
-                ctk.CTkLabel(row, text=sub, font=font(11),
-                             text_color=C_SUBTLE_TEXT).grid(
-                    row=1, column=0, padx=14, pady=(2, 10), sticky="w")
-                bb = ctk.CTkFrame(row, fg_color="transparent")
-                bb.grid(row=0, column=1, rowspan=2, padx=14, pady=8, sticky="e")
-                ctk.CTkButton(bb, text=self.bi("还原", "Restore"), width=56, height=28, font=font(11),
-                              corner_radius=6, fg_color=BTN_SUCCESS,
-                              hover_color=BTN_SUCCESS_H,
-                              command=lambda bp=b, gm=g, dlg=d:
-                                  self._restore_from_popup(bp, gm, dlg)).pack(
-                    side="left", padx=2)
-                ctk.CTkButton(bb, text=self.bi("删除", "Delete"), width=56, height=28, font=font(11),
-                              corner_radius=6, fg_color=BTN_DANGER,
-                              hover_color=BTN_DANGER_H,
-                              command=lambda bp=b, dlg=d:
-                                  self._del_bk_from_popup(bp, dlg)).pack(
-                    side="left", padx=2)
-
-    def _show_process_diagnose(self):
-        """弹出进程检测诊断窗口"""
-        monitor = GameProcessMonitor(self.cfg)
-        info = monitor.diagnose()
-        d = self._create_popup(self.bi("进程检测诊断", "Process Diagnostics"), "640x520")
-        tb = ctk.CTkTextbox(d, font=font(12), wrap="word")
-        tb.pack(fill="both", expand=True, padx=16, pady=(16, 8))
-        tb.insert("1.0", info)
-        tb.configure(state="disabled")
-        ctk.CTkButton(d, text=self.bi("关闭", "Close"), width=100, height=36,
-                      font=font(13, "bold"), corner_radius=8,
-                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                      command=d.destroy).pack(pady=(0, 16))
-
-    def _show_sync_log(self):
-        """弹出同步监控日志窗口"""
-        d = self._create_popup(self.bi("同步监控日志", "Sync Monitor Log"), "640x520")
-        tb = ctk.CTkTextbox(d, font=font(12), wrap="word")
-        tb.pack(fill="both", expand=True, padx=16, pady=(16, 8))
-        lines = []
-        if self._game_monitor and self._game_monitor.sync_log:
-            lines = list(self._game_monitor.sync_log)
-        else:
-            lines = [self.bi("暂无同步活动记录。", "No sync activity yet.")]
-            if not self.cfg.get("sync_enabled"):
-                lines.append("")
-                lines.append(self.bi("⚠ 同步功能未启用，请在设置中开启。", "⚠ Sync is disabled. Enable it in Settings."))
-            elif self.cfg.get("sync_mode") != "smart":
-                lines.append("")
-                lines.append(self.bi(f"⚠ 当前同步模式为「{self.cfg.get('sync_mode', '?')}」，",
-                                     f"⚠ Current sync mode is \"{self.cfg.get('sync_mode', '?')}\","))
-                lines.append(self.bi("   智能云存档需要设为「smart」模式。", "   Smart Cloud Save requires the \"smart\" mode."))
-            elif not has_sync_backend(self.cfg.get("sync_folder", ""), self.cfg):
-                lines.append("")
-                issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
-                if issue == "webdav_component_missing":
-                    lines.append(self.bi("⚠ WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件。", "⚠ WebDAV is enabled, but webdavclient3 is unavailable in the current runtime."))
-                elif issue == "webdav_url_missing":
-                    lines.append(self.bi("⚠ WebDAV 已启用，但服务器地址为空。", "⚠ WebDAV is enabled, but the server URL is empty."))
-                else:
-                    lines.append(self.bi("⚠ 同步目录与 WebDAV 均未配置，请在设置中启用其中一种。", "⚠ Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
-            elif not self._game_monitor:
-                lines.append("")
-                lines.append(self.bi("⚠ 同步监控未启动，请尝试重启应用。", "⚠ Sync monitoring is not running. Try restarting the app."))
-            else:
-                lines.append("")
-                lines.append(self.bi("监控已启动，等待游戏启动/关闭事件...", "Monitoring is running and waiting for game start/stop events..."))
-        pending_conflicts = sum(
-            1 for g in self.cfg.get("games", [])
-            if get_game_sync_state(self.cfg, g).get("pending_conflict")
-        )
-        retry_count = len(get_sync_retry_queue(self.cfg))
-        if pending_conflicts or retry_count:
-            lines.append("")
-            lines.append(self.bi(f"待处理冲突：{pending_conflicts} 个", f"Pending conflicts: {pending_conflicts}"))
-            lines.append(self.bi(f"待重试任务：{retry_count} 个", f"Queued retries: {retry_count}"))
-        tb.insert("1.0", "\n".join(lines))
-        tb.configure(state="disabled")
-        btn_frame = ctk.CTkFrame(d, fg_color="transparent")
-        btn_frame.pack(pady=(0, 16))
-        def _refresh_log():
-            tb.configure(state="normal")
-            tb.delete("1.0", "end")
-            if self._game_monitor and self._game_monitor.sync_log:
-                tb.insert("1.0", "\n".join(self._game_monitor.sync_log))
-            else:
-                tb.insert("1.0", self.bi("暂无同步活动记录。", "No sync activity yet."))
-            tb.configure(state="disabled")
-        ctk.CTkButton(btn_frame, text=self.bi("刷新", "Refresh"), width=100, height=36,
-                      font=font(13, "bold"), corner_radius=8,
-                      fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
-                      command=_refresh_log).pack(side="left", padx=4)
-        ctk.CTkButton(btn_frame, text=self.bi("关闭", "Close"), width=100, height=36,
-                      font=font(13, "bold"), corner_radius=8,
-                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
-                      command=d.destroy).pack(side="left", padx=4)
-
-    # ─── 文件监控 ───
-    def _start_watchers(self):
-        if not HAS_WATCHDOG: return
-        self._stop_watchers()
-        cd = self.cfg.get("watch_cooldown", 60)
-        observer = Observer()
-        handler_count = 0
-        for g in self.cfg.get("games", []):
-            if not g.get("auto_backup", True):
-                continue
-            for save_path in get_game_save_paths(g, existing_only=True):
-                handler = SaveChangeHandler(g, cd)
-                observer.schedule(handler, save_path, recursive=True)
-                self._watch_handlers.append(handler)
-                handler_count += 1
-        if handler_count:
-            observer.start()
-            self._watchers.append(observer)
-
-    def _toggle_game_auto_backup(self):
-        idx = self._detail_idx
-        en = self._detail_auto_var.get() == "on"
-        self.cfg["games"][idx]["auto_backup"] = en
-        save_config(self.cfg)
-        # 重建文件监控（如果开启了全局监控）
-        if self.cfg.get("watch_enabled"):
-            self._stop_watchers()
-            self._start_watchers()
 
     # ─── 游戏详情 ───
     def _build_game_detail_frame(self):
@@ -8775,6 +8002,942 @@ class SteamSaveManager(ctk.CTk):
                       command=self._show_backup_history).grid(
             row=0, column=2, padx=(0, 14), pady=14, sticky="e")
 
+    def _show_game_detail(self, idx):
+        self._detail_idx = idx
+        self._current_frame = "game_detail"
+        g = self.cfg["games"][idx]
+        self._detail_title.configure(text=f"🎮 {g['name']}")
+
+        backups = self._get_game_backups_cached(g["name"])
+        total_size = sum(b["size"] for b in backups)
+        detail_metrics = self._get_game_detail_metrics_cached(g)
+
+        # 统计卡片
+        self._detail_stats["appid"].configure(
+            text=g.get("appid", "") or self.bi("未设置", "Not set"))
+        self._detail_stats["backups"].configure(text=str(len(backups)))
+        self._detail_stats["size"].configure(text=fmt_size(total_size))
+        save_paths = detail_metrics.get("save_paths", [])
+        existing_paths = detail_metrics.get("existing_paths", [])
+        path_ok = bool(detail_metrics.get("path_ok", False))
+        file_count = int(detail_metrics.get("file_count", 0))
+        self._detail_stats["files"].configure(
+            text=self.bi(f"{file_count} 个", f"{file_count}") if path_ok else "—")
+
+        # 标题栏状态徽章
+        if path_ok:
+            self._detail_status_badge.configure(
+                text=self.bi("● 存档正常", "● Save OK"), text_color=("#16a34a", "#4ade80"))
+        else:
+            self._detail_status_badge.configure(
+                text=self.bi("● 路径异常", "● Path Error"), text_color=("#dc2626", "#fca5a5"))
+
+        # 路径
+        primary_path = save_paths[0] if save_paths else g.get("save_path", "")
+        if len(save_paths) > 1:
+            path_text = self.bi(
+                f"{primary_path}\n(+{len(save_paths) - 1} 个额外目录)",
+                f"{primary_path}\n(+{len(save_paths) - 1} additional folders)",
+            )
+        else:
+            path_text = primary_path
+        self._detail_path.configure(text=path_text)
+        self._detail_open_btn.configure(
+            command=lambda: self._open_save_folder(idx))
+
+        # 操作按钮 (grid 等宽排列)
+        for w in self._detail_btns.winfo_children(): w.destroy()
+        actions = [
+            (self.bi("💾 立即备份", "💾 Back Up Now"), BTN_SUCCESS, BTN_SUCCESS_H,
+             lambda: self._backup_from_detail(idx)),
+            (self.bi("🔄 同步存档", "🔄 Sync Saves"), BTN_BLUE, BTN_BLUE_H,
+             lambda: self._manual_sync_one(idx)),
+            (self.bi("📥 导入存档", "📥 Import Save"), BTN_WARN, BTN_WARN_H,
+             lambda: self._import_save(idx)),
+            (self.bi("📝 编辑信息", "📝 Edit"), BTN_PRIMARY, BTN_PRIMARY_H,
+             lambda: self._edit_game_dialog(idx)),
+            (self.bi("❌ 删除游戏", "❌ Delete Game"), BTN_DANGER, BTN_DANGER_H,
+             lambda: self._delete_game_from_detail(idx)),
+        ]
+        for i, (txt, clr, hclr, cmd) in enumerate(actions):
+            ctk.CTkButton(self._detail_btns, text=txt, height=36,
+                          font=font(12, "bold"), corner_radius=8,
+                          fg_color=clr, hover_color=hclr,
+                          command=cmd).grid(row=0, column=i, padx=3, sticky="ew")
+
+        # 单独设置：自动备份开关
+        auto_on = g.get("auto_backup", True)
+        self._detail_auto_var.set("on" if auto_on else "off")
+
+        # 备份历史：只更新计数标签
+        self._detail_bk_count_label.configure(
+            text=self.bi(f"{len(backups)} 条记录  ·  {fmt_size(total_size)}",
+                         f"{len(backups)} records  ·  {fmt_size(total_size)}") if backups else self.bi("暂无备份", "No backups"))
+
+        # 自动启动同步监控（如果条件满足但未启动）
+        if (self.cfg.get("sync_enabled") and self.cfg.get("sync_mode") == "smart"
+                and (self._game_monitor is None
+                     or self._game_monitor._thread is None
+                     or not self._game_monitor._thread.is_alive())):
+            self._start_game_monitor()
+
+        # 进程状态
+        self._refresh_proc_status()
+
+        # 显示详情页
+        for f in self._frames.values(): f.grid_forget()
+        self._frames["game_detail"].grid(row=0, column=1, sticky="nsew")
+        self._highlight_nav("games")
+        self._start_detail_refresh()
+
+    def _show_backup_history(self):
+        """弹窗显示当前游戏的完整备份历史"""
+        g = self.cfg["games"][self._detail_idx]
+        backups = self._get_game_backups_cached(g["name"])
+
+        d = self._create_popup(self.bi(f"备份历史 — {g['name']}", f"Backup History — {g['name']}"), "680x520")
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+
+        # 标题栏
+        hdr = ctk.CTkFrame(d, fg_color="transparent")
+        hdr.grid(row=0, column=0, padx=20, pady=(16, 8), sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text=self.bi(f"📋 {g['name']} — 备份历史", f"📋 {g['name']} — Backup History"),
+                     font=font(16, "bold")).grid(row=0, column=0, sticky="w")
+        total_size = sum(b["size"] for b in backups)
+        ctk.CTkLabel(hdr, text=self.bi(f"{len(backups)} 条  ·  {fmt_size(total_size)}",
+                                       f"{len(backups)} items  ·  {fmt_size(total_size)}"),
+                     font=font(12), text_color=C_SUBTLE_TEXT).grid(
+            row=0, column=1, sticky="e")
+
+        # 备份列表
+        scroll = ctk.CTkScrollableFrame(d, corner_radius=12, fg_color=C_CARD_BG)
+        scroll.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="nsew")
+
+        if not backups:
+            ctk.CTkLabel(scroll, text=self.bi("暂无备份记录", "No backup history yet"),
+                         text_color=C_SUBTLE_TEXT, font=font(13)).pack(pady=40)
+        else:
+            for b in backups:
+                row = ctk.CTkFrame(scroll, fg_color=("#f1f5f9", "#252640"),
+                                   corner_radius=10)
+                row.pack(fill="x", padx=4, pady=3)
+                row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(row, text=f"🕐 {self._fmt_ts(b['timestamp'])}",
+                             font=font(12, "bold"), text_color=C_BODY_TEXT).grid(
+                    row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+                sub = fmt_size(b['size'])
+                note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+                if note_text: sub += f"  ·  📝 {note_text}"
+                ctk.CTkLabel(row, text=sub, font=font(11),
+                             text_color=C_SUBTLE_TEXT).grid(
+                    row=1, column=0, padx=14, pady=(2, 10), sticky="w")
+                bb = ctk.CTkFrame(row, fg_color="transparent")
+                bb.grid(row=0, column=1, rowspan=2, padx=14, pady=8, sticky="e")
+                ctk.CTkButton(bb, text=self.bi("还原", "Restore"), width=56, height=28, font=font(11),
+                              corner_radius=6, fg_color=BTN_SUCCESS,
+                              hover_color=BTN_SUCCESS_H,
+                              command=lambda bp=b, gm=g, dlg=d:
+                                  self._restore_from_popup(bp, gm, dlg)).pack(
+                    side="left", padx=2)
+                ctk.CTkButton(bb, text=self.bi("删除", "Delete"), width=56, height=28, font=font(11),
+                              corner_radius=6, fg_color=BTN_DANGER,
+                              hover_color=BTN_DANGER_H,
+                              command=lambda bp=b, dlg=d:
+                                  self._del_bk_from_popup(bp, dlg)).pack(
+                    side="left", padx=2)
+
+    def _restore_from_popup(self, backup, game, dialog):
+        """从弹窗中还原备份"""
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
+                self.bi(f"还原 {self._fmt_ts(backup['timestamp'])} 的备份？\n当前存档将被自动备份后覆盖",
+                        f"Restore the backup from {self._fmt_ts(backup['timestamp'])}?\nYour current save will be backed up automatically before being overwritten.")):
+            backup_path = backup["path"]
+            game_copy = dict(game)
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    targets = get_game_save_specs(game_copy, existing_only=False)
+                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
+                    self.after(0, lambda: self._on_restore_popup_done(detail_idx, dialog))
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_popup_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_restore_popup_done(self, idx, dialog):
+        self._set_io_busy(False)
+        self._show_info(self.bi("成功", "Success"), self.bi("存档已还原！", "Save restored successfully!"))
+        dialog.destroy()
+        self._show_game_detail(idx)
+
+    def _on_restore_popup_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("还原失败", "Restore Failed"), err)
+
+    def _del_bk_from_popup(self, backup, dialog):
+        """从弹窗中删除备份"""
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("确定删除此备份？", "Delete this backup?")):
+            backup_path = backup["path"]
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_popup_done(detail_idx, dialog))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_del_bk_popup_done(self, idx, dialog):
+        self._set_io_busy(False)
+        dialog.destroy()
+        self._show_backup_history()
+        self._show_game_detail(idx)
+
+    def _refresh_proc_status(self):
+        """检测当前游戏的进程运行状态和同步监控状态并更新 UI"""
+        try:
+            g = self.cfg["games"][self._detail_idx]
+            appid = g.get("appid", "")
+            if not appid:
+                self._detail_proc_status.configure(text=self.bi("未设置 AppID，无法检测", "AppID is not set, so detection is unavailable"))
+                self._detail_proc_badge.configure(
+                    text=self.bi("⚠ 未知", "⚠ Unknown"), text_color=("#d97706", "#fbbf24"))
+            else:
+                # 创建临时监控器来检测
+                monitor = GameProcessMonitor(self.cfg)
+                running = monitor._find_running_games()
+                if appid in running:
+                    self._detail_proc_status.configure(
+                        text=self.bi(f"游戏进程运行中 (AppID: {appid})", f"Game process is running (AppID: {appid})"))
+                    self._detail_proc_badge.configure(
+                        text=self.bi("● 运行中", "● Running"), text_color=("#16a34a", "#4ade80"))
+                else:
+                    self._detail_proc_status.configure(
+                        text=self.bi(f"未检测到游戏进程 (AppID: {appid})", f"No game process detected (AppID: {appid})"))
+                    self._detail_proc_badge.configure(
+                        text=self.bi("○ 未运行", "○ Not Running"), text_color=C_SUBTLE_TEXT)
+        except Exception:
+            self._detail_proc_status.configure(text=self.bi("检测失败", "Detection failed"))
+            self._detail_proc_badge.configure(
+                text=self.bi("⚠ 错误", "⚠ Error"), text_color=("#dc2626", "#fca5a5"))
+        # 更新同步监控状态
+        try:
+            sync_enabled = self.cfg.get("sync_enabled", False)
+            sync_mode = self.cfg.get("sync_mode", "")
+            sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=False)
+            sync_issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+            if not sync_enabled:
+                self._detail_sync_monitor_status.configure(text=self.bi("同步功能未启用，请在设置中开启", "Sync is disabled. Enable it in Settings."))
+                self._detail_sync_badge.configure(
+                    text=self.bi("⏸ 关闭", "⏸ Off"), text_color=C_SUBTLE_TEXT)
+            elif sync_mode != "smart":
+                mode_names = {
+                    "upload": self._sync_mode_display("upload"),
+                    "download": self._sync_mode_display("download"),
+                    "bidirectional": self._sync_mode_display("bidirectional"),
+                    "smart": self._sync_mode_display("smart"),
+                }
+                self._detail_sync_monitor_status.configure(
+                    text=self.bi(
+                        f"当前模式: {mode_names.get(sync_mode, sync_mode)}（非智能云存档，不监控进程）",
+                        f"Current mode: {mode_names.get(sync_mode, sync_mode)} (not Smart Cloud Save, so no process monitoring)",
+                    ))
+                self._detail_sync_badge.configure(
+                    text=self.bi("⏸ 非智能", "⏸ Non-smart"), text_color=("#d97706", "#fbbf24"))
+            elif not sync_folder:
+                if sync_issue == "webdav_component_missing":
+                    status_text = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+                elif sync_issue == "webdav_url_missing":
+                    status_text = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+                else:
+                    status_text = self.bi("同步目录与 WebDAV 均未配置，请在设置中启用其中一种", "Neither a sync folder nor WebDAV is configured. Enable one in Settings.")
+                self._detail_sync_monitor_status.configure(text=status_text)
+                self._detail_sync_badge.configure(
+                    text=self.bi("⚠ 未配置", "⚠ Not Configured"), text_color=("#dc2626", "#fca5a5"))
+            elif self._game_monitor and self._game_monitor._thread and self._game_monitor._thread.is_alive():
+                n_running = len(self._game_monitor._running_games)
+                self._detail_sync_monitor_status.configure(
+                    text=self.bi(f"智能监控运行中，正在追踪 {n_running} 个游戏进程",
+                                 f"Smart monitoring is running and tracking {n_running} game process(es)"))
+                self._detail_sync_badge.configure(
+                    text=self.bi("● 运行中", "● Running"), text_color=("#16a34a", "#4ade80"))
+            else:
+                self._detail_sync_monitor_status.configure(text=self.bi("监控未启动（请尝试重启应用）", "Monitoring is not running. Try restarting the app."))
+                self._detail_sync_badge.configure(
+                    text=self.bi("⚠ 未启动", "⚠ Not Running"), text_color=("#dc2626", "#fca5a5"))
+            # 显示最近同步日志
+            if self._game_monitor and self._game_monitor.sync_log:
+                recent = self._game_monitor.sync_log[-3:]
+                self._detail_sync_recent.configure(text="\n".join(recent))
+            else:
+                self._detail_sync_recent.configure(text=self.bi("暂无同步活动记录", "No sync activity yet"))
+        except Exception:
+            self._detail_sync_monitor_status.configure(text=self.bi("状态未知", "Status unknown"))
+            self._detail_sync_badge.configure(
+                text=self.bi("⚠ 错误", "⚠ Error"), text_color=("#dc2626", "#fca5a5"))
+
+    def _enqueue_sync_conflict_dialog(self, game: dict):
+        self._sync_ui_queue.put(("conflict", get_game_sync_key(game)))
+
+    def _drain_sync_ui_queue(self):
+        try:
+            while True:
+                kind, payload = self._sync_ui_queue.get_nowait()
+                if kind == "conflict":
+                    game = find_game_by_sync_key(self.cfg, payload)
+                    if game:
+                        self._show_sync_conflict_dialog(game)
+        except queue.Empty:
+            pass
+        for game in self.cfg.get("games", []):
+            if get_game_sync_state(self.cfg, game).get("pending_conflict"):
+                self._show_sync_conflict_dialog(game)
+                break
+        self.after(1200, self._drain_sync_ui_queue)
+
+    def _format_sync_side_text(self, title: str, info: dict) -> str:
+        hash_short = (info.get("hash", "") or "—")[:12]
+        return (
+            f"{title}\n"
+            f"{self.bi('路径', 'Path')}: {info.get('path', '—')}\n"
+            f"{self.bi('文件数', 'Files')}: {info.get('file_count', 0)}\n"
+            f"{self.bi('最后修改', 'Last Modified')}: {format_sync_time(info.get('latest_mtime', 0))}\n"
+            f"{self.bi('内容摘要', 'Content Hash')}: {hash_short}"
+        )
+
+    def _show_sync_conflict_dialog(self, game: dict):
+        game_key = get_game_sync_key(game)
+        if game_key in self._open_conflict_dialogs:
+            return
+        state = get_game_sync_state(self.cfg, game)
+        conflict = state.get("pending_conflict")
+        if not isinstance(conflict, dict):
+            return
+
+        self._open_conflict_dialogs.add(game_key)
+        d = self._create_popup(self.bi(f"同步冲突 - {game['name']}", f"Sync Conflict - {game['name']}"), "760x460")
+        d.grid_columnconfigure((0, 1), weight=1)
+        d.grid_rowconfigure(2, weight=1)
+
+        def _close():
+            self._open_conflict_dialogs.discard(game_key)
+            d.destroy()
+
+        d.protocol("WM_DELETE_WINDOW", _close)
+
+        ctk.CTkLabel(
+            d,
+            text=self.bi(f"「{game['name']}」检测到同步冲突", f"Sync conflict detected for {game['name']}"),
+            font=font(16, "bold")
+        ).grid(row=0, column=0, columnspan=2, padx=20, pady=(18, 6), sticky="w")
+        reason = conflict.get("reason", self.bi("本地与云端内容不一致", "Local and cloud content differ"))
+        ctk.CTkLabel(
+            d,
+            text=self.bi(
+                f"{reason}。\n请选择要保留的版本。选择“仅下载”前会自动备份本地存档。",
+                f"{reason}.\nChoose which version to keep. A local backup will be created automatically before Download Only runs.",
+            ),
+            justify="left", wraplength=700, text_color=C_SUBTLE_TEXT,
+            font=font(12)
+        ).grid(row=1, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="w")
+
+        local_card = ctk.CTkTextbox(d, font=font(12), wrap="word")
+        local_card.grid(row=2, column=0, padx=(20, 10), pady=8, sticky="nsew")
+        local_card.insert("1.0", self._format_sync_side_text(self.bi("本地存档", "Local Save"), conflict.get("local", {})))
+        local_card.configure(state="disabled")
+
+        remote_card = ctk.CTkTextbox(d, font=font(12), wrap="word")
+        remote_card.grid(row=2, column=1, padx=(10, 20), pady=8, sticky="nsew")
+        remote_card.insert("1.0", self._format_sync_side_text(self.bi("云端存档", "Cloud Save"), conflict.get("remote", {})))
+        remote_card.configure(state="disabled")
+
+        btns = ctk.CTkFrame(d, fg_color="transparent")
+        btns.grid(row=3, column=0, columnspan=2, padx=20, pady=(8, 18), sticky="e")
+        ctk.CTkButton(
+            btns, text=self.bi("稍后处理", "Later"), width=100,
+            fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H, command=_close
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btns, text=self.bi("仅下载云端", "Download Only"), width=120, fg_color=BTN_WARN,
+            hover_color=BTN_WARN_H,
+            command=lambda: self._resolve_sync_conflict(game, "download", d)
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btns, text=self.bi("仅上传本地", "Upload Only"), width=120, fg_color=BTN_PRIMARY,
+            hover_color=BTN_PRIMARY_H,
+            command=lambda: self._resolve_sync_conflict(game, "upload", d)
+        ).pack(side="left", padx=6)
+
+    def _resolve_sync_conflict(self, game: dict, mode: str, dialog):
+        try:
+            result = sync_game_save(
+                game,
+                get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True),
+                mode,
+                cfg=self.cfg
+            )
+            self._show_info(self.bi("冲突已处理", "Conflict Resolved"), self.bi(f"「{game['name']}」{result}", f"{game['name']}: {result}"))
+            self._refresh_proc_status()
+        except Exception as e:
+            self._show_error(self.bi("处理失败", "Resolution Failed"), self.bi(f"「{game['name']}」处理冲突失败：\n{type(e).__name__}: {e}", f"Failed to resolve conflict for {game['name']}:\n{type(e).__name__}: {e}"))
+            return
+        finally:
+            self._open_conflict_dialogs.discard(get_game_sync_key(game))
+        dialog.destroy()
+
+    def _show_process_diagnose(self):
+        """弹出进程检测诊断窗口"""
+        monitor = GameProcessMonitor(self.cfg)
+        info = monitor.diagnose()
+        d = self._create_popup(self.bi("进程检测诊断", "Process Diagnostics"), "640x520")
+        tb = ctk.CTkTextbox(d, font=font(12), wrap="word")
+        tb.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        tb.insert("1.0", info)
+        tb.configure(state="disabled")
+        ctk.CTkButton(d, text=self.bi("关闭", "Close"), width=100, height=36,
+                      font=font(13, "bold"), corner_radius=8,
+                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                      command=d.destroy).pack(pady=(0, 16))
+
+    def _show_sync_log(self):
+        """弹出同步监控日志窗口"""
+        d = self._create_popup(self.bi("同步监控日志", "Sync Monitor Log"), "640x520")
+        tb = ctk.CTkTextbox(d, font=font(12), wrap="word")
+        tb.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        lines = []
+        if self._game_monitor and self._game_monitor.sync_log:
+            lines = list(self._game_monitor.sync_log)
+        else:
+            lines = [self.bi("暂无同步活动记录。", "No sync activity yet.")]
+            if not self.cfg.get("sync_enabled"):
+                lines.append("")
+                lines.append(self.bi("⚠ 同步功能未启用，请在设置中开启。", "⚠ Sync is disabled. Enable it in Settings."))
+            elif self.cfg.get("sync_mode") != "smart":
+                lines.append("")
+                lines.append(self.bi(f"⚠ 当前同步模式为「{self.cfg.get('sync_mode', '?')}」，",
+                                     f"⚠ Current sync mode is \"{self.cfg.get('sync_mode', '?')}\","))
+                lines.append(self.bi("   智能云存档需要设为「smart」模式。", "   Smart Cloud Save requires the \"smart\" mode."))
+            elif not has_sync_backend(self.cfg.get("sync_folder", ""), self.cfg):
+                lines.append("")
+                issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+                if issue == "webdav_component_missing":
+                    lines.append(self.bi("⚠ WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件。", "⚠ WebDAV is enabled, but webdavclient3 is unavailable in the current runtime."))
+                elif issue == "webdav_url_missing":
+                    lines.append(self.bi("⚠ WebDAV 已启用，但服务器地址为空。", "⚠ WebDAV is enabled, but the server URL is empty."))
+                else:
+                    lines.append(self.bi("⚠ 同步目录与 WebDAV 均未配置，请在设置中启用其中一种。", "⚠ Neither a sync folder nor WebDAV is configured. Enable one in Settings."))
+            elif not self._game_monitor:
+                lines.append("")
+                lines.append(self.bi("⚠ 同步监控未启动，请尝试重启应用。", "⚠ Sync monitoring is not running. Try restarting the app."))
+            else:
+                lines.append("")
+                lines.append(self.bi("监控已启动，等待游戏启动/关闭事件...", "Monitoring is running and waiting for game start/stop events..."))
+        pending_conflicts = sum(
+            1 for g in self.cfg.get("games", [])
+            if get_game_sync_state(self.cfg, g).get("pending_conflict")
+        )
+        retry_count = len(get_sync_retry_queue(self.cfg))
+        if pending_conflicts or retry_count:
+            lines.append("")
+            lines.append(self.bi(f"待处理冲突：{pending_conflicts} 个", f"Pending conflicts: {pending_conflicts}"))
+            lines.append(self.bi(f"待重试任务：{retry_count} 个", f"Queued retries: {retry_count}"))
+        tb.insert("1.0", "\n".join(lines))
+        tb.configure(state="disabled")
+        btn_frame = ctk.CTkFrame(d, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        def _refresh_log():
+            tb.configure(state="normal")
+            tb.delete("1.0", "end")
+            if self._game_monitor and self._game_monitor.sync_log:
+                tb.insert("1.0", "\n".join(self._game_monitor.sync_log))
+            else:
+                tb.insert("1.0", self.bi("暂无同步活动记录。", "No sync activity yet."))
+            tb.configure(state="disabled")
+        ctk.CTkButton(btn_frame, text=self.bi("刷新", "Refresh"), width=100, height=36,
+                      font=font(13, "bold"), corner_radius=8,
+                      fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
+                      command=_refresh_log).pack(side="left", padx=4)
+        ctk.CTkButton(btn_frame, text=self.bi("关闭", "Close"), width=100, height=36,
+                      font=font(13, "bold"), corner_radius=8,
+                      fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+                      command=d.destroy).pack(side="left", padx=4)
+
+    def _set_about_update_state(self, text: Optional[str] = None, busy: Optional[bool] = None):
+        label = getattr(self, "_about_update_status_label", None)
+        if label is not None and label.winfo_exists() and text is not None:
+            label.configure(text=text)
+        button = getattr(self, "_about_update_btn", None)
+        if button is not None and button.winfo_exists() and busy is not None:
+            button.configure(state="disabled" if busy else "normal")
+
+    def _apply_sidebar_version_state(self):
+        label = getattr(self, "_sidebar_version_label", None)
+        if label is not None and label.winfo_exists():
+            label.configure(text=self._sidebar_version_text, text_color=self._sidebar_version_color)
+
+    def _set_sidebar_update_hint(self, text: str, color=None):
+        self._sidebar_version_text = text
+        if color is not None:
+            self._sidebar_version_color = color
+        self._apply_sidebar_version_state()
+
+    def _check_for_updates(self):
+        self._set_about_update_state(
+            text=self.bi("更新状态：正在检查...", "Update status: checking..."),
+            busy=True,
+        )
+        threading.Thread(target=self._check_for_updates_worker, kwargs={"silent": False}, daemon=True).start()
+
+    def _check_for_updates_silent(self):
+        self._set_sidebar_update_hint(
+            self.bi(f"v{VERSION} · 检查更新中...", f"v{VERSION} · Checking updates..."),
+            ("#cbd5e1", "#71717a"),
+        )
+        threading.Thread(target=self._check_for_updates_worker, kwargs={"silent": True}, daemon=True).start()
+
+    def _check_for_updates_worker(self, silent: bool = False):
+        try:
+            manifest = fetch_update_manifest()
+        except Exception as e:
+            def _on_error():
+                self._set_about_update_state(
+                    text=self.bi("更新状态：检查失败", "Update status: failed to check"),
+                    busy=False,
+                )
+                self._set_sidebar_update_hint(
+                    self.bi(f"v{VERSION} · 更新检查失败", f"v{VERSION} · Update check failed"),
+                    ("#f59e0b", "#fbbf24"),
+                )
+                if not silent:
+                    self._show_error(
+                        self.bi("检查更新失败", "Update Check Failed"),
+                        self.bi(f"无法读取远程更新信息：\n{type(e).__name__}: {e}",
+                                f"Could not read remote update info:\n{type(e).__name__}: {e}"),
+                        parent=self._about_dialog,
+                    )
+            self.after(0, _on_error)
+            return
+
+        if not is_remote_version_newer(manifest["version"], VERSION):
+            def _on_latest():
+                self._update_manifest_cache = manifest
+                self._set_about_update_state(
+                    text=self.bi(f"更新状态：已是最新版本 v{VERSION}",
+                                 f"Update status: already on the latest version v{VERSION}"),
+                    busy=False,
+                )
+                self._set_sidebar_update_hint(
+                    f"v{VERSION}",
+                    ("#cbd5e1", "#3f3f46"),
+                )
+                if not silent:
+                    self._show_info(
+                        self.bi("检查更新", "Check for Updates"),
+                        self.bi(f"当前已经是最新版本。\n\n当前版本：v{VERSION}",
+                                f"You're already on the latest version.\n\nCurrent version: v{VERSION}"),
+                        parent=self._about_dialog,
+                    )
+            self.after(0, _on_latest)
+            return
+
+        self.after(0, lambda m=manifest: self._handle_update_available(m, silent))
+
+    def _handle_update_available(self, manifest: dict, silent: bool):
+        self._update_manifest_cache = manifest
+        self._set_about_update_state(
+            text=self.bi(f"更新状态：发现新版本 v{manifest['version']}",
+                         f"Update status: new version found v{manifest['version']}"),
+            busy=False,
+        )
+        self._set_sidebar_update_hint(
+            self.bi(f"v{VERSION} · 有更新 v{manifest['version']}",
+                    f"v{VERSION} · Update v{manifest['version']}"),
+            ("#10b981", "#4ade80"),
+        )
+        if not silent:
+            self._prompt_update_download(manifest)
+
+    def _prompt_update_download(self, manifest: dict):
+        notes = manifest.get("notes", "").strip() or self.bi("暂无更新说明", "No release notes")
+        self._set_about_update_state(
+            text=self.bi(f"更新状态：发现新版本 v{manifest['version']}",
+                         f"Update status: new version found v{manifest['version']}"),
+            busy=False,
+        )
+        ok = self._ask_yes_no(
+            self.bi("发现新版本", "Update Available"),
+            self.bi(
+                f"发现新版本：v{manifest['version']}\n当前版本：v{VERSION}\n\n更新说明：\n{notes}\n\n是否立即下载？",
+                f"New version found: v{manifest['version']}\nCurrent version: v{VERSION}\n\nRelease notes:\n{notes}\n\nDownload it now?",
+            ),
+            parent=self._about_dialog,
+        )
+        if ok:
+            self._download_update(manifest)
+
+    def _download_update(self, manifest: dict):
+        self._set_about_update_state(
+            text=self.bi(f"更新状态：正在下载 v{manifest['version']}...", f"Update status: downloading v{manifest['version']}..."),
+            busy=True,
+        )
+        threading.Thread(target=self._download_update_worker, args=(manifest,), daemon=True).start()
+
+    def _download_update_worker(self, manifest: dict):
+        try:
+            target = download_update_package(manifest, CONFIG_DIR / "updates")
+        except Exception as e:
+            self.after(0, lambda: (
+                self._set_about_update_state(
+                    text=self.bi("更新状态：下载失败", "Update status: download failed"),
+                    busy=False,
+                ),
+                self._show_error(
+                    self.bi("下载更新失败", "Update Download Failed"),
+                    self.bi(f"下载更新时出错：\n{type(e).__name__}: {e}",
+                            f"An error occurred while downloading the update:\n{type(e).__name__}: {e}"),
+                    parent=self._about_dialog,
+                )
+            ))
+            return
+        self.after(0, lambda t=target, m=manifest: self._handle_update_downloaded(m, t))
+
+    def _handle_update_downloaded(self, manifest: dict, target: Path):
+        self._set_about_update_state(
+            text=self.bi(f"更新状态：已下载 v{manifest['version']}", f"Update status: downloaded v{manifest['version']}"),
+            busy=False,
+        )
+        if self._ask_yes_no(
+                self.bi("下载完成", "Download Complete"),
+                self.bi(
+                    f"新版本已下载完成：\n{target}\n\n是否立即关闭当前程序并启动新版本？",
+                    f"The new version has been downloaded:\n{target}\n\nClose the current app and launch the new version now?",
+                ),
+                parent=self._about_dialog):
+            self._launch_downloaded_update(target)
+        else:
+            self._show_info(
+                self.bi("下载完成", "Download Complete"),
+                self.bi(f"更新文件已保存到：\n{target}",
+                        f"The update package has been saved to:\n{target}"),
+                parent=self._about_dialog,
+            )
+
+    def _launch_downloaded_update(self, target: Path):
+        try:
+            if sys.platform == "win32":
+                escaped_target = str(target).replace("'", "''")
+                command = f"Start-Sleep -Seconds 1; Start-Process -FilePath '{escaped_target}'"
+                subprocess.Popen(
+                    ["powershell", "-WindowStyle", "Hidden", "-Command", command],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                subprocess.Popen([str(target)])
+        except Exception as e:
+            self._show_error(
+                self.bi("启动更新失败", "Failed to Launch Update"),
+                self.bi(f"无法启动下载的新版本：\n{type(e).__name__}: {e}",
+                        f"Could not launch the downloaded update:\n{type(e).__name__}: {e}"),
+                parent=self._about_dialog,
+            )
+            return
+
+        if hasattr(self, "_tray") and self._tray:
+            self._tray.stop()
+            self._tray = None
+        self._stop_auto_backup()
+        self._stop_watchers()
+        self._stop_game_monitor()
+        self._stop_sync()
+        self.after(0, self.destroy)
+
+    def _show_about_dialog(self, *a):
+        d = self._create_popup(self.bi("关于 Steam 存档管家", "About Steam Save Manager"), "560x360")
+        self._about_dialog = d
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+        def _on_close():
+            self._about_update_status_label = None
+            self._about_update_btn = None
+            self._about_dialog = None
+            d.destroy()
+        d.protocol("WM_DELETE_WINDOW", _on_close)
+
+        hdr = ctk.CTkFrame(d, fg_color="transparent")
+        hdr.grid(row=0, column=0, padx=22, pady=(18, 10), sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr,
+            text=self.bi("Steam 存档管家", "Steam Save Manager"),
+            font=font(20, "bold"),
+            text_color=C_BODY_TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            hdr,
+            text=f"v{VERSION}",
+            font=font(12),
+            text_color=C_SUBTLE_TEXT,
+        ).grid(row=0, column=1, sticky="e")
+
+        body = ctk.CTkTextbox(d, font=font(12), wrap="word")
+        body.grid(row=1, column=0, padx=18, pady=(0, 14), sticky="nsew")
+        body.insert(
+            "1.0",
+            self.bi(
+                f"一个用于管理 Steam 游戏存档的桌面工具。\n\n"
+                f"当前版本：v{VERSION}\n"
+                f"配置目录：{CONFIG_DIR}\n"
+                f"备份目录：{BACKUP_ROOT}\n"
+                f"by：Kio\n\n"
+                f"主要功能：\n"
+                f"• 自动扫描常见存档目录\n"
+                f"• 手动备份、恢复和导入存档\n"
+                f"• 定时备份与文件变动监控\n"
+                f"• 本地与云盘同步、冲突处理和重试\n"
+                f"• 中英文界面与系统托盘运行",
+                f"A desktop utility for managing Steam game saves.\n\n"
+                f"Current version: v{VERSION}\n"
+                f"Config folder: {CONFIG_DIR}\n"
+                f"Backup folder: {BACKUP_ROOT}\n"
+                f"by：Kio\n\n"
+                f"Highlights:\n"
+                f"• Automatically scans common save locations\n"
+                f"• Manual backup, restore, and save import\n"
+                f"• Scheduled backup and file change monitoring\n"
+                f"• Local/cloud sync with conflict handling and retry\n"
+                f"• Bilingual UI and system tray support",
+            ),
+        )
+        body.configure(state="disabled")
+        self._about_update_status_label = ctk.CTkLabel(
+            d,
+            text=self.bi("更新状态：未检查", "Update status: not checked"),
+            font=font(11),
+            text_color=C_SUBTLE_TEXT,
+        )
+        self._about_update_status_label.grid(row=2, column=0, padx=22, pady=(0, 8), sticky="w")
+
+        btns = ctk.CTkFrame(d, fg_color="transparent")
+        btns.grid(row=3, column=0, padx=22, pady=(0, 18), sticky="e")
+        self._about_update_btn = ctk.CTkButton(
+            btns, text=self.bi("检查更新", "Check for Updates"),
+            width=150, height=36, font=font(13, "bold"),
+            corner_radius=8, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H,
+            command=self._check_for_updates
+        )
+        self._about_update_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btns, text=self.bi("关闭", "Close"),
+            width=100, height=36, font=font(13, "bold"),
+            corner_radius=8, fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_H,
+            command=_on_close
+        ).pack(side="left")
+
+    def _toggle_game_auto_backup(self):
+        idx = self._detail_idx
+        en = self._detail_auto_var.get() == "on"
+        self.cfg["games"][idx]["auto_backup"] = en
+        save_config(self.cfg)
+        # 重建文件监控（如果开启了全局监控）
+        if self.cfg.get("watch_enabled"):
+            self._stop_watchers()
+            self._start_watchers()
+
+    def _start_detail_refresh(self):
+        """启动详情页自动刷新定时器（每 15 秒检查备份变化）"""
+        self._stop_detail_refresh()
+        def _tick():
+            if hasattr(self, '_detail_idx'):
+                try:
+                    idx = self._detail_idx
+                    g = self.cfg["games"][idx]
+                    backups = get_backups(g["name"])
+                    current_text = self._detail_stats["backups"].cget("text")
+                    if str(len(backups)) != current_text:
+                        self._show_game_detail(idx)
+                        return
+                    # 同时刷新进程状态
+                    self._refresh_proc_status()
+                except Exception:
+                    pass
+            self._detail_refresh_job = self.after(15000, _tick)
+        self._detail_refresh_job = self.after(15000, _tick)
+
+    def _stop_detail_refresh(self):
+        """停止详情页自动刷新定时器"""
+        if self._detail_refresh_job:
+            self.after_cancel(self._detail_refresh_job)
+            self._detail_refresh_job = None
+
+    def _backup_from_detail(self, idx):
+        if self._io_busy:
+            self._notify_io_busy()
+            return
+        g = dict(self.cfg["games"][idx])
+        note = self._input_dialog(
+            title=self.bi("备注", "Note"),
+            text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
+        detail_idx = self._detail_idx
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                r = create_backup(g, note)
+                self.after(0, lambda: self._on_backup_detail_done(r, detail_idx))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_backup_failed(err, detail_idx))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_detail_done(self, result, idx):
+        self._set_io_busy(False)
+        if result:
+            if idx < len(self.cfg.get("games", [])):
+                self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
+            self._show_game_detail(idx)
+        else:
+            self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
+
+    def _open_save_folder(self, idx):
+        g = self.cfg["games"][idx]
+        save_paths = get_game_save_paths(g, existing_only=False)
+        p = save_paths[0] if save_paths else g.get("save_path", "")
+        if p and os.path.isdir(p):
+            if sys.platform == "win32":
+                os.startfile(p)
+            else:
+                import subprocess
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, p])
+        else:
+            self._show_warning(self.bi("提示", "Notice"), self.bi("存档路径不存在", "The save path does not exist"))
+
+    def _delete_game_from_detail(self, idx):
+        n = self.cfg["games"][idx]["name"]
+        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi(f"删除「{n}」？（备份保留）", f"Delete {n}? Existing backups will be kept.")):
+            self.cfg["games"].pop(idx)
+            save_config(self.cfg)
+            self._show_frame("games")
+
+    def _restore_from_detail(self, b, game):
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
+                self.bi(f"还原此存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
+                        f"Restore this save?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
+            backup_path = b["path"]
+            game_copy = dict(game)
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    targets = get_game_save_specs(game_copy, existing_only=False)
+                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
+                    self.after(0, lambda: self._on_restore_detail_done(detail_idx))
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_restore_detail_done(self, idx):
+        self._set_io_busy(False)
+        if idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
+        self._show_game_detail(idx)
+
+    def _del_bk_from_detail(self, b):
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
+            backup_path = b["path"]
+            detail_idx = self._detail_idx
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_detail_done(detail_idx))
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_del_bk_detail_done(self, idx):
+        self._set_io_busy(False)
+        if idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+        self._show_game_detail(idx)
+
+    def _manual_backup(self, idx):
+        if self._io_busy:
+            self._notify_io_busy()
+            return
+        g = dict(self.cfg["games"][idx])
+        note = self._input_dialog(
+            title=self.bi("备注", "Note"),
+            text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                r = create_backup(g, note)
+                self.after(0, lambda: self._on_backup_done(r))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_backup_failed(err))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_done(self, result):
+        self._set_io_busy(False)
+        if result:
+            self._invalidate_game_backup_count_cache()
+            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
+        else:
+            self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
+
+    def _on_backup_failed(self, err, detail_idx=None):
+        self._set_io_busy(False)
+        if detail_idx is not None and detail_idx < len(self.cfg.get("games", [])):
+            self._invalidate_game_backup_count_cache(self.cfg["games"][detail_idx].get("name", ""))
+        self._show_error(self.bi("备份失败", "Backup Failed"), err)
+
+    def _backup_all(self):
+        if self._io_busy:
+            self._notify_io_busy()
+            return
+        games = self.cfg.get("games", [])
+        if not games: self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
+        game_copies = [dict(g) for g in games]
+        default_note = self.bi("一键备份", "Back Up All")
+        original_title = self.t("product_title")
+        progress_tpl = self.bi("备份中 {cur}/{total}...", "Backing up {cur}/{total}...")
+        done_title = self.bi("完成", "Done")
+        self._set_io_busy(True)
+        def _worker():
+            ok = 0
+            total = len(game_copies)
+            failed: list[str] = []
+            try:
+                for i, g in enumerate(game_copies):
+                    try:
+                        r = create_backup(g, default_note)
+                        if r:
+                            ok += 1
+                        else:
+                            failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: " + self.bi("存档路径不存在", "Save path does not exist"))
+                    except Exception as e:
+                        failed.append(f"{g.get('name', self.bi('未命名游戏', 'Unnamed game'))}: {type(e).__name__}: {e}")
+                    label = progress_tpl.format(cur=i + 1, total=total)
+                    self.after(0, lambda t=label: self.title(t))
+            finally:
+                self.after(0, lambda: self._on_backup_all_done(total, ok, original_title, done_title, failed))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_backup_all_done(self, total, ok, original_title, done_title, failed=None):
+        self._set_io_busy(False)
+        self.title(original_title)
+        self._invalidate_game_backup_count_cache()
+        failed = failed or []
+        message = self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}")
+        if failed:
+            details = "\n".join(failed[:8])
+            if len(failed) > 8:
+                details += "\n" + self.bi(f"……另有 {len(failed) - 8} 个失败项", f"...and {len(failed) - 8} more failures")
+            message += "\n\n" + self.bi("失败项目：", "Failed items:") + "\n" + details
+        self._show_info(done_title, message)
+
     # ─── 备份记录 ───
     def _build_backup_frame(self):
         frame = ctk.CTkFrame(self, fg_color=C_MAIN_BG)
@@ -8805,491 +8968,121 @@ class SteamSaveManager(ctk.CTk):
             font=font(13),
         )
 
-    def _rebuild_ui(self, target_frame: Optional[str] = None):
-        current = target_frame or getattr(self, "_current_frame", "home")
-        detail_idx = getattr(self, "_detail_idx", None)
-        self._stop_detail_refresh()
-        self.unbind_all("<MouseWheel>")
-        for child in list(self.winfo_children()):
-            child.destroy()
-        self.title(self.t("product_title"))
-        self._frames = {}
-        self._nav_buttons = {}
-        self._build_sidebar()
-        self._build_home_frame()
-        self._build_scan_frame()
-        self._build_games_frame()
-        self._build_backup_frame()
-        self._build_settings_frame()
-        self._build_game_detail_frame()
-        if current == "game_detail" and detail_idx is not None and 0 <= detail_idx < len(self.cfg.get("games", [])):
-            self._show_game_detail(detail_idx)
-        else:
-            self._show_frame(current if current in self._frames else "home")
-        self._update_status()
-        self._apply_sidebar_version_state()
+    def _refresh_backup_list(self):
+        games = self.cfg.get("games", [])
+        all_games_label = self.t("backup_all_games")
+        self._bk_filter.configure(values=[all_games_label] + [g["name"] for g in games])
 
-    def _center_main_window(self):
-        try:
-            self.update_idletasks()
-            width = max(self.winfo_width(), self.winfo_reqwidth(), 1080)
-            height = max(self.winfo_height(), self.winfo_reqheight(), 720)
-            screen_width = self.winfo_screenwidth()
-            screen_height = self.winfo_screenheight()
-            x = max((screen_width - width) // 2, 0)
-            y = max((screen_height - height) // 2, 0)
-            self.geometry(f"{width}x{height}+{x}+{y}")
-        except Exception:
-            pass
+        sel = self._bk_var.get()
+        targets = games if sel == all_games_label else [g for g in games if g["name"] == sel]
+        all_b = []
+        for item in self._backup_rows.values():
+            item["card"].pack_forget()
+        for g in targets:
+            save_paths = get_game_save_paths(g, existing_only=False)
+            save_specs = get_game_save_specs(g, existing_only=False)
+            primary_path = save_paths[0] if save_paths else g.get("save_path", "")
+            for b in self._get_game_backups_cached(g["name"]):
+                b["game"] = g["name"]
+                b["save_path"] = primary_path
+                b["save_paths"] = save_paths
+                b["save_specs"] = save_specs
+                all_b.append(b)
+        all_b.sort(key=lambda x: x["timestamp"], reverse=True)
 
-    def _on_root_map(self, _event=None):
-        self.after(80, self._restore_popup_windows)
-
-    def _ensure_game_monitor(self):
-        """确保在同步启用且为智能模式时，游戏进程监控正在运行"""
-        should_run = (self.cfg.get("sync_enabled")
-                      and self.cfg.get("sync_mode") == "smart")
-        if should_run:
-            if (self._game_monitor is None
-                    or self._game_monitor._thread is None
-                    or not self._game_monitor._thread.is_alive()):
-                self._start_game_monitor()
-        else:
-            if self._game_monitor is not None:
-                self._game_monitor.stop()
-                self._game_monitor = None
-
-    def _browse(self, entry, callback=None):
-        f = self._ask_directory()
-        if f:
-            entry.delete(0, "end")
-            entry.insert(0, f)
-            if callback:
-                callback()
-
-    def _enqueue_sync_conflict_dialog(self, game: dict):
-        self._sync_ui_queue.put(("conflict", get_game_sync_key(game)))
-
-    def _drain_sync_ui_queue(self):
-        try:
-            while True:
-                kind, payload = self._sync_ui_queue.get_nowait()
-                if kind == "conflict":
-                    game = find_game_by_sync_key(self.cfg, payload)
-                    if game:
-                        self._show_sync_conflict_dialog(game)
-        except queue.Empty:
-            pass
-        for game in self.cfg.get("games", []):
-            if get_game_sync_state(self.cfg, game).get("pending_conflict"):
-                self._show_sync_conflict_dialog(game)
-                break
-        self.after(1200, self._drain_sync_ui_queue)
-
-    def _check_for_updates_silent(self):
-        self._set_sidebar_update_hint(
-            self.bi(f"v{VERSION} · 检查更新中...", f"v{VERSION} · Checking updates..."),
-            ("#cbd5e1", "#71717a"),
-        )
-        threading.Thread(target=self._check_for_updates_worker, kwargs={"silent": True}, daemon=True).start()
-
-
-
-    def _set_entry_value(self, entry, value):
-        entry.delete(0, "end")
-        entry.insert(0, str(value))
-
-    def _invoke_and_break(self, callback):
-        callback()
-        return "break"
-
-    def _bind_entry_apply(self, entry, callback):
-        entry.bind("<FocusOut>", lambda _e: callback())
-        entry.bind("<Return>", lambda _e: self._invoke_and_break(callback))
-
-    def _refresh_backup_storage_hint(self):
-        if hasattr(self, "_backup_current_path_label"):
-            self._backup_current_path_label.configure(
-                text=self.t("current_path", path=str(BACKUP_ROOT)))
-
-    def _auto_loop(self):
-        while not self._stop_event.is_set():
-            iv = self.cfg.get("auto_backup_interval", 30) * 60
-            self._stop_event.wait(iv)
-            if self._stop_event.is_set(): break
-            for g in self.cfg.get("games", []):
-                if not g.get("auto_backup", True):
-                    continue
-                create_backup(g, self.bi("定时自动备份", "Scheduled Backup"))
-
-    # ─── 定时备份 ───
-    def _start_auto_backup(self):
-        if self.auto_backup_running: return
-        self._stop_event.clear()
-        self.auto_backup_running = True
-        threading.Thread(target=self._auto_loop, daemon=True).start()
-        self._update_status()
-
-    def _restart_auto_backup_runtime(self):
-        if self.cfg.get("auto_backup_enabled"):
-            self._stop_auto_backup()
-            self._start_auto_backup()
-        else:
-            self._stop_auto_backup()
-
-    def _restart_watchers_runtime(self):
-        if self.cfg.get("watch_enabled"):
-            self._stop_watchers()
-            self._start_watchers()
-        else:
-            self._stop_watchers()
-
-    def _sync_loop(self):
-        while not self._sync_stop.is_set():
-            iv = self.cfg.get("sync_interval", 10) * 60
-            self._sync_stop.wait(iv)
-            if self._sync_stop.is_set():
-                break
-            try:
-                run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""))
-                results = sync_all_games(self.cfg, auto=True)
-                for game in self.cfg.get("games", []):
-                    state = get_game_sync_state(self.cfg, game)
-                    if state.get("pending_conflict"):
-                        self._enqueue_sync_conflict_dialog(game)
-                if self.cfg.get("sync_notify", True):
-                    synced = [
-                        self.bi(f"{n}：{m}", f"{n}: {m}")
-                        for n, m in results
-                        if "跳过" not in m
-                        and "无需" not in m
-                        and "Skipped:" not in m
-                        and "No need" not in m
-                        and not m.startswith("冲突：")
-                        and not m.startswith("Conflict:")
-                    ]
-                    if synced:
-                        send_desktop_notification(
-                            self.bi("存档管家 · 自动同步完成", "Steam Save Manager · Auto Sync Complete"),
-                            self.bi("；", "; ").join(synced[:3]))
-            except Exception:
-                pass
-
-    # ─── 自动同步 ───
-    def _start_sync(self):
-        if hasattr(self, "_sync_running") and self._sync_running:
+        if not all_b:
+            self._backup_empty_label.configure(text=self.t("backup_empty"))
+            self._backup_empty_label.pack(pady=40)
             return
-        self._sync_stop = threading.Event()
-        self._sync_running = True
-        # smart 模式不需要定时同步，由进程监控触发
-        if self.cfg.get("sync_mode") != "smart":
-            threading.Thread(target=self._sync_loop, daemon=True).start()
+        self._backup_empty_label.pack_forget()
+        active_keys = set()
+        for b in all_b:
+            key = f"{b['game']}::{b['timestamp']}::{b['filename']}"
+            active_keys.add(key)
+            item = self._backup_rows.get(key)
+            if item is None:
+                card = ctk.CTkFrame(self._bk_scroll,
+                                    fg_color=("#f1f5f9", "#252640"), corner_radius=10)
+                card.grid_columnconfigure(1, weight=1)
+                title = ctk.CTkLabel(card, text="", font=font(13, "bold"),
+                                     text_color=C_BODY_TEXT)
+                title.grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+                info_label = ctk.CTkLabel(card, text="", font=font(11),
+                                          text_color=C_SUBTLE_TEXT)
+                info_label.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+                bb = ctk.CTkFrame(card, fg_color="transparent")
+                bb.grid(row=0, column=1, rowspan=2, padx=14, pady=10, sticky="e")
+                restore_btn = ctk.CTkButton(
+                    bb, text=self.bi("还原", "Restore"), width=60, height=28, font=font(12),
+                    corner_radius=6, fg_color=BTN_SUCCESS, hover_color=BTN_SUCCESS_H)
+                restore_btn.pack(side="left", padx=2)
+                delete_btn = ctk.CTkButton(
+                    bb, text=self.bi("删除", "Delete"), width=60, height=28, font=font(12),
+                    corner_radius=6, fg_color=BTN_DANGER, hover_color=BTN_DANGER_H)
+                delete_btn.pack(side="left", padx=2)
+                item = {
+                    "card": card,
+                    "title": title,
+                    "info": info_label,
+                    "restore_btn": restore_btn,
+                    "delete_btn": delete_btn,
+                }
+                self._backup_rows[key] = item
+            item["title"].configure(text=f"🎮 {b['game']}")
+            info = f"{self._fmt_ts(b['timestamp'])}  ·  {fmt_size(b['size'])}"
+            note_text = localize_backup_note(b.get("note", ""), cfg_language(self.cfg))
+            if note_text:
+                info += f"  ·  📝 {note_text}"
+            item["info"].configure(text=info)
+            item["restore_btn"].configure(command=lambda bp=b: self._restore(bp))
+            item["delete_btn"].configure(command=lambda bp=b: self._del_bk(bp))
+            item["card"].pack(fill="x", padx=4, pady=2)
+        stale_keys = [key for key in self._backup_rows.keys() if key not in active_keys]
+        for key in stale_keys:
+            item = self._backup_rows.pop(key, None)
+            if item:
+                item["card"].destroy()
 
-    def _restart_sync_runtime(self):
-        if self.cfg.get("sync_enabled"):
-            self._stop_sync()
-            self._start_sync()
-            self._stop_game_monitor()
-            if self.cfg.get("sync_mode") == "smart":
-                self._start_game_monitor()
-        else:
-            self._stop_sync()
-            self._stop_game_monitor()
+    def _restore(self, b):
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
+                self.bi(f"还原「{b['game']}」的存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
+                        f"Restore the save for {b['game']}?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
+            backup_path = b["path"]
+            targets = b.get("save_specs", []) or [_default_save_spec(path) for path in b.get("save_paths", [])]
+            restore_target = targets if targets else b.get("save_path", "")
+            self._set_io_busy(True)
+            def _worker():
+                try:
+                    restore_backup(backup_path, restore_target)
+                    self.after(0, lambda: self._on_restore_done())
+                except Exception as e:
+                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
+            threading.Thread(target=_worker, daemon=True).start()
 
-    def _apply_steam_path(self):
-        self.cfg["steam_path"] = self._steam_e.get().strip()
-        save_config(self.cfg)
-        _SAVE_DETECTION_CACHE.clear()
+    def _on_restore_done(self):
+        self._set_io_busy(False)
+        self._invalidate_game_backup_count_cache()
+        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
 
-    def _apply_auto_backup_interval(self):
-        try:
-            value = max(1, int(self._int_e.get().strip()))
-        except ValueError:
-            value = int(self.cfg.get("auto_backup_interval", 30))
-        self._set_entry_value(self._int_e, value)
-        self.cfg["auto_backup_interval"] = value
-        save_config(self.cfg)
-        self._restart_auto_backup_runtime()
+    def _on_restore_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("失败", "Failed"), err)
 
-    def _apply_watch_cooldown(self):
-        try:
-            value = max(10, int(self._cd_e.get().strip()))
-        except ValueError:
-            value = int(self.cfg.get("watch_cooldown", 60))
-        self._set_entry_value(self._cd_e, value)
-        self.cfg["watch_cooldown"] = value
-        save_config(self.cfg)
-        self._restart_watchers_runtime()
+    def _del_bk(self, b):
+        if self._io_busy: return
+        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
+            backup_path = b["path"]
+            self._set_io_busy(True)
+            def _worker():
+                delete_backup(backup_path)
+                self.after(0, lambda: self._on_del_bk_done())
+            threading.Thread(target=_worker, daemon=True).start()
 
-    def _apply_sync_interval(self):
-        try:
-            value = max(1, int(self._sync_int_e.get().strip()))
-        except ValueError:
-            value = int(self.cfg.get("sync_interval", 10))
-        self._set_entry_value(self._sync_int_e, value)
-        self.cfg["sync_interval"] = value
-        save_config(self.cfg)
-        self._restart_sync_runtime()
-
-    def _apply_sync_folder(self):
-        self.cfg["sync_folder"] = self._sync_folder_e.get().strip()
-        save_config(self.cfg)
-
-    def _apply_sync_archive_keep(self):
-        try:
-            value = max(0, int(self._sync_archive_keep_e.get().strip()))
-        except ValueError:
-            value = int(self.cfg.get("sync_archive_keep", 3))
-        self._set_entry_value(self._sync_archive_keep_e, value)
-        self.cfg["sync_archive_keep"] = value
-        save_config(self.cfg)
-        enforce_all_sync_archive_limits(self.cfg)
-
-    def _on_sync_mode_change(self, _value=None):
-        self.cfg["sync_mode"] = self._sync_mode_code(self._sync_mode_var.get())
-        save_config(self.cfg)
-        self._restart_sync_runtime()
-        self._refresh_proc_status()
-
-    def _toggle_sync_notify(self):
-        self.cfg["sync_notify"] = self._sync_notify_var.get() == "on"
-        save_config(self.cfg)
-
-    # ─── WebDAV 设置 ───
-    def _webdav_preset_display(self, preset_code: str) -> str:
-        code = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
-        return self.t(f"webdav_preset_{code}")
-
-    def _webdav_preset_code(self, display_text: str) -> str:
-        for code in WEBDAV_PRESET_OPTIONS:
-            if display_text == self._webdav_preset_display(code):
-                return code
-        return "generic"
-
-    def _webdav_hint_for_preset(self, preset_code: str, username: str = "") -> str:
-        preset = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
-        if preset == "synology":
-            return "http://nas:5005 / https://nas:5006"
-        if preset == "qnap":
-            return "https://nas:5006/webdav"
-        if preset == "truenas":
-            return "https://nas/dav"
-        if preset == "nextcloud":
-            if username:
-                return f"https://cloud.example.com/remote.php/dav/files/{username}"
-            return "https://cloud.example.com/remote.php/dav/files/<username>"
-        if preset == "openmediavault":
-            if username:
-                return f"https://nas/remote.php/dav/files/{username}"
-            return "https://nas/remote.php/dav/files/<username>"
-        return "https://your-server.com/dav"
-
-    def _refresh_webdav_preset_hint(self):
-        if not hasattr(self, "_webdav_preset_hint"):
-            return
-        preset = str(self.cfg.get("webdav_preset", "generic") or "generic")
-        username = str(self.cfg.get("webdav_username", "") or "").strip()
-        self._webdav_preset_hint.configure(
-            text=self.t("webdav_preset_hint", hint=self._webdav_hint_for_preset(preset, username))
-        )
-
-    def _toggle_webdav(self):
-        en = self._webdav_var.get() == "on"
-        self.cfg["webdav_enabled"] = en
-        save_config(self.cfg)
-        if en:
-            self._webdav_fields.grid()
-        else:
-            self._webdav_fields.grid_remove()
-
-    def _apply_webdav_url(self):
-        normalized = _webdav_normalize_url(
-            self._webdav_url_e.get().strip(),
-            str(self.cfg.get("webdav_preset", "generic") or "generic"),
-            str(self.cfg.get("webdav_username", "") or "").strip(),
-        )
-        self.cfg["webdav_url"] = normalized
-        if hasattr(self, "_webdav_url_e"):
-            self._webdav_url_e.delete(0, "end")
-            self._webdav_url_e.insert(0, normalized)
-        save_config(self.cfg)
-
-    def _on_webdav_preset_change(self, display_text):
-        self.cfg["webdav_preset"] = self._webdav_preset_code(display_text)
-        if hasattr(self, "_webdav_url_e"):
-            self._apply_webdav_url()
-        self._refresh_webdav_preset_hint()
-        save_config(self.cfg)
-
-    def _apply_webdav_base_path(self):
-        self.cfg["webdav_base_path"] = _webdav_base_path({
-            "webdav_base_path": self._webdav_base_path_e.get().strip()
-        })
-        if hasattr(self, "_webdav_base_path_e"):
-            self._webdav_base_path_e.delete(0, "end")
-            self._webdav_base_path_e.insert(0, self.cfg["webdav_base_path"])
-        save_config(self.cfg)
-
-    def _apply_webdav_user(self):
-        self.cfg["webdav_username"] = self._webdav_user_e.get().strip()
-        if hasattr(self, "_webdav_url_e"):
-            self._apply_webdav_url()
-        self._refresh_webdav_preset_hint()
-        save_config(self.cfg)
-
-    def _apply_webdav_pass(self):
-        self.cfg["webdav_password"] = _webdav_encode_password(self._webdav_pass_e.get())
-        save_config(self.cfg)
-
-    def _toggle_webdav_verify_ssl(self):
-        self.cfg["webdav_verify_ssl"] = self._webdav_verify_ssl_var.get() == "on"
-        save_config(self.cfg)
-
-    def _on_webdav_test_result(self, ok, msg):
-        if ok:
-            self._webdav_status.configure(
-                text=self.t("webdav_test_ok"), text_color="#10b981")
-        else:
-            self._webdav_status.configure(
-                text=f"{self.t('webdav_test_fail')}: {msg}", text_color="#ef4444")
-
-    def _test_webdav_connection(self):
-        url = self._webdav_url_e.get().strip()
-        user = self._webdav_user_e.get().strip()
-        password = self._webdav_pass_e.get()
-        if not url:
-            self._show_warning(
-                self.bi("提示", "Notice"),
-                self.bi("请先输入 WebDAV 服务器地址", "Please enter a WebDAV server URL"))
-            return
-        self._webdav_status.configure(
-            text=self.t("webdav_testing"), text_color=C_SUBTLE_TEXT)
-        def _worker():
-            ok, msg = webdav_test_connection(
-                url, user, password,
-                preset=str(self.cfg.get("webdav_preset", "generic") or "generic"),
-                verify_ssl=bool(self.cfg.get("webdav_verify_ssl", True)),
-                base_path=str(self.cfg.get("webdav_base_path", "/SteamSaveSync") or "/SteamSaveSync"),
-            )
-            self.after(0, lambda: self._on_webdav_test_result(ok, msg))
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _toggle_minimize_to_tray(self):
-        self.cfg["minimize_to_tray"] = self._minimize_tray_var.get() == "on"
-        save_config(self.cfg)
-
-    def _apply_max_backups(self):
-        try:
-            value = max(0, int(self._max_bk_e.get().strip()))
-        except ValueError:
-            value = int(self.cfg.get("max_backups_per_game", 20))
-        self._set_entry_value(self._max_bk_e, value)
-        self.cfg["max_backups_per_game"] = value
-        save_config(self.cfg)
-        enforce_backup_limits()
-
-    def _apply_max_backup_size(self):
-        try:
-            value = max(0.0, float(self._max_size_e.get().strip()))
-        except ValueError:
-            value = float(self.cfg.get("max_backup_size_gb", 10.0))
-        self._set_entry_value(self._max_size_e, value)
-        self.cfg["max_backup_size_gb"] = value
-        save_config(self.cfg)
-        enforce_backup_limits()
-
-    def _apply_backup_path(self):
-        old_backup_root = globals()["BACKUP_ROOT"]
-        custom_bp = self._backup_path_e.get().strip()
-        new_backup_root = Path(custom_bp) if custom_bp else Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
-        try:
-            new_backup_root.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            self._show_error(self.t("settings_failed_title"), str(e))
-            self._set_entry_value(self._backup_path_e, self.cfg.get("backup_path", ""))
-            return
-        if os.path.normpath(str(old_backup_root)) != os.path.normpath(str(new_backup_root)):
-            if old_backup_root.exists() and any(old_backup_root.iterdir()):
-                if self._ask_yes_no(
-                        self.t("migrate_backups_title"),
-                        self.t("migrate_backups_prompt",
-                               old=old_backup_root, new=new_backup_root)):
-                    count = migrate_backups(old_backup_root, new_backup_root)
-                    self._show_info(
-                        self.t("migrate_backups_title"),
-                        self.t("migrate_backups_done", count=count))
-            globals()["BACKUP_ROOT"] = new_backup_root
-        self.cfg["backup_path"] = custom_bp
-        save_config(self.cfg)
-        self._refresh_backup_storage_hint()
-        enforce_backup_limits()
-
-    def _toggle_autostart(self):
-        en = self._autostart_var.get() == "on"
-        try:
-            set_autostart_enabled(en)
-            self.cfg["autostart"] = en
-            save_config(self.cfg)
-        except Exception as e:
-            self._show_error(self.t("settings_failed_title"), str(e))
-            self._autostart_var.set("on" if not en else "off")
-
-    def _on_theme(self, val):
-        t = self._theme_code(val)
-        ctk.set_appearance_mode(t)
-        self.cfg["theme"] = t; save_config(self.cfg)
-        # Update settings page canvas & scrollbar colors dynamically
-        try:
-            canvas = getattr(self, "_settings_scroll", None)
-            if canvas is not None:
-                mode = "light" if t == "light" else "dark"
-                canvas.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
-                for child in canvas.master.winfo_children():
-                    if isinstance(child, tkinter.Canvas) and child is not canvas:
-                        child.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
-                        items = child.find_all()
-                        if len(items) >= 2:
-                            cols = {
-                                "light": {"track": "#e2e2e2", "thumb": "#c0c0c0"},
-                                "dark":  {"track": "#333348", "thumb": "#555568"},
-                            }[mode]
-                            child.itemconfigure(items[0], fill=cols["track"])
-                            child.itemconfigure(items[1], fill=cols["thumb"])
-        except Exception:
-            pass
-
-    def _toggle_auto(self):
-        en = self._auto_var.get() == "on"
-        self.cfg["auto_backup_enabled"] = en; save_config(self.cfg)
-        self._restart_auto_backup_runtime()
-        self._update_status()
-
-    def _toggle_watch(self):
-        en = self._watch_var.get() == "on"
-        self.cfg["watch_enabled"] = en; save_config(self.cfg)
-        self._restart_watchers_runtime()
-
-    def _toggle_steamdb_detection(self):
-        self.cfg["steamdb_detection_enabled"] = self._steamdb_detection_var.get() == "on"
-        _SAVE_DETECTION_CACHE.clear()
-        save_config(self.cfg)
-
-    def _auto_detect_cloud(self):
-        path = detect_cloud_folder()
-        if path:
-            self._sync_folder_e.delete(0, "end")
-            self._sync_folder_e.insert(0, path)
-            self._apply_sync_folder()
-            self._show_info(self.t("detect_success_title"),
-                            self.t("detect_success_body", path=path))
-        else:
-            self._show_info(self.t("detect_fail_title"),
-                            self.t("detect_fail_body"))
-
-    def _toggle_sync(self):
-        en = self._sync_var.get() == "on"
-        self.cfg["sync_enabled"] = en; save_config(self.cfg)
-        self._restart_sync_runtime()
+    def _on_del_bk_done(self):
+        self._set_io_busy(False)
+        self._invalidate_game_backup_count_cache()
+        self._refresh_backup_list()
 
     # ─── 设置 ───
     def _build_settings_frame(self):
@@ -9848,27 +9641,584 @@ class SteamSaveManager(ctk.CTk):
             command=self._show_about_dialog
         ).grid(row=13, column=0, padx=22, pady=(0, 18), sticky="w")
 
-    def _tray_show(self, *a):
-        if hasattr(self, "_tray") and self._tray:
-            self._tray.stop()
-            self._tray = None
-        def _show():
-            self.deiconify()
-            self.lift()
-            self.focus_force()
-            self._restore_popup_windows()
-        self.after(0, _show)
 
-    def _tray_show_about(self, *a):
-        self.after(0, self._show_about_dialog)
 
-    def _tray_quit(self, *a):
-        if hasattr(self, "_tray") and self._tray:
-            self._tray.stop()
-            self._tray = None
-        self._stop_auto_backup(); self._stop_watchers()
+    def _set_entry_value(self, entry, value):
+        entry.delete(0, "end")
+        entry.insert(0, str(value))
+
+    def _invoke_and_break(self, callback):
+        callback()
+        return "break"
+
+    def _bind_entry_apply(self, entry, callback):
+        entry.bind("<FocusOut>", lambda _e: callback())
+        entry.bind("<Return>", lambda _e: self._invoke_and_break(callback))
+
+    def _refresh_backup_storage_hint(self):
+        if hasattr(self, "_backup_current_path_label"):
+            self._backup_current_path_label.configure(
+                text=self.t("current_path", path=str(BACKUP_ROOT)))
+
+    def _restart_auto_backup_runtime(self):
+        if self.cfg.get("auto_backup_enabled"):
+            self._stop_auto_backup()
+            self._start_auto_backup()
+        else:
+            self._stop_auto_backup()
+
+    def _restart_watchers_runtime(self):
+        if self.cfg.get("watch_enabled"):
+            self._stop_watchers()
+            self._start_watchers()
+        else:
+            self._stop_watchers()
+
+    def _restart_sync_runtime(self):
+        if self.cfg.get("sync_enabled"):
+            self._stop_sync()
+            self._start_sync()
+            self._stop_game_monitor()
+            if self.cfg.get("sync_mode") == "smart":
+                self._start_game_monitor()
+        else:
+            self._stop_sync()
+            self._stop_game_monitor()
+
+    def _on_language_change(self, _value=None):
+        new_lang = self._language_code(self._language_var.get())
+        if new_lang == self.lang:
+            return
+        self.cfg["language"] = new_lang
+        self.lang = new_lang
+        save_config(self.cfg)
+        self._rebuild_ui(self._current_frame)
+
+    def _apply_steam_path(self):
+        self.cfg["steam_path"] = self._steam_e.get().strip()
+        save_config(self.cfg)
+        _SAVE_DETECTION_CACHE.clear()
+
+    def _apply_auto_backup_interval(self):
+        try:
+            value = max(1, int(self._int_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("auto_backup_interval", 30))
+        self._set_entry_value(self._int_e, value)
+        self.cfg["auto_backup_interval"] = value
+        save_config(self.cfg)
+        self._restart_auto_backup_runtime()
+
+    def _apply_watch_cooldown(self):
+        try:
+            value = max(10, int(self._cd_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("watch_cooldown", 60))
+        self._set_entry_value(self._cd_e, value)
+        self.cfg["watch_cooldown"] = value
+        save_config(self.cfg)
+        self._restart_watchers_runtime()
+
+    def _apply_sync_interval(self):
+        try:
+            value = max(1, int(self._sync_int_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("sync_interval", 10))
+        self._set_entry_value(self._sync_int_e, value)
+        self.cfg["sync_interval"] = value
+        save_config(self.cfg)
+        self._restart_sync_runtime()
+
+    def _apply_sync_folder(self):
+        self.cfg["sync_folder"] = self._sync_folder_e.get().strip()
+        save_config(self.cfg)
+
+    def _apply_sync_archive_keep(self):
+        try:
+            value = max(0, int(self._sync_archive_keep_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("sync_archive_keep", 3))
+        self._set_entry_value(self._sync_archive_keep_e, value)
+        self.cfg["sync_archive_keep"] = value
+        save_config(self.cfg)
+        enforce_all_sync_archive_limits(self.cfg)
+
+    def _on_sync_mode_change(self, _value=None):
+        self.cfg["sync_mode"] = self._sync_mode_code(self._sync_mode_var.get())
+        save_config(self.cfg)
+        self._restart_sync_runtime()
+        self._refresh_proc_status()
+
+    def _toggle_sync_notify(self):
+        self.cfg["sync_notify"] = self._sync_notify_var.get() == "on"
+        save_config(self.cfg)
+
+    # ─── WebDAV 设置 ───
+    def _webdav_preset_display(self, preset_code: str) -> str:
+        code = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
+        return self.t(f"webdav_preset_{code}")
+
+    def _webdav_preset_code(self, display_text: str) -> str:
+        for code in WEBDAV_PRESET_OPTIONS:
+            if display_text == self._webdav_preset_display(code):
+                return code
+        return "generic"
+
+    def _webdav_hint_for_preset(self, preset_code: str, username: str = "") -> str:
+        preset = preset_code if preset_code in WEBDAV_PRESET_OPTIONS else "generic"
+        if preset == "synology":
+            return "http://nas:5005 / https://nas:5006"
+        if preset == "qnap":
+            return "https://nas:5006/webdav"
+        if preset == "truenas":
+            return "https://nas/dav"
+        if preset == "nextcloud":
+            if username:
+                return f"https://cloud.example.com/remote.php/dav/files/{username}"
+            return "https://cloud.example.com/remote.php/dav/files/<username>"
+        if preset == "openmediavault":
+            if username:
+                return f"https://nas/remote.php/dav/files/{username}"
+            return "https://nas/remote.php/dav/files/<username>"
+        return "https://your-server.com/dav"
+
+    def _refresh_webdav_preset_hint(self):
+        if not hasattr(self, "_webdav_preset_hint"):
+            return
+        preset = str(self.cfg.get("webdav_preset", "generic") or "generic")
+        username = str(self.cfg.get("webdav_username", "") or "").strip()
+        self._webdav_preset_hint.configure(
+            text=self.t("webdav_preset_hint", hint=self._webdav_hint_for_preset(preset, username))
+        )
+
+    def _toggle_webdav(self):
+        en = self._webdav_var.get() == "on"
+        self.cfg["webdav_enabled"] = en
+        save_config(self.cfg)
+        if en:
+            self._webdav_fields.grid()
+        else:
+            self._webdav_fields.grid_remove()
+
+    def _on_webdav_preset_change(self, display_text):
+        self.cfg["webdav_preset"] = self._webdav_preset_code(display_text)
+        if hasattr(self, "_webdav_url_e"):
+            self._apply_webdav_url()
+        self._refresh_webdav_preset_hint()
+        save_config(self.cfg)
+
+    def _apply_webdav_url(self):
+        normalized = _webdav_normalize_url(
+            self._webdav_url_e.get().strip(),
+            str(self.cfg.get("webdav_preset", "generic") or "generic"),
+            str(self.cfg.get("webdav_username", "") or "").strip(),
+        )
+        self.cfg["webdav_url"] = normalized
+        if hasattr(self, "_webdav_url_e"):
+            self._webdav_url_e.delete(0, "end")
+            self._webdav_url_e.insert(0, normalized)
+        save_config(self.cfg)
+
+    def _apply_webdav_base_path(self):
+        self.cfg["webdav_base_path"] = _webdav_base_path({
+            "webdav_base_path": self._webdav_base_path_e.get().strip()
+        })
+        if hasattr(self, "_webdav_base_path_e"):
+            self._webdav_base_path_e.delete(0, "end")
+            self._webdav_base_path_e.insert(0, self.cfg["webdav_base_path"])
+        save_config(self.cfg)
+
+    def _apply_webdav_user(self):
+        self.cfg["webdav_username"] = self._webdav_user_e.get().strip()
+        if hasattr(self, "_webdav_url_e"):
+            self._apply_webdav_url()
+        self._refresh_webdav_preset_hint()
+        save_config(self.cfg)
+
+    def _apply_webdav_pass(self):
+        self.cfg["webdav_password"] = _webdav_encode_password(self._webdav_pass_e.get())
+        save_config(self.cfg)
+
+    def _toggle_webdav_verify_ssl(self):
+        self.cfg["webdav_verify_ssl"] = self._webdav_verify_ssl_var.get() == "on"
+        save_config(self.cfg)
+
+    def _test_webdav_connection(self):
+        url = self._webdav_url_e.get().strip()
+        user = self._webdav_user_e.get().strip()
+        password = self._webdav_pass_e.get()
+        if not url:
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                self.bi("请先输入 WebDAV 服务器地址", "Please enter a WebDAV server URL"))
+            return
+        self._webdav_status.configure(
+            text=self.t("webdav_testing"), text_color=C_SUBTLE_TEXT)
+        def _worker():
+            ok, msg = webdav_test_connection(
+                url, user, password,
+                preset=str(self.cfg.get("webdav_preset", "generic") or "generic"),
+                verify_ssl=bool(self.cfg.get("webdav_verify_ssl", True)),
+                base_path=str(self.cfg.get("webdav_base_path", "/SteamSaveSync") or "/SteamSaveSync"),
+            )
+            self.after(0, lambda: self._on_webdav_test_result(ok, msg))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_webdav_test_result(self, ok, msg):
+        if ok:
+            self._webdav_status.configure(
+                text=self.t("webdav_test_ok"), text_color="#10b981")
+        else:
+            self._webdav_status.configure(
+                text=f"{self.t('webdav_test_fail')}: {msg}", text_color="#ef4444")
+
+    def _toggle_minimize_to_tray(self):
+        self.cfg["minimize_to_tray"] = self._minimize_tray_var.get() == "on"
+        save_config(self.cfg)
+
+    def _apply_max_backups(self):
+        try:
+            value = max(0, int(self._max_bk_e.get().strip()))
+        except ValueError:
+            value = int(self.cfg.get("max_backups_per_game", 20))
+        self._set_entry_value(self._max_bk_e, value)
+        self.cfg["max_backups_per_game"] = value
+        save_config(self.cfg)
+        enforce_backup_limits()
+
+    def _apply_max_backup_size(self):
+        try:
+            value = max(0.0, float(self._max_size_e.get().strip()))
+        except ValueError:
+            value = float(self.cfg.get("max_backup_size_gb", 10.0))
+        self._set_entry_value(self._max_size_e, value)
+        self.cfg["max_backup_size_gb"] = value
+        save_config(self.cfg)
+        enforce_backup_limits()
+
+    def _apply_backup_path(self):
+        old_backup_root = globals()["BACKUP_ROOT"]
+        custom_bp = self._backup_path_e.get().strip()
+        new_backup_root = Path(custom_bp) if custom_bp else Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "backups"
+        try:
+            new_backup_root.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._show_error(self.t("settings_failed_title"), str(e))
+            self._set_entry_value(self._backup_path_e, self.cfg.get("backup_path", ""))
+            return
+        if os.path.normpath(str(old_backup_root)) != os.path.normpath(str(new_backup_root)):
+            if old_backup_root.exists() and any(old_backup_root.iterdir()):
+                if self._ask_yes_no(
+                        self.t("migrate_backups_title"),
+                        self.t("migrate_backups_prompt",
+                               old=old_backup_root, new=new_backup_root)):
+                    count = migrate_backups(old_backup_root, new_backup_root)
+                    self._show_info(
+                        self.t("migrate_backups_title"),
+                        self.t("migrate_backups_done", count=count))
+            globals()["BACKUP_ROOT"] = new_backup_root
+        self.cfg["backup_path"] = custom_bp
+        save_config(self.cfg)
+        self._refresh_backup_storage_hint()
+        enforce_backup_limits()
+
+    def _toggle_autostart(self):
+        en = self._autostart_var.get() == "on"
+        try:
+            set_autostart_enabled(en)
+            self.cfg["autostart"] = en
+            save_config(self.cfg)
+        except Exception as e:
+            self._show_error(self.t("settings_failed_title"), str(e))
+            self._autostart_var.set("on" if not en else "off")
+
+    def _on_theme(self, val):
+        t = self._theme_code(val)
+        ctk.set_appearance_mode(t)
+        self.cfg["theme"] = t; save_config(self.cfg)
+        # Update settings page canvas & scrollbar colors dynamically
+        try:
+            canvas = getattr(self, "_settings_scroll", None)
+            if canvas is not None:
+                mode = "light" if t == "light" else "dark"
+                canvas.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
+                for child in canvas.master.winfo_children():
+                    if isinstance(child, tkinter.Canvas) and child is not canvas:
+                        child.configure(bg=C_MAIN_BG[0 if t == "light" else 1])
+                        items = child.find_all()
+                        if len(items) >= 2:
+                            cols = {
+                                "light": {"track": "#e2e2e2", "thumb": "#c0c0c0"},
+                                "dark":  {"track": "#333348", "thumb": "#555568"},
+                            }[mode]
+                            child.itemconfigure(items[0], fill=cols["track"])
+                            child.itemconfigure(items[1], fill=cols["thumb"])
+        except Exception:
+            pass
+
+    def _toggle_auto(self):
+        en = self._auto_var.get() == "on"
+        self.cfg["auto_backup_enabled"] = en; save_config(self.cfg)
+        self._restart_auto_backup_runtime()
+        self._update_status()
+
+    def _toggle_watch(self):
+        en = self._watch_var.get() == "on"
+        self.cfg["watch_enabled"] = en; save_config(self.cfg)
+        self._restart_watchers_runtime()
+
+    def _toggle_steamdb_detection(self):
+        self.cfg["steamdb_detection_enabled"] = self._steamdb_detection_var.get() == "on"
+        _SAVE_DETECTION_CACHE.clear()
+        save_config(self.cfg)
+
+    def _auto_detect_cloud(self):
+        path = detect_cloud_folder()
+        if path:
+            self._sync_folder_e.delete(0, "end")
+            self._sync_folder_e.insert(0, path)
+            self._apply_sync_folder()
+            self._show_info(self.t("detect_success_title"),
+                            self.t("detect_success_body", path=path))
+        else:
+            self._show_info(self.t("detect_fail_title"),
+                            self.t("detect_fail_body"))
+
+    def _toggle_sync(self):
+        en = self._sync_var.get() == "on"
+        self.cfg["sync_enabled"] = en; save_config(self.cfg)
+        self._restart_sync_runtime()
+
+    def _manual_sync_all(self):
+        if self._io_busy: return
+        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
+        if not sf:
+            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+            if issue == "webdav_component_missing":
+                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+            elif issue == "webdav_url_missing":
+                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+            else:
+                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                msg,
+            )
+            return
+        games = self.cfg.get("games", [])
+        if not games:
+            self._show_info(self.bi("提示", "Notice"), self.bi("请先添加游戏", "Please add a game first")); return
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                results = sync_all_games(self.cfg)
+                self.after(0, lambda: self._on_sync_all_done(results))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_sync_failed(err))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_all_done(self, results):
+        self._set_io_busy(False)
+        lines = [self.bi(f"{name}：{msg}", f"{name}: {msg}") for name, msg in results]
+        self._show_info(self.bi("同步完成", "Sync Complete"), "\n".join(lines))
+        conflict_keys = {
+            get_game_sync_key(game)
+            for game in self.cfg.get("games", [])
+            if get_game_sync_state(self.cfg, game).get("pending_conflict")
+        }
+        for game in self.cfg.get("games", []):
+            if get_game_sync_key(game) in conflict_keys:
+                self._show_sync_conflict_dialog(game)
+
+    def _on_sync_failed(self, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"同步过程中出错：\n{err}", f"An error occurred during sync:\n{err}"))
+
+    def _manual_sync_one(self, idx):
+        if self._io_busy: return
+        g = dict(self.cfg["games"][idx])
+        sf = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
+        if not sf:
+            issue = get_sync_backend_issue(self.cfg.get("sync_folder", ""), self.cfg)
+            if issue == "webdav_component_missing":
+                msg = self.bi("WebDAV 已启用，但当前运行环境缺少 webdavclient3 组件", "WebDAV is enabled, but webdavclient3 is unavailable in the current runtime")
+            elif issue == "webdav_url_missing":
+                msg = self.bi("WebDAV 已启用，但服务器地址为空", "WebDAV is enabled, but the server URL is empty")
+            else:
+                msg = self.bi("请先配置同步文件夹或启用 WebDAV 远程同步", "Please configure a sync folder or enable WebDAV remote sync")
+            self._show_warning(
+                self.bi("提示", "Notice"),
+                msg,
+            )
+            return
+        mode = self.cfg.get("sync_mode", "bidirectional")
+        game_name = g.get("name", "")
+        self._set_io_busy(True)
+        def _worker():
+            try:
+                r = sync_game_save(g, sf, mode, cfg=self.cfg)
+                self.after(0, lambda: self._on_sync_one_done(game_name, r, idx))
+            except Exception as e:
+                self.after(0, lambda err=f"{type(e).__name__}: {e}", name=game_name:
+                    self._on_sync_one_failed(name, err))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_one_done(self, game_name, result, idx):
+        self._set_io_busy(False)
+        if result.startswith("冲突：") or result.startswith("Conflict:"):
+            live_game = self.cfg["games"][idx] if idx < len(self.cfg["games"]) else None
+            if live_game:
+                self._show_sync_conflict_dialog(live_game)
+        else:
+            self._show_info(self.bi("同步结果", "Sync Result"), self.bi(f"「{game_name}」{result}", f"{game_name}: {result}"))
+
+    def _on_sync_one_failed(self, game_name, err):
+        self._set_io_busy(False)
+        self._show_error(self.bi("同步失败", "Sync Failed"), self.bi(f"「{game_name}」同步出错：\n{err}", f"Sync failed for {game_name}:\n{err}"))
+
+    # ─── 定时备份 ───
+    def _start_auto_backup(self):
+        if self.auto_backup_running: return
+        self._stop_event.clear()
+        self.auto_backup_running = True
+        threading.Thread(target=self._auto_loop, daemon=True).start()
+        self._update_status()
+
+    def _stop_auto_backup(self):
+        self._stop_event.set()
+        self.auto_backup_running = False
+        self._update_status()
+
+    def _auto_loop(self):
+        while not self._stop_event.is_set():
+            iv = self.cfg.get("auto_backup_interval", 30) * 60
+            self._stop_event.wait(iv)
+            if self._stop_event.is_set(): break
+            running_appids = set()
+            try:
+                if self._game_monitor:
+                    running_appids = self._game_monitor._find_running_games()
+                else:
+                    running_appids = GameProcessMonitor(self.cfg)._find_running_games()
+            except Exception:
+                running_appids = set()
+            for g in self.cfg.get("games", []):
+                if not g.get("auto_backup", True):
+                    continue
+                appid = str(g.get("appid", "") or "").strip()
+                if not appid or appid not in running_appids:
+                    continue
+                create_backup(g, self.bi("定时自动备份", "Scheduled Backup"))
+
+    def _update_status(self):
+        if self.cfg.get("auto_backup_enabled"):
+            iv = self.cfg.get("auto_backup_interval", 30)
+            self._status_label.configure(
+                text=self.t("status_auto_on", minutes=iv), text_color=BTN_SUCCESS)
+        else:
+            self._status_label.configure(
+                text=self.t("status_auto_off"), text_color=C_SUBTLE_TEXT)
+
+    # ─── 自动同步 ───
+    def _start_sync(self):
+        if hasattr(self, "_sync_running") and self._sync_running:
+            return
+        self._sync_stop = threading.Event()
+        self._sync_running = True
+        # smart 模式不需要定时同步，由进程监控触发
+        if self.cfg.get("sync_mode") != "smart":
+            threading.Thread(target=self._sync_loop, daemon=True).start()
+
+    def _stop_sync(self):
+        if hasattr(self, "_sync_stop"):
+            self._sync_stop.set()
+        self._sync_running = False
+
+    def _sync_loop(self):
+        while not self._sync_stop.is_set():
+            iv = self.cfg.get("sync_interval", 10) * 60
+            self._sync_stop.wait(iv)
+            if self._sync_stop.is_set():
+                break
+            try:
+                run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""))
+                results = sync_all_games(self.cfg, auto=True)
+                for game in self.cfg.get("games", []):
+                    state = get_game_sync_state(self.cfg, game)
+                    if state.get("pending_conflict"):
+                        self._enqueue_sync_conflict_dialog(game)
+                if self.cfg.get("sync_notify", True):
+                    synced = [
+                        self.bi(f"{n}：{m}", f"{n}: {m}")
+                        for n, m in results
+                        if "跳过" not in m
+                        and "无需" not in m
+                        and "Skipped:" not in m
+                        and "No need" not in m
+                        and not m.startswith("冲突：")
+                        and not m.startswith("Conflict:")
+                    ]
+                    if synced:
+                        send_desktop_notification(
+                            self.bi("存档管家 · 自动同步完成", "Steam Save Manager · Auto Sync Complete"),
+                            self.bi("；", "; ").join(synced[:3]))
+            except Exception:
+                pass
+
+    # ─── 智能云存档进程监控 ───
+    def _start_game_monitor(self):
         self._stop_game_monitor()
-        self.after(0, self.destroy)
+        self._game_monitor = GameProcessMonitor(self.cfg)
+        self._game_monitor.start()
+
+    def _stop_game_monitor(self):
+        if self._game_monitor:
+            self._game_monitor.stop()
+            self._game_monitor = None
+
+    # ─── 文件监控 ───
+    def _start_watchers(self):
+        if not HAS_WATCHDOG: return
+        self._stop_watchers()
+        cd = self.cfg.get("watch_cooldown", 60)
+        observer = Observer()
+        handler_count = 0
+        for g in self.cfg.get("games", []):
+            if not g.get("auto_backup", True):
+                continue
+            for save_path in get_game_save_paths(g, existing_only=True):
+                handler = SaveChangeHandler(g, cd)
+                observer.schedule(handler, save_path, recursive=True)
+                self._watch_handlers.append(handler)
+                handler_count += 1
+        if handler_count:
+            observer.start()
+            self._watchers.append(observer)
+
+    def _stop_watchers(self):
+        for obs in self._watchers:
+            try:
+                obs.stop()
+            except Exception:
+                pass
+        for obs in self._watchers:
+            try:
+                obs.join(timeout=1.0)
+            except Exception:
+                pass
+        self._watchers.clear()
+        self._watch_handlers.clear()
+
+    # ─── 系统托盘 & 关闭 ───
+    def _on_close(self):
+        if self.cfg.get("minimize_to_tray", True) and HAS_TRAY:
+            self.withdraw()
+            self._create_tray()
+            return
+        self._stop_auto_backup()
+        self._stop_watchers()
+        self._stop_game_monitor()
+        self.destroy()
 
     def _create_tray(self):
         if not HAS_TRAY: return
@@ -9912,324 +10262,32 @@ class SteamSaveManager(ctk.CTk):
         self._tray = tray_cls(APP_NAME, img, APP_NAME, menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
-    # ─── 系统托盘 & 关闭 ───
-    def _on_close(self):
-        if self.cfg.get("minimize_to_tray", True) and HAS_TRAY:
-            self.withdraw()
-            self._create_tray()
-            return
-        self._stop_auto_backup()
-        self._stop_watchers()
+    def _tray_show(self, *a):
+        if hasattr(self, "_tray") and self._tray:
+            self._tray.stop()
+            self._tray = None
+        def _show():
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+            self._restore_popup_windows()
+        self.after(0, _show)
+
+    def _tray_show_about(self, *a):
+        self.after(0, self._show_about_dialog)
+
+    def _tray_quit(self, *a):
+        if hasattr(self, "_tray") and self._tray:
+            self._tray.stop()
+            self._tray = None
+        self._stop_auto_backup(); self._stop_watchers()
         self._stop_game_monitor()
-        self.destroy()
-    def __init__(self):
-        super().__init__()
-        self.cfg = load_config()
-        clear_startup_caches(self.cfg)
-        self.lang = normalize_language(self.cfg.get("language"))
-        self.auto_backup_running = False
-        self._stop_event = threading.Event()
-        self._watchers: list[Observer] = []
-        self._watch_handlers: list[SaveChangeHandler] = []
-        self._detail_refresh_job = None  # 详情页自动刷新定时器
-        self._sync_ui_queue: queue.Queue = queue.Queue()
-        self._open_conflict_dialogs: set[str] = set()
-        self._current_frame = "home"
-        self._about_update_status_label = None
-        self._about_update_btn = None
-        self._about_dialog = None
-        self._sidebar_version_label = None
-        self._sidebar_version_text = f"v{VERSION}"
-        self._sidebar_version_color = ("#cbd5e1", "#3f3f46")
-        self._update_manifest_cache: Optional[dict] = None
-        self._scan_results: list[dict] = []
-        self._scan_lib_folders: list[str] = []
-        self._scan_choice_vars: dict[str, ctk.StringVar] = {}
-        self._scan_cards: dict[str, dict] = {}
-        self._scan_info_banner = None
-        self._scan_empty_label = None
-        self._scan_search_job = None
-        self._games_search_job = None
-        self._game_backup_count_cache: dict[str, int] = {}
-        self._game_backups_cache: dict[str, list] = {}
-        self._recent_backups_cache: dict[int, list] = {}
-        self._game_detail_metrics_cache: dict[str, dict] = {}
-        self._game_cards: dict[str, dict] = {}
-        self._games_empty_label = None
-        self._home_recent_rows: dict[str, dict] = {}
-        self._home_recent_empty_label = None
-        self._backup_rows: dict[str, dict] = {}
-        self._backup_empty_label = None
-        self._scan_in_progress = False
-        self._scan_worker_count = 0
-        self._scan_storage_profile = "unknown"
-        self._scan_start_btn = None
-        self._scan_add_all_btn = None
-        self._io_busy = False
-        self._popup_windows: weakref.WeakSet = weakref.WeakSet()
-        self._popup_restore_grab: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self.after(0, self.destroy)
 
-        self.title(self.t("product_title"))
-        self.geometry("1080x720")
-        self.minsize(920, 620)
-        self._center_main_window()
-        ctk.set_appearance_mode(self.cfg.get("theme", "light"))
-        ctk.set_default_color_theme("blue")
-        self.configure(fg_color=C_MAIN_BG)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.bind("<Map>", self._on_root_map, add="+")
-
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        self._build_sidebar()
-        self._frames: dict[str, ctk.CTkFrame] = {}
-        self._build_home_frame()
-        self._build_scan_frame()
-        self._build_games_frame()
-        self._build_backup_frame()
-        self._build_settings_frame()
-        self._build_game_detail_frame()
-        self._show_frame("home")
-
-        if self.cfg.get("auto_backup_enabled"):
-            self._start_auto_backup()
-        if self.cfg.get("watch_enabled"):
-            self._start_watchers()
-        if self.cfg.get("sync_enabled"):
-            self._start_sync()
-
-        # 智能云存档进程监控
-        self._game_monitor: Optional[GameProcessMonitor] = None
-        self._ensure_game_monitor()
-        self.after(1200, self._drain_sync_ui_queue)
-        self.after(1800, self._check_for_updates_silent)
-
-    def t(self, key: str, **kwargs) -> str:
-        return translate(self.lang, key, **kwargs)
-
-    def bi(self, zh: str, en: str) -> str:
-        return bilingual_text(self.lang, zh, en)
-
-    def _language_code(self, display: str) -> str:
-        for code, label in LANGUAGE_NAMES.items():
-            if label == display:
-                return code
-        return "en"
-
-    def _add_from_scan(self, appid, name, save_path):
-        games = self.cfg.setdefault("games", [])
-        if any(g.get("appid") == appid for g in games):
-            self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
-            return
-        save_paths = self._collect_scan_add_paths(appid, save_path)
-        game = {"appid": appid, "name": name}
-        save_specs = self._collect_scan_add_specs(appid, save_path)
-        if save_specs:
-            set_game_save_specs(game, save_specs)
-        else:
-            set_game_save_paths(game, save_paths if save_paths else [save_path])
-        result = next((r for r in self._scan_results if r.get("appid") == appid), None)
-        if result and result.get("library_path"):
-            game["library_path"] = result.get("library_path", "")
-        games.append(game)
-        remember_recognition_path(self.cfg, appid, name, game.get("save_path", ""))
-        save_config(self.cfg)
-        self._refresh_games_list()
-        self._render_scan_results()
-        if len(game.get("save_paths", [])) > 1:
-            self._show_info(
-                self.bi("成功", "Success"),
-                self.bi(
-                    f"已添加「{name}」，共 {len(game['save_paths'])} 个存档目录",
-                    f"Added {name} with {len(game['save_paths'])} save folders",
-                ),
-            )
-        else:
-            self._show_info(self.bi("成功", "Success"), self.bi(f"已添加「{name}」", f"Added {name}"))
-
-    def _manual_add_from_scan(self, appid, name):
-        d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
-        if d:
-            self._add_from_scan(appid, name, d)
-
-    def _override_scan_result_path(self, appid, name):
-        d = self._ask_directory(title=self.bi(f"选择「{name}」的存档文件夹", f"Choose the save folder for {name}"))
-        if not d:
-            return
-        norm = os.path.normpath(d)
-        for result in self._scan_results:
-            if result.get("appid") != appid:
-                continue
-            existing_paths = [os.path.normpath(p) for p in result.get("save_paths", [])]
-            if norm in existing_paths:
-                idx = existing_paths.index(norm)
-                if idx != 0:
-                    result["save_paths"].insert(0, result["save_paths"].pop(idx))
-                    candidates = result.get("save_candidates", [])
-                    if idx < len(candidates):
-                        candidates.insert(0, candidates.pop(idx))
-            else:
-                result.setdefault("save_paths", [])
-                result["save_paths"] = [norm] + [p for p in result["save_paths"] if os.path.normpath(p) != norm]
-                result.setdefault("save_candidates", [])
-                result["save_candidates"] = [{
-                    "path": norm,
-                    "score": 999,
-                    "source": "manual",
-                    "confidence": "high",
-                    "reasons": ["manual"],
-                }] + [c for c in result["save_candidates"] if os.path.normpath(c.get("path", "")) != norm]
-            break
-        self._render_scan_results()
-
-    def _delete_game(self, idx):
-        g = self.cfg["games"][idx]
-        n = g["name"]
-        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi(f"删除「{n}」？（备份保留）", f"Delete {n}? Existing backups will be kept.")):
-            clear_game_sync_state(self.cfg, g)
-            self.cfg["games"].pop(idx)
-            self._invalidate_game_backup_count_cache()
-            save_config(self.cfg); self._refresh_games_list()
-
-    def _del_bk_from_popup(self, backup, dialog):
-        """从弹窗中删除备份"""
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("确定删除此备份？", "Delete this backup?")):
-            backup_path = backup["path"]
-            detail_idx = self._detail_idx
-            self._set_io_busy(True)
-            def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_popup_done(detail_idx, dialog))
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_del_bk_popup_done(self, idx, dialog):
-        self._set_io_busy(False)
-        dialog.destroy()
-        self._show_backup_history()
-        self._show_game_detail(idx)
-
-    def _start_detail_refresh(self):
-        """启动详情页自动刷新定时器（每 15 秒检查备份变化）"""
-        self._stop_detail_refresh()
-        def _tick():
-            if hasattr(self, '_detail_idx'):
-                try:
-                    idx = self._detail_idx
-                    g = self.cfg["games"][idx]
-                    backups = get_backups(g["name"])
-                    current_text = self._detail_stats["backups"].cget("text")
-                    if str(len(backups)) != current_text:
-                        self._show_game_detail(idx)
-                        return
-                    # 同时刷新进程状态
-                    self._refresh_proc_status()
-                except Exception:
-                    pass
-            self._detail_refresh_job = self.after(15000, _tick)
-        self._detail_refresh_job = self.after(15000, _tick)
-
-    def _backup_from_detail(self, idx):
-        if self._io_busy:
-            self._notify_io_busy()
-            return
-        g = dict(self.cfg["games"][idx])
-        note = self._input_dialog(
-            title=self.bi("备注", "Note"),
-            text=self.bi(f"为「{g['name']}」备份添加备注（可选）：", f"Add an optional note for the backup of {g['name']}:"))
-        detail_idx = self._detail_idx
-        self._set_io_busy(True)
-        def _worker():
-            try:
-                r = create_backup(g, note)
-                self.after(0, lambda: self._on_backup_detail_done(r, detail_idx))
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._on_backup_failed(err, detail_idx))
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_backup_detail_done(self, result, idx):
-        self._set_io_busy(False)
-        if result:
-            if idx < len(self.cfg.get("games", [])):
-                self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
-            self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
-            self._show_game_detail(idx)
-        else:
-            self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
-
-    def _delete_game_from_detail(self, idx):
-        n = self.cfg["games"][idx]["name"]
-        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi(f"删除「{n}」？（备份保留）", f"Delete {n}? Existing backups will be kept.")):
-            self.cfg["games"].pop(idx)
-            save_config(self.cfg)
-            self._show_frame("games")
-
-    def _on_restore_detail_done(self, idx):
-        self._set_io_busy(False)
-        if idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
-        self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
-        self._show_game_detail(idx)
-
-    def _restore_from_detail(self, b, game):
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认还原", "Confirm Restore"),
-                self.bi(f"还原此存档？\n时间：{self._fmt_ts(b['timestamp'])}\n当前存档会自动安全备份",
-                        f"Restore this save?\nTime: {self._fmt_ts(b['timestamp'])}\nYour current save will be backed up automatically first")):
-            backup_path = b["path"]
-            game_copy = dict(game)
-            detail_idx = self._detail_idx
-            self._set_io_busy(True)
-            def _worker():
-                try:
-                    targets = get_game_save_specs(game_copy, existing_only=False)
-                    restore_backup(backup_path, targets if targets else game_copy.get("save_path", ""))
-                    self.after(0, lambda: self._on_restore_detail_done(detail_idx))
-                except Exception as e:
-                    self.after(0, lambda err=str(e): self._on_restore_failed(err))
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_del_bk_detail_done(self, idx):
-        self._set_io_busy(False)
-        if idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
-        self._show_game_detail(idx)
-
-    def _del_bk_from_detail(self, b):
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
-            backup_path = b["path"]
-            detail_idx = self._detail_idx
-            self._set_io_busy(True)
-            def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_detail_done(detail_idx))
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _del_bk(self, b):
-        if self._io_busy: return
-        if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
-            backup_path = b["path"]
-            self._set_io_busy(True)
-            def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_done())
-            threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_del_bk_done(self):
-        self._set_io_busy(False)
-        self._invalidate_game_backup_count_cache()
-        self._refresh_backup_list()
-
-    def _on_language_change(self, _value=None):
-        new_lang = self._language_code(self._language_var.get())
-        if new_lang == self.lang:
-            return
-        self.cfg["language"] = new_lang
-        self.lang = new_lang
-        save_config(self.cfg)
-        self._rebuild_ui(self._current_frame)
+    @staticmethod
+    def _fmt_ts(ts: str) -> str:
+        try: return datetime.datetime.strptime(ts, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+        except: return ts
 
 
 # ══════════════════════════════════════════════
