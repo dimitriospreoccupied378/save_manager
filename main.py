@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.3.2 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.4 — 通用版"""
 
 import os
 import sys
@@ -26,7 +26,8 @@ import urllib.parse
 import html
 import tkinter
 import weakref
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 try:
@@ -79,7 +80,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.3.2"
+VERSION = "1.3.4"
 APP_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 LEGACY_CONFIG_DIR = Path.home() / ".steam_save_manager"
 STARTUP_AUTOSTART_FLAG = "--startup-launch"
@@ -983,8 +984,13 @@ def get_steam_user_ids(steam_path: str) -> list[str]:
     userdata = os.path.join(steam_path, "userdata")
     if not os.path.isdir(userdata):
         return []
-    return [d for d in os.listdir(userdata)
-            if os.path.isdir(os.path.join(userdata, d)) and d.isdigit()]
+    return sorted(
+        [
+            d for d in os.listdir(userdata)
+            if os.path.isdir(os.path.join(userdata, d)) and d.isdigit()
+        ],
+        key=lambda item: int(item),
+    )
 
 
 def _accountid_from_steam64(steamid64: str) -> str:
@@ -2015,6 +2021,87 @@ def set_game_save_paths(game: dict, paths: list[str]):
     set_game_save_specs(game, rebuilt_specs)
 
 
+def get_game_uid(game: Optional[dict]) -> str:
+    if not isinstance(game, dict):
+        return ""
+    return str(game.get("game_uid", "") or "").strip()
+
+
+def _build_game_storage_key(name: str, uid: str) -> str:
+    base = sanitize(str(name or "")).strip() or "game"
+    uid_part = re.sub(r"[^a-zA-Z0-9]+", "", str(uid or "").strip())[:8]
+    if uid_part:
+        return f"{base}__{uid_part}"
+    return base
+
+
+def ensure_game_storage_identity(game: Optional[dict]) -> str:
+    if not isinstance(game, dict):
+        return ""
+    uid = get_game_uid(game)
+    if not uid:
+        uid = uuid.uuid4().hex
+        game["game_uid"] = uid
+    storage_key = str(game.get("storage_key", "") or "").strip()
+    if not storage_key:
+        storage_key = _build_game_storage_key(game.get("name", ""), uid)
+        game["storage_key"] = storage_key
+    return storage_key
+
+
+def get_game_storage_key(game_or_name, game_uid: str = "", storage_key: str = "") -> str:
+    if isinstance(game_or_name, dict):
+        existing = str(game_or_name.get("storage_key", "") or "").strip()
+        if existing:
+            return existing
+        uid = get_game_uid(game_or_name)
+        if uid:
+            return _build_game_storage_key(game_or_name.get("name", ""), uid)
+        return sanitize(str(game_or_name.get("name", "") or "")).strip() or "game"
+    name = str(game_or_name or "").strip()
+    if storage_key:
+        return str(storage_key).strip()
+    if game_uid:
+        return _build_game_storage_key(name, game_uid)
+    return sanitize(name).strip() or "game"
+
+
+def _normalize_spec_signature(specs: list[dict]) -> tuple:
+    return tuple(
+        (
+            os.path.normcase(spec["base"]),
+            tuple(p.lower() for p in spec.get("includes", [])),
+            bool(spec.get("recursive", True)),
+        )
+        for spec in _normalize_unique_save_specs(specs)
+    )
+
+
+def game_matches_save_target(existing_game: Optional[dict], appid: str,
+                             save_specs: Optional[list[dict]] = None,
+                             save_paths: Optional[list[str]] = None) -> bool:
+    if not isinstance(existing_game, dict):
+        return False
+    if str(existing_game.get("appid", "") or "").strip() != str(appid or "").strip():
+        return False
+    existing_specs = get_game_save_specs(existing_game, existing_only=False)
+    if save_specs:
+        return _normalize_spec_signature(existing_specs) == _normalize_spec_signature(save_specs)
+    return _normalize_unique_paths(get_game_save_paths(existing_game, existing_only=False)) == _normalize_unique_paths(save_paths or [])
+
+
+def get_game_cache_key(game_or_name) -> str:
+    if isinstance(game_or_name, dict):
+        storage_key = str(game_or_name.get("storage_key", "") or "").strip()
+        if storage_key:
+            return f"storage:{storage_key}"
+        uid = get_game_uid(game_or_name)
+        if uid:
+            return f"uid:{uid}"
+        return get_game_sync_key(game_or_name)
+    return f"name:{str(game_or_name or '').strip()}"
+
+
 def _save_spec_covers_entire_dir(spec: dict) -> bool:
     includes = spec.get("includes", [])
     return bool(spec.get("recursive", True)) and not includes
@@ -2092,10 +2179,10 @@ def compute_save_spec_hash(specs: list[dict]) -> str:
     h = hashlib.md5()
     all_files = []
     for idx, spec, abs_f, rel in iter_save_spec_files(specs):
-        all_files.append((idx, spec["base"], rel, str(abs_f)))
-    all_files.sort(key=lambda item: (item[0], item[2].lower(), item[3].lower()))
-    for idx, base, rel, file_path in all_files:
-        h.update(f"{idx}:{os.path.normcase(base)}:{rel}".encode("utf-8", errors="ignore"))
+        all_files.append((idx, rel, str(abs_f)))
+    all_files.sort(key=lambda item: (item[0], item[1].lower(), item[2].lower()))
+    for idx, rel, file_path in all_files:
+        h.update(f"{idx}:{rel}".encode("utf-8", errors="ignore"))
         _streaming_file_hash(file_path, h)
     return h.hexdigest()
 
@@ -2249,7 +2336,17 @@ def _steam64_from_accountid(accountid: str) -> str:
 
 
 def _preferred_steam_account_ids(cfg: Optional[dict], steam_path: str) -> list[str]:
-    return []
+    if not steam_path:
+        return []
+    accounts = get_steam_accounts(steam_path)
+    ordered = [
+        str(item.get("accountid", "") or "").strip()
+        for item in accounts
+        if str(item.get("accountid", "") or "").strip()
+    ]
+    if ordered:
+        return ordered
+    return get_steam_user_ids(steam_path)
 
 
 
@@ -2393,7 +2490,8 @@ def fetch_steamdb_ufs_templates(appid: str) -> list[str]:
 def expand_steamdb_template(template: str, appid: str,
                             install_dir: str = "", steam_path: str = "",
                             library_path: str = "",
-                            preferred_accountids: Optional[list[str]] = None) -> list[str]:
+                            preferred_accountids: Optional[list[str]] = None,
+                            include_missing: bool = False) -> list[str]:
     if not template:
         return []
     library_root = _get_steam_library_root(install_dir, steam_path, library_path)
@@ -2480,10 +2578,15 @@ def expand_steamdb_template(template: str, appid: str,
     for candidate in expanded:
         if any(token in candidate for token in ("{Steam3AccountID}", "{64BitSteamID}")):
             continue
+        if re.search(r"%[^%]+%|\[[^\]]+\]|\{[^}]+\}", candidate):
+            continue
         norm = os.path.normpath(candidate)
-        if norm not in seen and os.path.exists(norm):
-            seen.add(norm)
-            final.append(norm)
+        if norm in seen:
+            continue
+        if not include_missing and not os.path.exists(norm):
+            continue
+        seen.add(norm)
+        final.append(norm)
     return final
 
 
@@ -3148,25 +3251,38 @@ def detect_save_candidates(appid: str, game_name: str,
         os.path.normpath(install_dir or ""),
         os.path.normpath(steam_path or ""),
         os.path.normpath(library_path or ""),
-        str((cfg or {}).get("steam_account_id", "") or "").strip(),
         "steamdb:on" if cfg and cfg.get("steamdb_detection_enabled") else "steamdb:off",
         get_cached_recognition_path(cfg, appid, game_name),
         "|".join(sorted(get_recognition_blacklist(cfg, appid, game_name))),
     ])
     cached_candidates = _SAVE_DETECTION_CACHE.get(cache_key)
     if cached_candidates:
-        valid = [c for c in cached_candidates if os.path.exists(c.get("path", ""))]
+        valid = [
+            c for c in cached_candidates
+            if os.path.exists(c.get("path", "")) or not c.get("materialized", True)
+        ]
         if valid:
             return [dict(c) for c in valid]
 
     scored: dict[str, dict] = {}
     blacklist = get_recognition_blacklist(cfg, appid, game_name)
 
-    def _add(path: str, score: int, source: str, save_specs: Optional[list[dict]] = None):
+    def _add(path: str, score: int, source: str,
+             save_specs: Optional[list[dict]] = None,
+             allow_missing: bool = False):
         norm = os.path.normpath(path)
-        if not norm or norm in blacklist or not os.path.exists(norm):
+        exists_flag = os.path.exists(norm)
+        if not norm or norm in blacklist or (not exists_flag and not allow_missing):
             return
-        detail = inspect_save_candidate(norm, game_name, install_dir)
+        if exists_flag:
+            detail = inspect_save_candidate(norm, game_name, install_dir)
+        else:
+            detail = {
+                "score": -6,
+                "confidence": "medium" if source in {"steamdb", "appinfo"} else "low",
+                "reasons": ["known-template", "not-materialized"],
+                "signals": {},
+            }
         if not should_accept_candidate(source, score, detail):
             return
         total = score + detail["score"]
@@ -3177,13 +3293,23 @@ def detect_save_candidates(appid: str, game_name: str,
             "source": source,
             "confidence": detail["confidence"],
             "reasons": [source] + detail["reasons"],
+            "materialized": exists_flag,
         }
         if save_specs:
             entry["save_specs"] = _normalize_unique_save_specs(save_specs)
-        if existing is None or total > existing["score"]:
+        if existing is None:
             scored[norm] = entry
-        elif save_specs and not existing.get("save_specs"):
-            existing["save_specs"] = _normalize_unique_save_specs(save_specs)
+            return
+        existing["reasons"] = list(dict.fromkeys(list(existing.get("reasons", [])) + entry["reasons"]))
+        existing["materialized"] = bool(existing.get("materialized", True) or exists_flag)
+        if save_specs:
+            existing["save_specs"] = _normalize_unique_save_specs(
+                list(existing.get("save_specs", []) or []) + list(entry.get("save_specs", []) or [])
+            )
+        if total > existing["score"]:
+            existing["score"] = total
+            existing["source"] = source
+            existing["confidence"] = detail["confidence"]
 
     steamdb_enabled = bool(cfg and cfg.get("steamdb_detection_enabled"))
 
@@ -3194,11 +3320,22 @@ def detect_save_candidates(appid: str, game_name: str,
 
     steamdb_candidates: dict[str, dict] = {}
 
-    def _collect_steamdb_candidate(path: str, score: int = 92, save_specs: Optional[list[dict]] = None):
+    def _collect_steamdb_candidate(path: str, score: int = 92,
+                                   save_specs: Optional[list[dict]] = None,
+                                   allow_missing: bool = False):
         norm = os.path.normpath(path)
-        if not norm or norm in blacklist or not os.path.exists(norm):
+        exists_flag = os.path.exists(norm)
+        if not norm or norm in blacklist or (not exists_flag and not allow_missing):
             return
-        detail = inspect_save_candidate(norm, game_name, install_dir)
+        if exists_flag:
+            detail = inspect_save_candidate(norm, game_name, install_dir)
+        else:
+            detail = {
+                "score": -6,
+                "confidence": "medium",
+                "reasons": ["known-template", "not-materialized"],
+                "signals": {},
+            }
         if not should_accept_candidate("steamdb", score, detail):
             return
         total = score + detail["score"]
@@ -3209,27 +3346,36 @@ def detect_save_candidates(appid: str, game_name: str,
             "source": "steamdb",
             "confidence": detail["confidence"],
             "reasons": ["steamdb"] + detail["reasons"],
+            "materialized": exists_flag,
         }
         if save_specs:
             entry["save_specs"] = _normalize_unique_save_specs(save_specs)
-        if existing is None or total > existing["score"]:
+        if existing is None:
             steamdb_candidates[norm] = entry
-        elif save_specs and not existing.get("save_specs"):
-            existing["save_specs"] = _normalize_unique_save_specs(save_specs)
+            return
+        existing["reasons"] = list(dict.fromkeys(list(existing.get("reasons", [])) + entry["reasons"]))
+        existing["materialized"] = bool(existing.get("materialized", True) or exists_flag)
+        if save_specs:
+            existing["save_specs"] = _normalize_unique_save_specs(
+                list(existing.get("save_specs", []) or []) + list(entry.get("save_specs", []) or [])
+            )
+        if total > existing["score"]:
+            existing["score"] = total
+            existing["confidence"] = detail["confidence"]
 
     # 1a) 本地 appinfo.vdf UFS 线索（离线，无需联网）
     if str(appid or "").strip() and steam_path:
         for appinfo_entry in parse_appinfo_ufs_entries(steam_path, appid):
             template = appinfo_entry.get("template", "")
             for path in expand_steamdb_template(
-                template, appid, install_dir, steam_path, library_path, preferred_accountids
+                template, appid, install_dir, steam_path, library_path, preferred_accountids, include_missing=True
             ):
                 save_specs = [{
                     "base": path,
                     "includes": list(appinfo_entry.get("includes", [])),
                     "recursive": appinfo_entry.get("recursive", True),
                 }]
-                _add(path, 94, "appinfo", save_specs=save_specs)
+                _add(path, 94, "appinfo", save_specs=save_specs, allow_missing=True)
 
     if install_dir and has_install_root_save_files(install_dir):
         inferred_root_specs = infer_install_root_file_specs(install_dir)
@@ -3245,7 +3391,7 @@ def detect_save_candidates(appid: str, game_name: str,
         for steamdb_entry in fetch_steamdb_ufs_entries(appid):
             template = steamdb_entry.get("template", "")
             expanded_paths = expand_steamdb_template(
-                template, appid, install_dir, steam_path, library_path, preferred_accountids
+                template, appid, install_dir, steam_path, library_path, preferred_accountids, include_missing=True
             )
             if not expanded_paths:
                 inferred_install = infer_install_dir_from_steamdb_template(template, install_dir, library_path)
@@ -3257,37 +3403,23 @@ def detect_save_candidates(appid: str, game_name: str,
                     "includes": list(steamdb_entry.get("includes", [])),
                     "recursive": steamdb_entry.get("recursive", True),
                 }]
-                _collect_steamdb_candidate(path, save_specs=save_specs)
+                _collect_steamdb_candidate(path, save_specs=save_specs, allow_missing=True)
 
-        if steamdb_candidates:
-            merged_candidates = list(steamdb_candidates.values())
-            scored_by_path = {
-                item["path"]: item
-                for item in scored.values()
-                if item.get("path")
-            }
-            for item in merged_candidates:
-                matched = scored_by_path.get(item["path"])
-                if matched and matched.get("save_specs") and not item.get("save_specs"):
-                    item["save_specs"] = _normalize_unique_save_specs(matched.get("save_specs", []))
-                    item["reasons"] = list(dict.fromkeys(list(item.get("reasons", [])) + list(matched.get("reasons", []))))
-            confirmed_entry = None
-            if confirmed_path:
-                confirmed_entry = scored.get(os.path.normpath(confirmed_path))
-                if confirmed_entry and confirmed_entry["path"] not in {c["path"] for c in merged_candidates}:
-                    merged_candidates.append(confirmed_entry)
-            all_candidates = sorted(
-                merged_candidates,
-                key=lambda item: (-item["score"], len(item["path"]), item["path"].lower())
-            )
-            if confirmed_entry:
-                all_candidates = [confirmed_entry] + [
-                    item for item in all_candidates
-                    if item["path"] != confirmed_entry["path"]
-                ]
-            final_candidates = all_candidates[:6]
-            _SAVE_DETECTION_CACHE[cache_key] = [dict(c) for c in final_candidates]
-            return [dict(c) for c in final_candidates]
+        for item in steamdb_candidates.values():
+            existing = scored.get(item["path"])
+            if existing is None:
+                scored[item["path"]] = dict(item)
+                continue
+            existing["reasons"] = list(dict.fromkeys(list(existing.get("reasons", [])) + list(item.get("reasons", []))))
+            existing["materialized"] = bool(existing.get("materialized", True) or item.get("materialized", True))
+            if item.get("save_specs"):
+                existing["save_specs"] = _normalize_unique_save_specs(
+                    list(existing.get("save_specs", []) or []) + list(item.get("save_specs", []) or [])
+                )
+            if item["score"] > existing["score"]:
+                existing["score"] = item["score"]
+                existing["source"] = "steamdb"
+                existing["confidence"] = item.get("confidence", existing.get("confidence", "low"))
 
     if cached_path:
         _add(cached_path, 104, "cache")
@@ -3365,8 +3497,6 @@ def load_config() -> dict:
     changed = False
     defaults = {
         "steam_path": "",
-        "steam_account_id": "",
-        "steam_account_ids": [],
         "games": [],
         "theme": "light",
         "language": "",
@@ -3412,11 +3542,19 @@ def load_config() -> dict:
         cfg = defaults.copy()
         changed = True
 
+    for legacy_key in ("steam_account_id", "steam_account_ids"):
+        if legacy_key in cfg:
+            cfg.pop(legacy_key, None)
+            changed = True
+
     games = cfg.get("games", [])
     if isinstance(games, list):
         for game in games:
             if not isinstance(game, dict):
                 continue
+            if game.get("game_uid") and not game.get("storage_key"):
+                ensure_game_storage_identity(game)
+                changed = True
             old_primary = game.get("save_path", "")
             old_specs = list(game.get("save_specs", [])) if isinstance(game.get("save_specs", []), list) else []
             normalized_specs = get_game_save_specs(game, existing_only=False)
@@ -3431,6 +3569,10 @@ def load_config() -> dict:
     detected_lang = normalize_language(cfg.get("language") or detect_system_language())
     if cfg.get("language") != detected_lang:
         cfg["language"] = detected_lang
+        changed = True
+    actual_autostart = get_autostart_enabled()
+    if cfg.get("autostart") != actual_autostart:
+        cfg["autostart"] = actual_autostart
         changed = True
     # 如果 steam_path 为空或不存在，自动重新检测
     if not cfg.get("steam_path") or not os.path.isdir(cfg["steam_path"]):
@@ -3694,9 +3836,9 @@ def send_desktop_notification(title: str, message: str):
             _try_pystray()
 
 
-def get_sync_game_dir(sync_folder: str, game_name: str) -> Path:
+def get_sync_game_dir(sync_folder: str, game_ref) -> Path:
     """获取同步目标中该游戏的子文件夹"""
-    return Path(sync_folder) / "SteamSaveSync" / sanitize(game_name)
+    return Path(sync_folder) / "SteamSaveSync" / get_game_storage_key(game_ref)
 
 
 def get_sync_archive_root(sync_game_dir: Path) -> Path:
@@ -3784,7 +3926,7 @@ def enforce_all_sync_archive_limits(cfg: Optional[dict]):
         game_name = str(game.get("name", "") or "").strip()
         if not game_name:
             continue
-        sync_game_dir = get_sync_game_dir(sync_folder, game_name)
+        sync_game_dir = get_sync_game_dir(sync_folder, game)
         dir_key = str(sync_game_dir).lower()
         if dir_key in seen_dirs:
             continue
@@ -3792,7 +3934,7 @@ def enforce_all_sync_archive_limits(cfg: Optional[dict]):
         enforce_sync_archive_limits(sync_game_dir, keep_count)
         if cfg.get("webdav_enabled") and HAS_WEBDAV:
             try:
-                webdav_enforce_archive_limits(cfg, game_name, keep_count)
+                webdav_enforce_archive_limits(cfg, game, keep_count)
             except Exception:
                 pass
 
@@ -3910,6 +4052,57 @@ def get_remote_sync_payload(sync_game_dir: Path, path_count: int) -> Optional[di
     if archive_info:
         return archive_info
     return get_legacy_sync_snapshot(sync_game_dir, path_count)
+
+
+def _remote_sync_payload_signature(payload: Optional[dict]) -> tuple:
+    if not payload:
+        return ("none", "", 0, "", 0.0, 0)
+    archive_name = ""
+    if payload.get("kind") == "archive":
+        archive_name = Path(str(payload.get("archive_path", "") or "")).name
+    return (
+        str(payload.get("kind", "") or ""),
+        archive_name,
+        int(payload.get("file_count", 0) or 0),
+        str(payload.get("hash", "") or ""),
+        float(payload.get("latest_mtime", payload.get("timestamp", 0.0)) or 0.0),
+        int(payload.get("path_count", 0) or 0),
+    )
+
+
+def _cloud_sync_probe_path(sync_root: str) -> Path:
+    return Path(sync_root) / "SteamSaveSync" / ".sync_probe.json"
+
+
+def _poke_cloud_sync_folder(sync_root: str):
+    try:
+        probe = _cloud_sync_probe_path(sync_root)
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as f:
+            json.dump({
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "pid": os.getpid(),
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def refresh_local_sync_payload(sync_root: str, sync_game_dir: Path, path_count: int,
+                               current_payload: Optional[dict] = None,
+                               timeout: float = 6.0, interval: float = 0.75) -> Optional[dict]:
+    if not sync_root or not os.path.isdir(sync_root):
+        return current_payload if current_payload is not None else get_remote_sync_payload(sync_game_dir, path_count)
+    baseline = current_payload if current_payload is not None else get_remote_sync_payload(sync_game_dir, path_count)
+    baseline_signature = _remote_sync_payload_signature(baseline)
+    _poke_cloud_sync_folder(sync_root)
+    deadline = time.time() + max(0.0, float(timeout))
+    latest = baseline
+    while time.time() < deadline:
+        time.sleep(max(0.1, float(interval)))
+        latest = get_remote_sync_payload(sync_game_dir, path_count)
+        if _remote_sync_payload_signature(latest) != baseline_signature:
+            return latest
+    return latest
 
 
 def _prune_webdav_cache_payload(sync_game_dir: Path, latest_name: Optional[str] = None):
@@ -4054,6 +4247,52 @@ def _webdav_base_path(cfg: Optional[dict]) -> str:
     return raw.rstrip("/") or "/SteamSaveSync"
 
 
+def _webdav_safe_segment(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "game"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    safe = safe.strip("._-")
+    return safe or "game"
+
+
+def _webdav_legacy_game_dir_key(game_ref) -> str:
+    if isinstance(game_ref, dict):
+        name = str(game_ref.get("name", "") or "").strip()
+    else:
+        name = str(game_ref or "").strip()
+    return sanitize(name).strip() or "game"
+
+
+def _webdav_remote_archive_dirs(cfg: Optional[dict], game_ref) -> list[str]:
+    base_path = _webdav_base_path(cfg)
+    storage_key = get_game_storage_key(game_ref)
+    candidates = []
+    for key in (
+        _webdav_legacy_game_dir_key(game_ref),
+        str(storage_key or "").strip(),
+        _webdav_safe_segment(storage_key),
+    ):
+        if not key:
+            continue
+        remote_dir = f"{base_path}/{key}/archives"
+        if remote_dir not in candidates:
+            candidates.append(remote_dir)
+    return candidates or [f"{base_path}/game/archives"]
+
+
+def _webdav_preferred_archive_dir(client, cfg: Optional[dict], game_ref) -> str:
+    candidates = _webdav_remote_archive_dirs(cfg, game_ref)
+    if not candidates:
+        return f"{_webdav_base_path(cfg)}/game/archives"
+    for candidate in candidates:
+        try:
+            return _webdav_find_existing_variant(client, candidate)
+        except Exception:
+            continue
+    return candidates[0]
+
+
 def _webdav_normalize_url(url: str, preset: str = "generic", username: str = "") -> str:
     raw = str(url or "").strip().rstrip("/")
     if not raw:
@@ -4146,6 +4385,30 @@ def get_sync_backend_issue(sync_folder: str, cfg: Optional[dict] = None) -> str:
     return "not_configured"
 
 
+def _webdav_enhance_error_message(cfg: Optional[dict], message: str) -> str:
+    raw = str(message or "").strip()
+    if not raw:
+        return raw
+    lowered = raw.lower()
+    if "code 403" not in lowered and "403 forbidden" not in lowered:
+        return raw
+    url = str((cfg or {}).get("webdav_url", "") or "").strip().lower()
+    is_alist_like = ":5244/" in url and "/dav" in url
+    if is_alist_like:
+        hint = bilingual_cfg(
+            cfg,
+            "服务器返回 403。若使用 AList，请确认该账号已开启 WebDAV 读取、WebDAV 管理，以及创建目录或上传、删除、重命名、复制等权限。",
+            "Server returned 403. If this is AList, make sure the account has WebDAV Read, WebDAV Manage, and the Create/Upload, Delete, Rename, and Copy permissions enabled.",
+        )
+    else:
+        hint = bilingual_cfg(
+            cfg,
+            "服务器返回 403。请检查当前 WebDAV 账号是否对目标目录具备写入权限。",
+            "Server returned 403. Check whether the current WebDAV account has write permission to the target folder.",
+        )
+    return f"{raw} | {hint}"
+
+
 def webdav_test_connection(url: str, username: str, password: str,
                            preset: str = "generic", verify_ssl: bool = True,
                            base_path: str = "/SteamSaveSync") -> tuple:
@@ -4168,12 +4431,10 @@ def webdav_test_connection(url: str, username: str, password: str,
         })
 
         base_dir = _webdav_base_path({"webdav_base_path": base_path})
-        _webdav_ensure_remote_dir(client, base_dir)
-
         probe_name = f".ssm_probe_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        probe_dir = f"{base_dir.rstrip('/')}/{probe_name}"
-        probe_file = f"{probe_dir}/probe.txt"
-        _webdav_ensure_remote_dir(client, probe_dir)
+        probe_root = f"{base_dir.rstrip('/')}/Steam_Save_Manager_Probe/archives/{probe_name}"
+        probe_file = f"{probe_root}/probe.txt"
+        _webdav_ensure_remote_dir(client, probe_root)
 
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as tmp:
             tmp.write("Steam Save Manager WebDAV probe")
@@ -4181,10 +4442,22 @@ def webdav_test_connection(url: str, username: str, password: str,
 
         _webdav_upload_with_variants(client, probe_file, temp_file_path)
         _webdav_clean_with_variants(client, probe_file)
-        _webdav_clean_with_variants(client, probe_dir)
+        _webdav_clean_with_variants(client, probe_root)
+        try:
+            _webdav_clean_with_variants(client, f"{base_dir.rstrip('/')}/Steam_Save_Manager_Probe/archives")
+        except Exception:
+            pass
+        try:
+            _webdav_clean_with_variants(client, f"{base_dir.rstrip('/')}/Steam_Save_Manager_Probe")
+        except Exception:
+            pass
         return True, "OK"
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        temp_cfg = {
+            "language": cfg_language(None),
+            "webdav_url": normalized_url if 'normalized_url' in locals() else url,
+        }
+        return False, _webdav_enhance_error_message(temp_cfg, f"{type(e).__name__}: {e}")
     finally:
         if temp_file_path:
             try:
@@ -4193,8 +4466,33 @@ def webdav_test_connection(url: str, username: str, password: str,
                 pass
 
 
-def _webdav_remote_archive_dir(cfg: Optional[dict], game_name: str) -> str:
-    return f"{_webdav_base_path(cfg)}/{sanitize(game_name)}/archives"
+def _webdav_remote_archive_dir(cfg: Optional[dict], game_ref) -> str:
+    return _webdav_remote_archive_dirs(cfg, game_ref)[0]
+
+
+def _webdav_list_archive_entries(client, cfg: dict, game_ref) -> list[dict]:
+    entries = []
+    seen = set()
+    for remote_dir in _webdav_remote_archive_dirs(cfg, game_ref):
+        try:
+            existing_dir = _webdav_find_existing_variant(client, remote_dir)
+        except Exception:
+            continue
+        try:
+            items = client.list(existing_dir)
+        except Exception:
+            continue
+        for item in items:
+            name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
+            if not name.endswith(".zip"):
+                continue
+            entry_key = (existing_dir, name)
+            if entry_key in seen:
+                continue
+            seen.add(entry_key)
+            entries.append({"dir": existing_dir, "name": name})
+    entries.sort(key=lambda item: item["name"])
+    return entries
 
 
 def _webdav_path_variants(remote_path: str) -> list[str]:
@@ -4296,6 +4594,17 @@ def _webdav_info_with_variants(client, remote_path: str) -> dict:
     raise RuntimeError("invalid_webdav_info_path")
 
 
+def _webdav_list_dir_names(client, remote_dir: str) -> tuple[str, set[str]]:
+    existing_dir = _webdav_find_existing_variant(client, remote_dir)
+    items = client.list(existing_dir)
+    names = set()
+    for item in items:
+        name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
+        if name:
+            names.add(name)
+    return existing_dir, names
+
+
 def _webdav_ensure_remote_dir(client, remote_dir: str):
     normalized = str(remote_dir or "").strip().strip("/")
     if not normalized:
@@ -4334,9 +4643,19 @@ def _webdav_ensure_remote_dir(client, remote_dir: str):
 
 
 def _webdav_verify_remote_file(client, remote_path: str, expected_size: int = 0) -> tuple[bool, str]:
+    parent_dir = str(PurePosixPath(str(remote_path or "").replace("\\", "/")).parent)
+    file_name = PurePosixPath(str(remote_path or "").replace("\\", "/")).name
+    listed = False
+    try:
+        _, names = _webdav_list_dir_names(client, parent_dir)
+        listed = file_name in names
+    except Exception:
+        listed = False
     try:
         info = _webdav_info_with_variants(client, remote_path)
     except Exception as e:
+        if listed:
+            return True, ""
         return False, f"{type(e).__name__}: {e}"
     try:
         remote_size = int(info.get("size", 0) or 0)
@@ -4344,16 +4663,18 @@ def _webdav_verify_remote_file(client, remote_path: str, expected_size: int = 0)
         remote_size = 0
     if expected_size and remote_size and remote_size != expected_size:
         return False, f"remote_size_mismatch:{remote_size}!={expected_size}"
+    if listed:
+        return True, ""
     return True, ""
 
 
-def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name: str) -> tuple[bool, str]:
+def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_ref) -> tuple[bool, str]:
     """上传 ZIP + meta.json 到 WebDAV，返回 (success, message)。"""
     client = _webdav_make_client(cfg)
     if not client:
         return False, "client_unavailable"
     try:
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
+        archive_dir = _webdav_preferred_archive_dir(client, cfg, game_ref)
         _webdav_ensure_remote_dir(client, archive_dir)
         zip_name = Path(local_zip).name
         meta_name = Path(local_meta).name
@@ -4380,37 +4701,26 @@ def webdav_upload_archive(cfg: dict, local_zip: str, local_meta: str, game_name:
                 expected_meta_size,
             )
             if not ok:
-                return False, verify_msg or "remote_meta_verify_failed"
-        except Exception:
-            pass
+                return False, _webdav_enhance_error_message(cfg, verify_msg or "remote_meta_verify_failed")
+        except Exception as e:
+            return False, _webdav_enhance_error_message(cfg, f"{type(e).__name__}: {e}")
         return True, ""
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, _webdav_enhance_error_message(cfg, f"{type(e).__name__}: {e}")
 
 
-def webdav_list_archives(cfg: dict, game_name: str) -> list:
+def webdav_list_archives(cfg: dict, game_ref) -> list:
     """列出 WebDAV 上的 .zip 存档文件名（排序后）"""
     client = _webdav_make_client(cfg)
     if not client:
         return []
     try:
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        try:
-            archive_dir = _webdav_find_existing_variant(client, archive_dir)
-        except Exception:
-            return []
-        items = client.list(archive_dir)
-        names = []
-        for item in items:
-            name = item.strip("/").rsplit("/", 1)[-1] if "/" in item else item.strip("/")
-            if name.endswith(".zip"):
-                names.append(name)
-        return sorted(names)
+        return [entry["name"] for entry in _webdav_list_archive_entries(client, cfg, game_ref)]
     except Exception:
         return []
 
 
-def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3):
+def webdav_enforce_archive_limits(cfg: dict, game_ref, keep_count: int = 3):
     """执行 WebDAV 远端归档轮转，只保留最近 keep_count 个 ZIP。"""
     if keep_count <= 0:
         return
@@ -4418,19 +4728,19 @@ def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3
     if not client:
         return
     try:
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        archive_dir = _webdav_find_existing_variant(client, archive_dir)
+        archive_entries = sorted(
+            _webdav_list_archive_entries(client, cfg, game_ref),
+            key=lambda item: item["name"],
+            reverse=True,
+        )
     except Exception:
+        archive_entries = []
+    if len(archive_entries) <= keep_count:
         return
 
-    try:
-        archive_names = sorted(webdav_list_archives(cfg, game_name), reverse=True)
-    except Exception:
-        archive_names = []
-    if len(archive_names) <= keep_count:
-        return
-
-    for name in archive_names[keep_count:]:
+    for entry in archive_entries[keep_count:]:
+        archive_dir = entry["dir"]
+        name = entry["name"]
         try:
             _webdav_clean_with_variants(client, f"{archive_dir.rstrip('/')}/{name}")
         except Exception:
@@ -4441,23 +4751,23 @@ def webdav_enforce_archive_limits(cfg: dict, game_name: str, keep_count: int = 3
             pass
 
 
-def webdav_download_latest(cfg: dict, game_name: str, local_sync_game_dir: Path,
+def webdav_download_latest(cfg: dict, game_ref, local_sync_game_dir: Path,
                            cache_mirror_remote: bool = False) -> str | None:
     """从 WebDAV 下载最新存档到本地缓存，返回本地 ZIP 路径或 None"""
     client = _webdav_make_client(cfg)
     if not client:
         return None
     try:
-        archives = webdav_list_archives(cfg, game_name)
-        if not archives:
+        archive_entries = _webdav_list_archive_entries(client, cfg, game_ref)
+        if not archive_entries:
             if cache_mirror_remote:
                 _prune_webdav_cache_payload(local_sync_game_dir, None)
             return None
-        latest_name = archives[-1]
+        latest_entry = archive_entries[-1]
+        latest_name = latest_entry["name"]
         if cache_mirror_remote:
             _prune_webdav_cache_payload(local_sync_game_dir, latest_name)
-        archive_dir = _webdav_remote_archive_dir(cfg, game_name)
-        archive_dir = _webdav_find_existing_variant(client, archive_dir)
+        archive_dir = latest_entry["dir"]
         remote_meta_info = {}
         meta_name = latest_name + ".meta.json"
         try:
@@ -4633,7 +4943,7 @@ def snapshot_sync_paths(paths: list[str], label: str) -> dict:
         file_count = compute_dir_file_count(path)
         total_files += file_count
         latest_mtime = max(latest_mtime, compute_dir_latest_mtime(path))
-        hash_parts.append((f"{idx}:{path}", compute_dir_hash(path) if file_count else ""))
+        hash_parts.append((f"path_{idx}", compute_dir_hash(path) if file_count else ""))
     return {
         "path": label,
         "file_count": total_files,
@@ -4658,7 +4968,7 @@ def snapshot_sync_specs(specs: list[dict], label: str) -> dict:
         file_count = compute_save_spec_file_count([spec])
         total_files += file_count
         latest_mtime = max(latest_mtime, compute_save_spec_latest_mtime([spec]))
-        hash_parts.append((f"{idx}:{spec['base']}", compute_save_spec_hash([spec]) if file_count else ""))
+        hash_parts.append((f"path_{idx}", compute_save_spec_hash([spec]) if file_count else ""))
     return {
         "path": label,
         "file_count": total_files,
@@ -4949,7 +5259,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             "Skipped: neither a sync folder nor WebDAV is available",
         )
 
-    dest_dir = get_sync_game_dir(effective_sync_root, game["name"])
+    dest_dir = get_sync_game_dir(effective_sync_root, game)
     dest_dir.mkdir(parents=True, exist_ok=True)
     webdav_active = bool(cfg and cfg.get("webdav_enabled"))
     webdav_cache_root = (CONFIG_DIR / "webdav_sync_cache")
@@ -4971,7 +5281,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
         try:
             webdav_download_latest(
                 cfg,
-                game["name"],
+                game,
                 dest_dir,
                 cache_mirror_remote=using_webdav_cache,
             )
@@ -4984,28 +5294,47 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
     state = get_game_sync_state(cfg, game)
     base_local = state.get("local_hash", "")
     base_remote = state.get("remote_hash", "")
-    remote_payload = get_remote_sync_payload(dest_dir, len(configured_paths))
-    remote_hash = remote_payload.get("hash", "") if remote_payload else ""
-    remote_count = int(remote_payload.get("file_count", 0) or 0) if remote_payload else 0
-    if remote_payload:
-        if remote_payload.get("kind") == "archive":
-            remote_label = str(remote_payload.get("archive_path", dest_dir))
+    def _build_remote_state(payload: Optional[dict]):
+        remote_hash_value = payload.get("hash", "") if payload else ""
+        remote_count_value = int(payload.get("file_count", 0) or 0) if payload else 0
+        if payload:
+            if payload.get("kind") == "archive":
+                remote_label_value = str(payload.get("archive_path", dest_dir))
+            else:
+                remote_label_value = str(dest_dir)
+            remote_info_value = {
+                "path": remote_label_value,
+                "file_count": remote_count_value,
+                "hash": remote_hash_value,
+                "latest_mtime": float(payload.get("latest_mtime", payload.get("timestamp", 0.0)) or 0.0),
+            }
         else:
-            remote_label = str(dest_dir)
-        remote_info = {
-            "path": remote_label,
-            "file_count": remote_count,
-            "hash": remote_hash,
-            "latest_mtime": float(remote_payload.get("latest_mtime", remote_payload.get("timestamp", 0.0)) or 0.0),
-        }
-    else:
-        remote_label = str(dest_dir)
-        remote_info = {
-            "path": remote_label,
-            "file_count": 0,
-            "hash": "",
-            "latest_mtime": 0.0,
-        }
+            remote_label_value = str(dest_dir)
+            remote_info_value = {
+                "path": remote_label_value,
+                "file_count": 0,
+                "hash": "",
+                "latest_mtime": 0.0,
+            }
+        return remote_hash_value, remote_count_value, remote_label_value, remote_info_value
+
+    remote_payload = get_remote_sync_payload(dest_dir, len(configured_paths))
+    remote_hash, remote_count, remote_label, remote_info = _build_remote_state(remote_payload)
+    should_refresh_local_mirror = (
+        not using_webdav_cache
+        and mode in {"download", "bidirectional"}
+        and (not remote_payload or local_hash == remote_hash)
+    )
+    if should_refresh_local_mirror:
+        refreshed_payload = refresh_local_sync_payload(
+            effective_sync_root,
+            dest_dir,
+            len(configured_paths),
+            current_payload=remote_payload,
+        )
+        if _remote_sync_payload_signature(refreshed_payload) != _remote_sync_payload_signature(remote_payload):
+            remote_payload = refreshed_payload
+            remote_hash, remote_count, remote_label, remote_info = _build_remote_state(remote_payload)
     def _mirror(src: str, dst: str):
         """将 src 目录完整镜像到 dst（兼容 OneDrive/Dropbox 等云盘锁定）"""
         dst_p = Path(dst)
@@ -5056,19 +5385,20 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             if not HAS_WEBDAV:
                 webdav_error = WEBDAV_IMPORT_ERROR or "webdavclient3 not installed"
             else:
-                ok, upload_msg = webdav_upload_archive(cfg, str(archive_path), str(meta_path), game["name"])
+                ok, upload_msg = webdav_upload_archive(cfg, str(archive_path), str(meta_path), game)
                 if not ok:
                     webdav_error = upload_msg or "upload_failed"
                 else:
                     webdav_error = ""
                     try:
-                        webdav_enforce_archive_limits(cfg, game["name"], keep_count)
+                        webdav_enforce_archive_limits(cfg, game, keep_count)
                     except Exception:
                         pass
         return archive_path
 
-    def _download_remote_payload():
-        current_remote = get_remote_sync_payload(dest_dir, len(configured_paths))
+    def _download_remote_payload(current_remote: Optional[dict] = None):
+        if current_remote is None:
+            current_remote = get_remote_sync_payload(dest_dir, len(configured_paths))
         if not current_remote:
             return
         if current_remote.get("kind") == "archive":
@@ -5120,7 +5450,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             _record_current()
             return bilingual_text(lang, "跳过：本地与同步文件夹已一致", "Skipped: local and sync folders are already identical")
         create_backup(game, pre_sync_backup_tag)
-        _download_remote_payload()
+        _download_remote_payload(remote_payload)
         create_backup(game, sync_tag)
         _record_synced(remote_hash, "download")
         return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
@@ -5130,7 +5460,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
             return bilingual_text(lang, "跳过：两端存档均为空", "Skipped: both sides are empty")
         if local_count == 0:
             create_backup(game, pre_sync_backup_tag)
-            _download_remote_payload()
+            _download_remote_payload(remote_payload)
             create_backup(game, sync_tag)
             _record_synced(remote_hash, "download")
             return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
@@ -5161,7 +5491,7 @@ def sync_game_save(game: dict, sync_folder: str, mode: str = "smart",
                 ))
             if remote_changed and not local_changed:
                 create_backup(game, pre_sync_backup_tag)
-                _download_remote_payload()
+                _download_remote_payload(remote_payload)
                 create_backup(game, sync_tag)
                 _record_synced(remote_hash, "download")
                 return bilingual_text(lang, "↓ 已下载并解压 ZIP（云端 → 本地）", "↓ Downloaded and extracted ZIP archive (cloud → local)")
@@ -5292,7 +5622,11 @@ def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None)
     if not save_specs:
         return None
     save_paths = [spec["base"] for spec in save_specs]
-    game_dir = BACKUP_ROOT / sanitize(game["name"])
+    if isinstance(game, dict) and (game.get("game_uid") or game.get("storage_key")):
+        storage_key = ensure_game_storage_identity(game)
+    else:
+        storage_key = get_game_storage_key(game)
+    game_dir = BACKUP_ROOT / storage_key
     game_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = game_dir / f"{ts}.zip"
@@ -5304,6 +5638,8 @@ def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None)
             _zip_write_file(zf, abs_f, arcname)
     meta = {
         "game": game["name"], "appid": game.get("appid", ""),
+        "game_uid": get_game_uid(game),
+        "storage_key": storage_key,
         "timestamp": ts, "note": note,
         "source": str(save_paths[0]), "sources": save_paths,
         "save_specs": _normalize_unique_save_specs(save_specs),
@@ -5314,11 +5650,11 @@ def create_backup(game: dict, note: str = "", extra_meta: Optional[dict] = None)
         meta.update(extra_meta)
     with open(zip_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    enforce_backup_limits(game["name"])
+    enforce_backup_limits(game)
     return str(zip_path)
 
 
-def enforce_backup_limits(game_name: str = None):
+def enforce_backup_limits(game_ref=None):
     """
     执行备份轮转策略：
     1. 每个游戏最多保留 max_backups_per_game 个备份（超出删除最旧的）
@@ -5333,13 +5669,12 @@ def enforce_backup_limits(game_name: str = None):
     max_per_game = cfg.get("max_backups_per_game", 20)
     max_total_gb = cfg.get("max_backup_size_gb", 10.0)
     max_total_bytes = max_total_gb * 1024 * 1024 * 1024
-    game_names = [g["name"] for g in cfg.get("games", [])]
-    # 1) 单游戏轮转：只清理触发备份的那个游戏（或全部）
-    targets = [game_name] if game_name else game_names
-    for gn in targets:
-        if not gn:
+    games = [g for g in cfg.get("games", []) if isinstance(g, dict)]
+    targets = [game_ref] if game_ref else games
+    for target in targets:
+        if not target:
             continue
-        backups = get_backups(gn)  # 已按时间倒序
+        backups = get_backups(target)  # 已按时间倒序
         if max_per_game > 0 and len(backups) > max_per_game:
             for b in backups[max_per_game:]:
                 delete_backup(b["path"])
@@ -5347,8 +5682,8 @@ def enforce_backup_limits(game_name: str = None):
     if max_total_gb <= 0:
         return
     all_backups = []
-    for gn in game_names:
-        for b in get_backups(gn):
+    for game in games:
+        for b in get_backups(game):
             all_backups.append(b)
     total_size = sum(b["size"] for b in all_backups)
     if total_size > max_total_bytes:
@@ -5450,24 +5785,40 @@ def restore_backup(zip_path: str, target_dir):
                 shutil.copyfileobj(src, dst)
 
 
-def get_backups(game_name: str) -> list:
-    game_dir = BACKUP_ROOT / sanitize(game_name)
-    if not game_dir.exists():
-        return []
+def get_backups(game_ref) -> list:
+    if isinstance(game_ref, dict):
+        candidate_dirs = [BACKUP_ROOT / get_game_storage_key(game_ref)]
+        if not get_game_uid(game_ref):
+            legacy_dir = BACKUP_ROOT / sanitize(str(game_ref.get("name", "") or ""))
+            if legacy_dir not in candidate_dirs:
+                candidate_dirs.append(legacy_dir)
+    else:
+        candidate_dirs = [BACKUP_ROOT / get_game_storage_key(str(game_ref or ""))]
     backups = []
-    for f in sorted(game_dir.glob("*.zip"), reverse=True):
-        meta_file = f.with_suffix(".meta.json")
-        meta = {}
-        if meta_file.exists():
-            meta = load_json_file_tolerant(meta_file, default={}) or {}
-        backups.append({
-            "path": str(f), "filename": f.name,
-            "timestamp": meta.get("timestamp", f.stem),
-            "note": meta.get("note", ""),
-            "size": meta.get("size", f.stat().st_size),
-            "backup_kind": meta.get("backup_kind", ""),
-            "linked_sync_archive": meta.get("linked_sync_archive", ""),
-        })
+    seen_paths = set()
+    for game_dir in candidate_dirs:
+        if not game_dir.exists():
+            continue
+        for f in sorted(game_dir.glob("*.zip"), reverse=True):
+            norm = os.path.normcase(str(f))
+            if norm in seen_paths:
+                continue
+            seen_paths.add(norm)
+            meta_file = f.with_suffix(".meta.json")
+            meta = {}
+            if meta_file.exists():
+                meta = load_json_file_tolerant(meta_file, default={}) or {}
+            backups.append({
+                "path": str(f), "filename": f.name,
+                "timestamp": meta.get("timestamp", f.stem),
+                "note": meta.get("note", ""),
+                "size": meta.get("size", f.stat().st_size),
+                "backup_kind": meta.get("backup_kind", ""),
+                "linked_sync_archive": meta.get("linked_sync_archive", ""),
+                "game_uid": meta.get("game_uid", ""),
+                "storage_key": meta.get("storage_key", ""),
+            })
+    backups.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
     return backups
 
 
@@ -5478,14 +5829,15 @@ def delete_backup(zip_path: str):
     if m.exists(): m.unlink()
 
 
-def delete_linked_sync_archive(cfg: Optional[dict], game_name: str, archive_name: str) -> dict:
+def delete_linked_sync_archive(cfg: Optional[dict], game_ref, archive_name: str) -> dict:
     result = {"local_deleted": False, "webdav_deleted": False, "errors": []}
-    if not cfg or not game_name or not archive_name:
+    storage_key = get_game_storage_key(game_ref)
+    if not cfg or not storage_key or not archive_name:
         return result
 
     local_root = str(cfg.get("sync_folder", "") or "").strip()
     if local_root and os.path.isdir(local_root):
-        archive_root = get_sync_archive_root(get_sync_game_dir(local_root, game_name))
+        archive_root = get_sync_archive_root(get_sync_game_dir(local_root, game_ref))
         try:
             matches = list(archive_root.rglob(archive_name)) if archive_root.exists() else []
         except Exception:
@@ -5506,16 +5858,18 @@ def delete_linked_sync_archive(cfg: Optional[dict], game_name: str, archive_name
     if cfg.get("webdav_enabled") and HAS_WEBDAV:
         client = _webdav_make_client(cfg)
         if client:
-            remote_dir = _webdav_remote_archive_dir(cfg, game_name)
-            try:
-                _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}")
-                result["webdav_deleted"] = True
-            except Exception as e:
-                result["errors"].append(f"webdav:{type(e).__name__}: {e}")
-            try:
-                _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}.meta.json")
-            except Exception:
-                pass
+            deleted = False
+            for remote_dir in _webdav_remote_archive_dirs(cfg, game_ref):
+                try:
+                    _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}")
+                    deleted = True
+                except Exception as e:
+                    result["errors"].append(f"webdav:{type(e).__name__}: {e}")
+                try:
+                    _webdav_clean_with_variants(client, f"{remote_dir.rstrip('/')}/{archive_name}.meta.json")
+                except Exception:
+                    pass
+            result["webdav_deleted"] = deleted
 
     return result
 
@@ -6699,7 +7053,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _refresh_home(self):
         games = self.cfg.get("games", [])
-        total = sum(self._get_game_backup_count_cached(g["name"]) for g in games)
+        total = sum(self._get_game_backup_count_cached(g) for g in games)
         auto = self.t("switch_on") if self.cfg.get("auto_backup_enabled") else self.t("switch_off")
         watch = self.t("switch_on") if self.cfg.get("watch_enabled") else self.t("switch_off")
         self._stat_cards["games"].configure(text=self.t("value_games", count=len(games)))
@@ -6821,11 +7175,7 @@ class SteamSaveManager(ctk.CTk):
         if self._scan_add_all_btn is not None:
             filtered_results = self._get_filtered_scan_results()
             can_add = bool(
-                not busy and any(r.get("save_paths") for r in filtered_results)
-                and any(
-                    r.get("appid") not in {g.get("appid") for g in self.cfg.get("games", [])}
-                    for r in filtered_results if r.get("save_paths")
-                )
+                not busy and any(self._scan_result_has_addable_paths(r) for r in filtered_results)
             )
             self._scan_add_all_btn.configure(state="normal" if can_add else "disabled")
 
@@ -6866,9 +7216,9 @@ class SteamSaveManager(ctk.CTk):
         self._games_search_job = None
         self._refresh_games_list()
 
-    def _invalidate_game_backup_count_cache(self, game_name: Optional[str] = None):
-        if game_name:
-            key = str(game_name)
+    def _invalidate_game_backup_count_cache(self, game_ref=None):
+        if game_ref is not None:
+            key = get_game_cache_key(game_ref)
             self._game_backup_count_cache.pop(key, None)
             self._game_backups_cache.pop(key, None)
             self._recent_backups_cache.clear()
@@ -6879,20 +7229,20 @@ class SteamSaveManager(ctk.CTk):
         self._recent_backups_cache.clear()
         self._game_detail_metrics_cache.clear()
 
-    def _get_game_backup_count_cached(self, game_name: str) -> int:
-        key = str(game_name or "")
+    def _get_game_backup_count_cached(self, game_ref) -> int:
+        key = get_game_cache_key(game_ref)
         if key in self._game_backup_count_cache:
             return self._game_backup_count_cache[key]
-        count = len(self._get_game_backups_cached(key))
+        count = len(self._get_game_backups_cached(game_ref))
         self._game_backup_count_cache[key] = count
         return count
 
-    def _get_game_backups_cached(self, game_name: str) -> list:
-        key = str(game_name or "")
+    def _get_game_backups_cached(self, game_ref) -> list:
+        key = get_game_cache_key(game_ref)
         cached = self._game_backups_cache.get(key)
         if cached is not None:
             return [dict(item) for item in cached]
-        backups = get_backups(key)
+        backups = get_backups(game_ref)
         self._game_backups_cache[key] = [dict(item) for item in backups]
         return [dict(item) for item in backups]
 
@@ -6902,7 +7252,7 @@ class SteamSaveManager(ctk.CTk):
             return [dict(item) for item in cached]
         all_b = []
         for g in self.cfg.get("games", []):
-            for b in self._get_game_backups_cached(g["name"]):
+            for b in self._get_game_backups_cached(g):
                 item = dict(b)
                 item["game"] = g["name"]
                 all_b.append(item)
@@ -6912,7 +7262,7 @@ class SteamSaveManager(ctk.CTk):
         return [dict(item) for item in recent]
 
     def _get_game_detail_metrics_cached(self, game: dict) -> dict:
-        key = str(game.get("name", "") or "")
+        key = get_game_cache_key(game)
         now = time.time()
         cached = self._game_detail_metrics_cache.get(key)
         if cached and now - float(cached.get("ts", 0.0)) < 10.0:
@@ -6952,6 +7302,24 @@ class SteamSaveManager(ctk.CTk):
             results.append(game)
         return results
 
+    def _scan_result_has_addable_paths(self, result: Optional[dict]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        appid = str(result.get("appid", "") or "").strip()
+        save_paths = result.get("save_paths", []) or []
+        if not appid or not save_paths:
+            return False
+        tracked_paths = set()
+        for tracked_game in self.cfg.get("games", []):
+            if str(tracked_game.get("appid", "") or "").strip() != appid:
+                continue
+            tracked_paths.update(
+                os.path.normpath(p)
+                for p in get_game_save_paths(tracked_game, existing_only=False)
+                if p
+            )
+        return any(os.path.normpath(path) not in tracked_paths for path in save_paths)
+
     def _render_scan_results(self):
         for item in self._scan_cards.values():
             item["card"].pack_forget()
@@ -6965,7 +7333,17 @@ class SteamSaveManager(ctk.CTk):
         else:
             self._scan_info_banner.pack_forget()
 
-        already_added = {g.get("appid") for g in self.cfg.get("games", [])}
+        tracked_by_appid: dict[str, set[str]] = {}
+        for tracked_game in self.cfg.get("games", []):
+            tracked_appid = str(tracked_game.get("appid", "") or "").strip()
+            if not tracked_appid:
+                continue
+            tracked_paths = tracked_by_appid.setdefault(tracked_appid, set())
+            tracked_paths.update(
+                os.path.normpath(p)
+                for p in get_game_save_paths(tracked_game, existing_only=False)
+                if p
+            )
         found = 0
         addable = 0
         filtered_results = self._get_filtered_scan_results()
@@ -6985,6 +7363,8 @@ class SteamSaveManager(ctk.CTk):
             top_candidate = (game.get("save_candidates") or [{}])[0] if save_paths else {}
             key = str(appid)
             active_keys.add(key)
+            tracked_paths = tracked_by_appid.get(str(appid or "").strip(), set())
+            available_paths = [p for p in save_paths if os.path.normpath(p) not in tracked_paths]
             item = self._scan_cards.get(key)
             if item is None:
                 card = ctk.CTkFrame(self._scan_scroll,
@@ -7017,7 +7397,7 @@ class SteamSaveManager(ctk.CTk):
                 }
                 self._scan_cards[key] = item
 
-            ico = "✔" if appid in already_added else ("✅" if save_paths else "❓")
+            ico = "✔" if save_paths and not available_paths else ("✅" if save_paths else "❓")
             item["title"].configure(text=f"{ico} {name}")
 
             if save_paths:
@@ -7064,21 +7444,21 @@ class SteamSaveManager(ctk.CTk):
                 else:
                     item["meta"].configure(text="")
                     item["meta"].grid_remove()
-                if appid not in already_added:
+                if available_paths:
                     addable += 1
                     pv = self._scan_choice_vars.get(appid)
                     if pv is None:
                         pv = ctk.StringVar(value=save_paths[0])
                         self._scan_choice_vars[appid] = pv
-                    if pv.get() not in save_paths:
-                        pv.set(save_paths[0])
+                    if pv.get() not in available_paths:
+                        pv.set(available_paths[0])
                     if item["option"] is None:
                         item["option"] = ctk.CTkOptionMenu(
-                            item["right_top"], variable=pv, values=save_paths, width=240, font=font(11)
+                            item["right_top"], variable=pv, values=available_paths, width=240, font=font(11)
                         )
                         item["option"].pack(side="left")
                     else:
-                        item["option"].configure(variable=pv, values=save_paths)
+                        item["option"].configure(variable=pv, values=available_paths)
                         if not item["option"].winfo_manager():
                             item["option"].pack(side="left")
                     if item["folder_btn"] is None:
@@ -7114,7 +7494,9 @@ class SteamSaveManager(ctk.CTk):
                         item["status"] = ctk.CTkLabel(
                             item["right_top"], text="", font=font(11), text_color=BTN_SUCCESS
                         )
-                    item["status"].configure(text=self.bi("✔ 已添加", "✔ Added"))
+                    item["status"].configure(
+                        text=self.bi("✔ 已全部添加", "✔ All added") if save_paths else self.bi("✔ 已添加", "✔ Added")
+                    )
                     item["status"].grid(row=0, column=0, padx=14, sticky="e")
             else:
                 item["path"].configure(
@@ -7324,16 +7706,17 @@ class SteamSaveManager(ctk.CTk):
 
     def _add_from_scan(self, appid, name, save_path):
         games = self.cfg.setdefault("games", [])
-        if any(g.get("appid") == appid for g in games):
+        save_paths = self._collect_scan_add_paths(appid, save_path)
+        save_specs = self._collect_scan_add_specs(appid, save_path)
+        if any(game_matches_save_target(g, appid, save_specs=save_specs, save_paths=save_paths) for g in games):
             self._show_info(self.bi("提示", "Notice"), self.bi(f"「{name}」已添加过", f"{name} has already been added"))
             return
-        save_paths = self._collect_scan_add_paths(appid, save_path)
         game = {"appid": appid, "name": name}
-        save_specs = self._collect_scan_add_specs(appid, save_path)
         if save_specs:
             set_game_save_specs(game, save_specs)
         else:
             set_game_save_paths(game, save_paths if save_paths else [save_path])
+        ensure_game_storage_identity(game)
         result = next((r for r in self._scan_results if r.get("appid") == appid), None)
         if result and result.get("library_path"):
             game["library_path"] = result.get("library_path", "")
@@ -7357,25 +7740,26 @@ class SteamSaveManager(ctk.CTk):
         if self._scan_in_progress:
             return
         games = self.cfg.setdefault("games", [])
-        existing = {g.get("appid") for g in games}
         added = 0
         for result in self._get_filtered_scan_results():
             appid = result.get("appid")
-            if not result.get("save_paths") or appid in existing:
+            if not result.get("save_paths"):
                 continue
             selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
             save_paths = self._collect_scan_add_paths(appid, selected)
-            game = {"appid": appid, "name": result["name"]}
             save_specs = self._collect_scan_add_specs(appid, selected)
+            if any(game_matches_save_target(g, appid, save_specs=save_specs, save_paths=save_paths) for g in games):
+                continue
+            game = {"appid": appid, "name": result["name"]}
             if save_specs:
                 set_game_save_specs(game, save_specs)
             else:
                 set_game_save_paths(game, save_paths if save_paths else [selected])
+            ensure_game_storage_identity(game)
             if result.get("library_path"):
                 game["library_path"] = result.get("library_path", "")
             games.append(game)
             remember_recognition_path(self.cfg, appid, result["name"], game.get("save_path", ""))
-            existing.add(appid)
             added += 1
         if not added:
             self._show_info(
@@ -7492,7 +7876,7 @@ class SteamSaveManager(ctk.CTk):
             filtered_games.append((idx, g))
 
         for idx, g in filtered_games:
-            key = str(g.get("appid") or f"{g.get('name', '')}::{g.get('save_path', '')}")
+            key = get_game_cache_key(g)
             active_keys.add(key)
             item = self._game_cards.get(key)
             if item is None:
@@ -7549,7 +7933,7 @@ class SteamSaveManager(ctk.CTk):
                 p += self.bi(f"  (+{len(save_paths)-1} 个目录)", f"  (+{len(save_paths)-1} folders)")
             item["path"].configure(text=f"📁 {p}")
 
-            bc = self._get_game_backup_count_cached(g["name"])
+            bc = self._get_game_backup_count_cached(g)
             item["backup"].configure(text=self.bi(f"备份数：{bc}", f"Backups: {bc}"))
 
             item["detail_btn"].configure(command=lambda i=idx: self._show_game_detail(i))
@@ -7745,6 +8129,7 @@ class SteamSaveManager(ctk.CTk):
             appid = ae.get().strip()
             game = {"name": n, "appid": appid}
             set_game_save_paths(game, save_paths)
+            ensure_game_storage_identity(game)
             self.cfg.setdefault("games", []).append(game)
             remember_recognition_path(self.cfg, appid, n, game["save_path"])
             self._invalidate_game_backup_count_cache()
@@ -7814,11 +8199,12 @@ class SteamSaveManager(ctk.CTk):
             src = self._ask_open_filename(
                 title=self.bi("选择 ZIP 备份", "Choose a ZIP backup"), filetypes=[("ZIP", "*.zip"), (self.bi("全部", "All"), "*.*")])
             if not src: return
-            gd = BACKUP_ROOT / sanitize(g["name"]); gd.mkdir(parents=True, exist_ok=True)
+            gd = BACKUP_ROOT / get_game_storage_key(g); gd.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             dest = gd / f"{ts}_imported.zip"
             shutil.copy2(src, dest)
             meta = {"game": g["name"], "appid": g.get("appid", ""),
+                    "game_uid": get_game_uid(g), "storage_key": str(g.get("storage_key", "") or ""),
                     "timestamp": ts, "note": self.bi("导入的备份", "Imported backup"),
                     "source": src, "size": dest.stat().st_size}
             with open(dest.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
@@ -7832,7 +8218,7 @@ class SteamSaveManager(ctk.CTk):
         else:
             folder = self._ask_directory(title=self.bi("选择存档文件夹", "Choose a save folder"))
             if not folder: return
-            gd = BACKUP_ROOT / sanitize(g["name"]); gd.mkdir(parents=True, exist_ok=True)
+            gd = BACKUP_ROOT / get_game_storage_key(g); gd.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             zp = gd / f"{ts}_imported.zip"
             fp = Path(folder)
@@ -7842,6 +8228,7 @@ class SteamSaveManager(ctk.CTk):
                         af = Path(root) / file
                         _zip_write_file(zf, af, af.relative_to(fp))
             meta = {"game": g["name"], "appid": g.get("appid", ""),
+                    "game_uid": get_game_uid(g), "storage_key": str(g.get("storage_key", "") or ""),
                     "timestamp": ts, "note": self.bi("导入的存档文件夹", "Imported save folder"),
                     "source": folder, "size": zp.stat().st_size}
             with open(zp.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
@@ -8008,7 +8395,7 @@ class SteamSaveManager(ctk.CTk):
         g = self.cfg["games"][idx]
         self._detail_title.configure(text=f"🎮 {g['name']}")
 
-        backups = self._get_game_backups_cached(g["name"])
+        backups = self._get_game_backups_cached(g)
         total_size = sum(b["size"] for b in backups)
         detail_metrics = self._get_game_detail_metrics_cached(g)
 
@@ -8093,7 +8480,7 @@ class SteamSaveManager(ctk.CTk):
     def _show_backup_history(self):
         """弹窗显示当前游戏的完整备份历史"""
         g = self.cfg["games"][self._detail_idx]
-        backups = self._get_game_backups_cached(g["name"])
+        backups = self._get_game_backups_cached(g)
 
         d = self._create_popup(self.bi(f"备份历史 — {g['name']}", f"Backup History — {g['name']}"), "680x520")
         d.grid_columnconfigure(0, weight=1)
@@ -8177,21 +8564,63 @@ class SteamSaveManager(ctk.CTk):
         self._set_io_busy(False)
         self._show_error(self.bi("还原失败", "Restore Failed"), err)
 
+    def _resolve_linked_sync_archive_deletion(self, backup: dict, game_ref) -> str:
+        linked_archive = str(backup.get("linked_sync_archive", "") or "").strip()
+        backup_kind = str(backup.get("backup_kind", "") or "").strip().lower()
+        if not linked_archive or backup_kind != "sync_archive" or not get_game_storage_key(game_ref):
+            return ""
+        remove_linked = self._ask_yes_no(
+            self.bi("删除同步包", "Delete Sync Archive"),
+            self.bi(
+                "这个备份关联了一个同步包，是否同时删除对应的本地或 WebDAV 远程同步包？",
+                "This backup is linked to a sync archive. Do you also want to delete the corresponding local or WebDAV remote sync archive?",
+            ),
+        )
+        return linked_archive if remove_linked else ""
+
+    def _delete_backup_worker(self, backup_path: str, game_ref, linked_archive: str) -> dict:
+        result = {"linked": None, "errors": []}
+        if linked_archive:
+            linked_result = delete_linked_sync_archive(self.cfg, game_ref, linked_archive)
+            result["linked"] = linked_result
+            result["errors"].extend(linked_result.get("errors", []))
+        try:
+            delete_backup(backup_path)
+        except Exception as e:
+            result["errors"].append(f"backup:{type(e).__name__}: {e}")
+        return result
+
+    def _show_delete_backup_followup(self, result: Optional[dict]):
+        result = result or {}
+        errors = result.get("errors", []) or []
+        if errors:
+            details = "\n".join(errors[:6])
+            self._show_warning(
+                self.bi("删除已完成", "Deletion Completed"),
+                self.bi(
+                    "备份已删除，但关联同步包删除时出现部分问题：\n" + details,
+                    "The backup was deleted, but some problems occurred while deleting linked sync archives:\n" + details,
+                ),
+            )
+
     def _del_bk_from_popup(self, backup, dialog):
         """从弹窗中删除备份"""
         if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("确定删除此备份？", "Delete this backup?")):
             backup_path = backup["path"]
+            game_ref = self.cfg["games"][self._detail_idx] if self._detail_idx < len(self.cfg.get("games", [])) else {}
+            linked_archive = self._resolve_linked_sync_archive_deletion(backup, game_ref)
             detail_idx = self._detail_idx
             self._set_io_busy(True)
             def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_popup_done(detail_idx, dialog))
+                result = self._delete_backup_worker(backup_path, game_ref, linked_archive)
+                self.after(0, lambda r=result: self._on_del_bk_popup_done(detail_idx, dialog, r))
             threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_del_bk_popup_done(self, idx, dialog):
+    def _on_del_bk_popup_done(self, idx, dialog, result=None):
         self._set_io_busy(False)
         dialog.destroy()
+        self._show_delete_backup_followup(result)
         self._show_backup_history()
         self._show_game_detail(idx)
 
@@ -8753,7 +9182,7 @@ class SteamSaveManager(ctk.CTk):
                 try:
                     idx = self._detail_idx
                     g = self.cfg["games"][idx]
-                    backups = get_backups(g["name"])
+                    backups = get_backups(g)
                     current_text = self._detail_stats["backups"].cget("text")
                     if str(len(backups)) != current_text:
                         self._show_game_detail(idx)
@@ -8793,7 +9222,7 @@ class SteamSaveManager(ctk.CTk):
         self._set_io_busy(False)
         if result:
             if idx < len(self.cfg.get("games", [])):
-                self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+                self._invalidate_game_backup_count_cache(self.cfg["games"][idx])
             self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
             self._show_game_detail(idx)
         else:
@@ -8841,7 +9270,7 @@ class SteamSaveManager(ctk.CTk):
     def _on_restore_detail_done(self, idx):
         self._set_io_busy(False)
         if idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx])
         self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
         self._show_game_detail(idx)
 
@@ -8849,17 +9278,20 @@ class SteamSaveManager(ctk.CTk):
         if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
             backup_path = b["path"]
+            game_ref = self.cfg["games"][self._detail_idx] if self._detail_idx < len(self.cfg.get("games", [])) else {}
+            linked_archive = self._resolve_linked_sync_archive_deletion(b, game_ref)
             detail_idx = self._detail_idx
             self._set_io_busy(True)
             def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_detail_done(detail_idx))
+                result = self._delete_backup_worker(backup_path, game_ref, linked_archive)
+                self.after(0, lambda r=result: self._on_del_bk_detail_done(detail_idx, r))
             threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_del_bk_detail_done(self, idx):
+    def _on_del_bk_detail_done(self, idx, result=None):
         self._set_io_busy(False)
         if idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][idx].get("name", ""))
+            self._invalidate_game_backup_count_cache(self.cfg["games"][idx])
+        self._show_delete_backup_followup(result)
         self._show_game_detail(idx)
 
     def _manual_backup(self, idx):
@@ -8890,7 +9322,7 @@ class SteamSaveManager(ctk.CTk):
     def _on_backup_failed(self, err, detail_idx=None):
         self._set_io_busy(False)
         if detail_idx is not None and detail_idx < len(self.cfg.get("games", [])):
-            self._invalidate_game_backup_count_cache(self.cfg["games"][detail_idx].get("name", ""))
+            self._invalidate_game_backup_count_cache(self.cfg["games"][detail_idx])
         self._show_error(self.bi("备份失败", "Backup Failed"), err)
 
     def _backup_all(self):
@@ -8982,7 +9414,7 @@ class SteamSaveManager(ctk.CTk):
             save_paths = get_game_save_paths(g, existing_only=False)
             save_specs = get_game_save_specs(g, existing_only=False)
             primary_path = save_paths[0] if save_paths else g.get("save_path", "")
-            for b in self._get_game_backups_cached(g["name"]):
+            for b in self._get_game_backups_cached(g):
                 b["game"] = g["name"]
                 b["save_path"] = primary_path
                 b["save_paths"] = save_paths
@@ -9073,15 +9505,22 @@ class SteamSaveManager(ctk.CTk):
         if self._io_busy: return
         if self._ask_yes_no(self.bi("确认", "Confirm"), self.bi("删除此备份？不可撤销。", "Delete this backup? This cannot be undone.")):
             backup_path = b["path"]
+            game_ref = {
+                "name": b.get("game", ""),
+                "game_uid": b.get("game_uid", ""),
+                "storage_key": b.get("storage_key", ""),
+            }
+            linked_archive = self._resolve_linked_sync_archive_deletion(b, game_ref)
             self._set_io_busy(True)
             def _worker():
-                delete_backup(backup_path)
-                self.after(0, lambda: self._on_del_bk_done())
+                result = self._delete_backup_worker(backup_path, game_ref, linked_archive)
+                self.after(0, lambda r=result: self._on_del_bk_done(r))
             threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_del_bk_done(self):
+    def _on_del_bk_done(self, result=None):
         self._set_io_busy(False)
         self._invalidate_game_backup_count_cache()
+        self._show_delete_backup_followup(result)
         self._refresh_backup_list()
 
     # ─── 设置 ───
@@ -9114,13 +9553,6 @@ class SteamSaveManager(ctk.CTk):
         def _apply_settings_moveto(fraction):
             fraction = max(0.0, min(float(fraction), 1.0))
             settings_canvas.yview_moveto(fraction)
-            settings_canvas.update_idletasks()
-
-        def _settings_canvas_yview(*args):
-            if args and args[0] == "moveto":
-                _apply_settings_moveto(args[1])
-                return
-            settings_canvas.yview(*args)
             settings_canvas.update_idletasks()
 
         # ── Scrollbar colors (theme-aware, update dynamically) ──
