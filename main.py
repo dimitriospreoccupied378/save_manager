@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.3.4 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.5 — 通用版"""
 
 import os
 import sys
@@ -80,7 +80,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 APP_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 LEGACY_CONFIG_DIR = Path.home() / ".steam_save_manager"
 STARTUP_AUTOSTART_FLAG = "--startup-launch"
@@ -3269,7 +3269,8 @@ def detect_save_candidates(appid: str, game_name: str,
 
     def _add(path: str, score: int, source: str,
              save_specs: Optional[list[dict]] = None,
-             allow_missing: bool = False):
+             allow_missing: bool = False,
+             accountid: str = ""):
         norm = os.path.normpath(path)
         exists_flag = os.path.exists(norm)
         if not norm or norm in blacklist or (not exists_flag and not allow_missing):
@@ -3295,6 +3296,8 @@ def detect_save_candidates(appid: str, game_name: str,
             "reasons": [source] + detail["reasons"],
             "materialized": exists_flag,
         }
+        if accountid:
+            entry["accountid"] = str(accountid).strip()
         if save_specs:
             entry["save_specs"] = _normalize_unique_save_specs(save_specs)
         if existing is None:
@@ -3302,6 +3305,8 @@ def detect_save_candidates(appid: str, game_name: str,
             return
         existing["reasons"] = list(dict.fromkeys(list(existing.get("reasons", [])) + entry["reasons"]))
         existing["materialized"] = bool(existing.get("materialized", True) or exists_flag)
+        if accountid and not existing.get("accountid"):
+            existing["accountid"] = str(accountid).strip()
         if save_specs:
             existing["save_specs"] = _normalize_unique_save_specs(
                 list(existing.get("save_specs", []) or []) + list(entry.get("save_specs", []) or [])
@@ -3443,16 +3448,16 @@ def detect_save_candidates(appid: str, game_name: str,
         local_candidates = entry.get("local_candidates", [])
         has_local_candidates = bool(local_candidates)
         for path in local_candidates:
-            _add(path, score_remotecache_candidate(path), "remotecache")
+            _add(path, score_remotecache_candidate(path), "remotecache", accountid=entry.get("accountid", ""))
         if entry["remote_dir"]:
-            _add(entry["remote_dir"], 104 if has_local_candidates else 112, "steam-remote")
-        _add(entry["app_root"], 98, "steam-app-root")
+            _add(entry["remote_dir"], 104 if has_local_candidates else 112, "steam-remote", accountid=entry.get("accountid", ""))
+        _add(entry["app_root"], 98, "steam-app-root", accountid=entry.get("accountid", ""))
 
     # 5) Steam userdata/<uid>/<appid>/remote
     for entry in remotecache_entries:
         if entry["remote_dir"] and not entry.get("local_candidates"):
-            _add(entry["remote_dir"], 108, "steam-remote")
-        _add(entry["app_root"], 94, "steam-app-root")
+            _add(entry["remote_dir"], 108, "steam-remote", accountid=entry.get("accountid", ""))
+        _add(entry["app_root"], 94, "steam-app-root", accountid=entry.get("accountid", ""))
 
     # 6) 安装目录搜索
     for path in find_save_in_install_dir(install_dir):
@@ -3507,6 +3512,7 @@ def load_config() -> dict:
         "autostart": False,
         "sync_enabled": False,
         "sync_folder": "",
+        "sync_folder_source": "",
         "sync_interval": 10,
         "sync_mode": "smart",
         "sync_archive_keep": 3,
@@ -3540,6 +3546,10 @@ def load_config() -> dict:
             cfg = defaults.copy()
     else:
         cfg = defaults.copy()
+        changed = True
+
+    if "sync_folder_source" not in cfg:
+        cfg["sync_folder_source"] = "manual" if str(cfg.get("sync_folder", "") or "").strip() else ""
         changed = True
 
     for legacy_key in ("steam_account_id", "steam_account_ids"):
@@ -3587,11 +3597,14 @@ def load_config() -> dict:
                 continue
             if try_upgrade_game_save_specs_from_appinfo(game, steam_path_for_upgrade, cfg):
                 changed = True
-    # 如果 sync_folder 为空或不存在，自动检测云盘文件夹
-    if not cfg.get("sync_folder") or not os.path.isdir(cfg.get("sync_folder", "")):
+    sync_folder_value = str(cfg.get("sync_folder", "") or "").strip()
+    sync_folder_source = str(cfg.get("sync_folder_source", "") or "").strip().lower()
+    # 仅在首次使用或上次为自动探测来源时，才自动补回同步文件夹。
+    if (not sync_folder_value or not os.path.isdir(sync_folder_value)) and sync_folder_source != "manual":
         cloud = detect_cloud_folder()
         if cloud:
             cfg["sync_folder"] = cloud
+            cfg["sync_folder_source"] = "auto"
             changed = True
     # 自定义备份路径
     global BACKUP_ROOT
@@ -5904,6 +5917,7 @@ class GameProcessMonitor:
         self._running_games: set[str] = set()  # 当前正在运行的 appid 集合
         self._thread: Optional[threading.Thread] = None
         self.sync_log: list[str] = []  # 同步活动日志（最近50条）
+        self._upload_guards: dict[str, dict] = {}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -5916,6 +5930,67 @@ class GameProcessMonitor:
         self._stop_event.set()
         self._thread = None
         self._running_games.clear()
+        self._upload_guards.clear()
+
+    def _build_sync_snapshots(self, game: dict, sync_folder: str) -> tuple[dict, dict, Optional[dict]]:
+        save_specs = get_game_save_specs(game, existing_only=False)
+        save_paths = get_game_save_paths(game, existing_only=False)
+        if not save_specs:
+            fallback = str(game.get("save_path", "") or "").strip()
+            save_specs = [_default_save_spec(fallback)] if fallback else []
+            save_paths = [fallback] if fallback else []
+        local_label = save_paths[0] if len(save_paths) == 1 and save_paths else bilingual_cfg(
+            self.cfg,
+            f"{len(save_paths)} 个本地目录",
+            f"{len(save_paths)} local folders",
+        )
+        local_info = snapshot_sync_specs(save_specs, local_label)
+        dest_dir = get_sync_game_dir(sync_folder, game)
+        remote_payload = get_remote_sync_payload(dest_dir, len(save_paths))
+        if remote_payload:
+            if remote_payload.get("kind") == "archive":
+                remote_label = str(remote_payload.get("archive_path", dest_dir))
+            else:
+                remote_label = str(dest_dir)
+            remote_info = {
+                "path": remote_label,
+                "file_count": int(remote_payload.get("file_count", 0) or 0),
+                "hash": str(remote_payload.get("hash", "") or ""),
+                "latest_mtime": float(remote_payload.get("latest_mtime", remote_payload.get("timestamp", 0.0)) or 0.0),
+            }
+        else:
+            remote_info = {
+                "path": str(dest_dir),
+                "file_count": 0,
+                "hash": "",
+                "latest_mtime": 0.0,
+            }
+        return local_info, remote_info, remote_payload
+
+    def _arm_upload_guard_after_launch(self, game: dict, sync_folder: str) -> bool:
+        local_info, remote_info, remote_payload = self._build_sync_snapshots(game, sync_folder)
+        remote_count = int(remote_info.get("file_count", 0) or 0)
+        if remote_count <= 0:
+            return False
+        local_hash = str(local_info.get("hash", "") or "")
+        remote_hash = str(remote_info.get("hash", "") or "")
+        if local_hash == remote_hash:
+            return False
+        key = get_game_sync_key(game)
+        self._upload_guards[key] = {
+            "reason": bilingual_cfg(
+                self.cfg,
+                "游戏启动后才检测到云端存档更新，为避免覆盖远端，已保护本轮会话并禁止自动上传",
+                "A newer cloud save was detected only after the game had already started. Automatic upload is blocked for this session to avoid overwriting the cloud copy.",
+            ),
+            "armed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "local": dict(local_info),
+            "remote": dict(remote_info),
+        }
+        return True
+
+    def _consume_upload_guard(self, game: dict) -> Optional[dict]:
+        return self._upload_guards.pop(get_game_sync_key(game), None)
 
     def _wait_for_save_settle(self, game: dict,
                               timeout: float = 12.0,
@@ -6248,7 +6323,9 @@ class GameProcessMonitor:
             self.sync_log.append(f"[{_ts_log}] {msg}")
             self.sync_log = self.sync_log[-50:]
 
-        run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
+        retry_results = run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
+        if retry_results:
+            self.after(0, self._on_backups_changed)
 
         # 初始扫描，记录已在运行的游戏并立即触发一次下载同步
         self._running_games = self._find_running_games()
@@ -6270,14 +6347,22 @@ class GameProcessMonitor:
                 g = game_by_appid.get(aid)
                 if g and sync_folder:
                     try:
+                        guarded = self._arm_upload_guard_after_launch(g, sync_folder)
                         r = sync_game_save(g, sync_folder, "download",
                                            auto=True, cfg=self.cfg)
+                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
                         _ts2 = datetime.datetime.now().strftime("%H:%M:%S")
                         self.sync_log.append(f"[{_ts2}] " + bilingual_cfg(
                             self.cfg,
                             f"↓ {g['name']}(初始同步): {r}",
                             f"↓ {g['name']} (initial sync): {r}",
                         ))
+                        if guarded:
+                            self.sync_log.append(f"[{_ts2}] " + bilingual_cfg(
+                                self.cfg,
+                                f"🛡 {g['name']} 已启用启动保护：本轮运行结束前将跳过自动上传",
+                                f"🛡 Startup protection enabled for {g['name']}: automatic upload will be skipped for this run",
+                            ))
                         if self.cfg.get("sync_notify", True):
                             send_desktop_notification(
                                 bilingual_cfg(self.cfg, "存档管家 · 初始同步", "Steam Save Manager · Initial Sync"),
@@ -6308,7 +6393,9 @@ class GameProcessMonitor:
             sync_folder = get_effective_sync_root(self.cfg.get("sync_folder", ""), self.cfg, ensure=True)
             if not sync_folder:
                 continue
-            run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
+            retry_results = run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
+            if retry_results:
+                self.after(0, self._on_backups_changed)
             game_by_appid = {
                 g.get("appid"): g
                 for g in self.cfg.get("games", []) if g.get("appid")
@@ -6324,13 +6411,21 @@ class GameProcessMonitor:
                 _ts = datetime.datetime.now().strftime("%H:%M:%S")
                 if g and sync_folder:
                     try:
+                        guarded = self._arm_upload_guard_after_launch(g, sync_folder)
                         r = sync_game_save(g, sync_folder, "download",
                                            auto=True, cfg=self.cfg)
+                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
                         self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                             self.cfg,
                             f"↓ {g['name']}: {r}",
                             f"↓ {g['name']}: {r}",
                         ))
+                        if guarded:
+                            self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
+                                self.cfg,
+                                f"🛡 {g['name']} 已启用启动保护：本轮运行结束前将跳过自动上传",
+                                f"🛡 Startup protection enabled for {g['name']}: automatic upload will be skipped for this run",
+                            ))
                         if self.cfg.get("sync_notify", True):
                             send_desktop_notification(
                                 bilingual_cfg(self.cfg, "存档管家 · 云存档下载", "Steam Save Manager · Cloud Save Download"),
@@ -6357,6 +6452,36 @@ class GameProcessMonitor:
                 _ts = datetime.datetime.now().strftime("%H:%M:%S")
                 if g and sync_folder:
                     try:
+                        guard = self._consume_upload_guard(g)
+                        if guard:
+                            local_info, remote_info, _ = self._build_sync_snapshots(g, sync_folder)
+                            mark_game_sync_conflict(
+                                self.cfg,
+                                g,
+                                guard.get("reason", bilingual_cfg(
+                                    self.cfg,
+                                    "本轮运行中云端存档是在游戏启动后才同步到本地，已为安全起见跳过自动上传",
+                                    "The cloud save was synchronized only after the game had already started in this session, so automatic upload was skipped for safety.",
+                                )),
+                                local_info,
+                                remote_info,
+                            )
+                            self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
+                                self.cfg,
+                                f"🛡 {g['name']}：已跳过自动上传，避免覆盖云端存档",
+                                f"🛡 {g['name']}: automatic upload skipped to avoid overwriting the cloud save",
+                            ))
+                            if self.cfg.get("sync_notify", True):
+                                send_desktop_notification(
+                                    bilingual_cfg(self.cfg, "存档管家 · 上传已保护", "Steam Save Manager · Upload Protected"),
+                                    bilingual_cfg(
+                                        self.cfg,
+                                        f"「{g['name']}」本轮运行已跳过自动上传，请确认后手动同步",
+                                        f"Automatic upload was skipped for {g['name']} in this session. Please sync manually after checking the save.",
+                                    ),
+                                )
+                            self.sync_log = self.sync_log[-50:]
+                            continue
                         waited = self._wait_for_save_settle(g)
                         if self._stop_event.is_set():
                             break
@@ -6368,6 +6493,7 @@ class GameProcessMonitor:
                             ))
                         r = sync_game_save(g, sync_folder, "upload",
                                            auto=True, cfg=self.cfg)
+                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
                         self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                             self.cfg,
                             f"↑ {g['name']}: {r}",
@@ -6401,10 +6527,11 @@ class GameProcessMonitor:
 # ══════════════════════════════════════════════
 
 class SaveChangeHandler(FileSystemEventHandler):
-    def __init__(self, game: dict, cooldown: int = 60):
+    def __init__(self, game: dict, cooldown: int = 60, on_backup_created=None):
         super().__init__()
         self.game = game
         self.cooldown = cooldown
+        self.on_backup_created = on_backup_created
         self._last_backup = 0
         self._quiet_delay = 2.5
         self._timer = None
@@ -6445,7 +6572,12 @@ class SaveChangeHandler(FileSystemEventHandler):
         if now - self._last_backup < self.cooldown:
             return
         self._last_backup = now
-        create_backup(self.game, localize_backup_note("文件变动自动备份", cfg_language(None)))
+        result = create_backup(self.game, localize_backup_note("文件变动自动备份", cfg_language(None)))
+        if result and callable(self.on_backup_created):
+            try:
+                self.on_backup_created(self.game)
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════
@@ -6519,7 +6651,9 @@ class SteamSaveManager(ctk.CTk):
         self._scan_results: list[dict] = []
         self._scan_lib_folders: list[str] = []
         self._scan_choice_vars: dict[str, ctk.StringVar] = {}
+        self._scan_choice_labels: dict[str, dict[str, str]] = {}
         self._scan_cards: dict[str, dict] = {}
+        self._steam_account_lookup_cache = {"steam_path": None, "accountid_map": {}, "steam64_map": {}}
         self._scan_info_banner = None
         self._scan_empty_label = None
         self._scan_search_job = None
@@ -7204,6 +7338,86 @@ class SteamSaveManager(ctk.CTk):
         self._scan_search_job = None
         self._render_scan_results()
 
+    def _get_scan_account_lookups(self):
+        steam_path = str(self.cfg.get("steam_path", "") or "").strip()
+        cached_steam_path = str(self._steam_account_lookup_cache.get("steam_path") or "").strip()
+        if steam_path and steam_path == cached_steam_path:
+            return (
+                dict(self._steam_account_lookup_cache.get("accountid_map", {})),
+                dict(self._steam_account_lookup_cache.get("steam64_map", {})),
+            )
+        accountid_map = {}
+        steam64_map = {}
+        if not steam_path:
+            return accountid_map, steam64_map
+        for item in get_steam_accounts(steam_path):
+            display = (
+                str(item.get("persona_name", "") or "").strip()
+                or str(item.get("account_name", "") or "").strip()
+                or str(item.get("accountid", "") or "").strip()
+            )
+            if not display:
+                continue
+            accountid = str(item.get("accountid", "") or "").strip()
+            steam64 = str(item.get("steamid64", "") or "").strip()
+            if accountid:
+                accountid_map[accountid] = display
+            if steam64:
+                steam64_map[steam64] = display
+        self._steam_account_lookup_cache = {
+            "steam_path": steam_path,
+            "accountid_map": dict(accountid_map),
+            "steam64_map": dict(steam64_map),
+        }
+        return accountid_map, steam64_map
+
+    def _get_scan_candidate_account_note(self, candidate: dict,
+                                         accountid_map: dict[str, str],
+                                         steam64_map: dict[str, str]) -> str:
+        candidate_accountid = str(candidate.get("accountid", "") or "").strip()
+        if candidate_accountid and candidate_accountid in accountid_map:
+            return accountid_map[candidate_accountid]
+        path = str(candidate.get("path", "") or "").strip()
+        if not path:
+            return ""
+        segments = [seg for seg in re.split(r"[\\\\/]+", path) if seg]
+        for segment in segments:
+            if segment in accountid_map:
+                return accountid_map[segment]
+            if segment in steam64_map:
+                return steam64_map[segment]
+        return ""
+
+    def _build_scan_choice_labels(self, appid: str, available_paths: list[str], candidates: list[dict]) -> tuple[list[str], dict[str, str]]:
+        accountid_map, steam64_map = self._get_scan_account_lookups()
+        labels = []
+        label_to_path = {}
+        path_to_candidate = {
+            os.path.normpath(c.get("path", "")): c
+            for c in (candidates or [])
+            if c.get("path")
+        }
+        for path in available_paths:
+            candidate = path_to_candidate.get(os.path.normpath(path), {"path": path})
+            note = self._get_scan_candidate_account_note(candidate, accountid_map, steam64_map)
+            label = path
+            if note:
+                label = self.bi(f"{path}  ·  Steam昵称：{note}", f"{path}  ·  Steam: {note}")
+            if label in label_to_path:
+                suffix = 2
+                base_label = label
+                while label in label_to_path:
+                    label = f"{base_label} ({suffix})"
+                    suffix += 1
+            label_to_path[label] = path
+            labels.append(label)
+        self._scan_choice_labels[str(appid)] = dict(label_to_path)
+        return labels, label_to_path
+
+    def _resolve_scan_selected_path(self, appid: str, selected_value: str) -> str:
+        mapping = self._scan_choice_labels.get(str(appid), {})
+        return mapping.get(selected_value, selected_value)
+
     def _schedule_games_refresh(self, *_args):
         if self._games_search_job:
             try:
@@ -7228,6 +7442,25 @@ class SteamSaveManager(ctk.CTk):
         self._game_backups_cache.clear()
         self._recent_backups_cache.clear()
         self._game_detail_metrics_cache.clear()
+
+    def _on_backups_changed(self, game_ref=None):
+        self._invalidate_game_backup_count_cache(game_ref)
+        current = getattr(self, "_current_frame", "home")
+        if current == "backup":
+            self._refresh_backup_list()
+            return
+        if current == "home":
+            self._refresh_home()
+            return
+        if current == "games":
+            self._refresh_games_list()
+            return
+        if current == "game_detail":
+            detail_idx = getattr(self, "_detail_idx", None)
+            if isinstance(detail_idx, int) and 0 <= detail_idx < len(self.cfg.get("games", [])):
+                live_game = self.cfg["games"][detail_idx]
+                if game_ref is None or get_game_cache_key(game_ref) == get_game_cache_key(live_game):
+                    self._show_game_detail(detail_idx)
 
     def _get_game_backup_count_cached(self, game_ref) -> int:
         key = get_game_cache_key(game_ref)
@@ -7365,6 +7598,7 @@ class SteamSaveManager(ctk.CTk):
             active_keys.add(key)
             tracked_paths = tracked_by_appid.get(str(appid or "").strip(), set())
             available_paths = [p for p in save_paths if os.path.normpath(p) not in tracked_paths]
+            option_labels, label_to_path = self._build_scan_choice_labels(appid, available_paths, game.get("save_candidates", []))
             item = self._scan_cards.get(key)
             if item is None:
                 card = ctk.CTkFrame(self._scan_scroll,
@@ -7448,17 +7682,17 @@ class SteamSaveManager(ctk.CTk):
                     addable += 1
                     pv = self._scan_choice_vars.get(appid)
                     if pv is None:
-                        pv = ctk.StringVar(value=save_paths[0])
+                        pv = ctk.StringVar(value=option_labels[0])
                         self._scan_choice_vars[appid] = pv
-                    if pv.get() not in available_paths:
-                        pv.set(available_paths[0])
+                    if pv.get() not in label_to_path:
+                        pv.set(option_labels[0])
                     if item["option"] is None:
                         item["option"] = ctk.CTkOptionMenu(
-                            item["right_top"], variable=pv, values=available_paths, width=240, font=font(11)
+                            item["right_top"], variable=pv, values=option_labels, width=260, font=font(11)
                         )
                         item["option"].pack(side="left")
                     else:
-                        item["option"].configure(variable=pv, values=available_paths)
+                        item["option"].configure(variable=pv, values=option_labels)
                         if not item["option"].winfo_manager():
                             item["option"].pack(side="left")
                     if item["folder_btn"] is None:
@@ -7480,7 +7714,7 @@ class SteamSaveManager(ctk.CTk):
                         item["add_btn"].pack(side="left", padx=(8, 0))
                     elif not item["add_btn"].winfo_manager():
                         item["add_btn"].pack(side="left", padx=(8, 0))
-                    item["add_btn"].configure(command=lambda a=appid, n=name, v=pv: self._add_from_scan(a, n, v.get()))
+                    item["add_btn"].configure(command=lambda a=appid, n=name, v=pv: self._add_from_scan(a, n, self._resolve_scan_selected_path(a, v.get())))
                     if item["status"] is not None:
                         item["status"].grid_remove()
                 else:
@@ -7528,6 +7762,7 @@ class SteamSaveManager(ctk.CTk):
             if item:
                 item["card"].destroy()
             self._scan_choice_vars.pop(key, None)
+            self._scan_choice_labels.pop(key, None)
 
         if not self._scan_in_progress:
             self._scan_status.configure(
@@ -7547,6 +7782,7 @@ class SteamSaveManager(ctk.CTk):
             item["card"].destroy()
         self._scan_cards.clear()
         self._scan_choice_vars = {}
+        self._scan_choice_labels = {}
         self._scan_empty_label.pack_forget()
         self._scan_info_banner.configure(fg_color=("#fef2f2", "#450a0a"))
         self._scan_info_label.configure(
@@ -7640,6 +7876,7 @@ class SteamSaveManager(ctk.CTk):
         self._scan_results = []
         self._scan_lib_folders = []
         self._scan_choice_vars = {}
+        self._scan_choice_labels = {}
         for item in self._scan_cards.values():
             item["card"].destroy()
         self._scan_cards.clear()
@@ -7745,7 +7982,8 @@ class SteamSaveManager(ctk.CTk):
             appid = result.get("appid")
             if not result.get("save_paths"):
                 continue
-            selected = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
+            selected_value = self._scan_choice_vars.get(appid).get() if appid in self._scan_choice_vars else result["save_paths"][0]
+            selected = self._resolve_scan_selected_path(appid, selected_value)
             save_paths = self._collect_scan_add_paths(appid, selected)
             save_specs = self._collect_scan_add_specs(appid, selected)
             if any(game_matches_save_target(g, appid, save_specs=save_specs, save_paths=save_paths) for g in games):
@@ -9314,7 +9552,7 @@ class SteamSaveManager(ctk.CTk):
     def _on_backup_done(self, result):
         self._set_io_busy(False)
         if result:
-            self._invalidate_game_backup_count_cache()
+            self._on_backups_changed()
             self._show_info(self.bi("成功", "Success"), self.bi(f"备份完成！\n{result}", f"Backup complete!\n{result}"))
         else:
             self._show_error(self.bi("失败", "Failed"), self.bi("存档路径不存在", "The save path does not exist"))
@@ -9360,7 +9598,7 @@ class SteamSaveManager(ctk.CTk):
     def _on_backup_all_done(self, total, ok, original_title, done_title, failed=None):
         self._set_io_busy(False)
         self.title(original_title)
-        self._invalidate_game_backup_count_cache()
+        self._on_backups_changed()
         failed = failed or []
         message = self.bi(f"成功 {ok}/{total}", f"Succeeded: {ok}/{total}")
         if failed:
@@ -9494,7 +9732,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_restore_done(self):
         self._set_io_busy(False)
-        self._invalidate_game_backup_count_cache()
+        self._on_backups_changed()
         self._show_info(self.bi("成功", "Success"), self.bi("已还原！", "Restored successfully!"))
 
     def _on_restore_failed(self, err):
@@ -9519,9 +9757,8 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_del_bk_done(self, result=None):
         self._set_io_busy(False)
-        self._invalidate_game_backup_count_cache()
+        self._on_backups_changed()
         self._show_delete_backup_followup(result)
-        self._refresh_backup_list()
 
     # ─── 设置 ───
     def _build_settings_frame(self):
@@ -10130,6 +10367,7 @@ class SteamSaveManager(ctk.CTk):
         self.cfg["steam_path"] = self._steam_e.get().strip()
         save_config(self.cfg)
         _SAVE_DETECTION_CACHE.clear()
+        self._steam_account_lookup_cache = {"steam_path": None, "accountid_map": {}, "steam64_map": {}}
 
     def _apply_auto_backup_interval(self):
         try:
@@ -10163,6 +10401,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _apply_sync_folder(self):
         self.cfg["sync_folder"] = self._sync_folder_e.get().strip()
+        self.cfg["sync_folder_source"] = "manual"
         save_config(self.cfg)
 
     def _apply_sync_archive_keep(self):
@@ -10409,7 +10648,9 @@ class SteamSaveManager(ctk.CTk):
         if path:
             self._sync_folder_e.delete(0, "end")
             self._sync_folder_e.insert(0, path)
-            self._apply_sync_folder()
+            self.cfg["sync_folder"] = path
+            self.cfg["sync_folder_source"] = "auto"
+            save_config(self.cfg)
             self._show_info(self.t("detect_success_title"),
                             self.t("detect_success_body", path=path))
         else:
@@ -10451,6 +10692,7 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_sync_all_done(self, results):
         self._set_io_busy(False)
+        self._on_backups_changed()
         lines = [self.bi(f"{name}：{msg}", f"{name}: {msg}") for name, msg in results]
         self._show_info(self.bi("同步完成", "Sync Complete"), "\n".join(lines))
         conflict_keys = {
@@ -10497,8 +10739,9 @@ class SteamSaveManager(ctk.CTk):
 
     def _on_sync_one_done(self, game_name, result, idx):
         self._set_io_busy(False)
+        live_game = self.cfg["games"][idx] if idx < len(self.cfg.get("games", [])) else None
+        self._on_backups_changed(live_game)
         if result.startswith("冲突：") or result.startswith("Conflict:"):
-            live_game = self.cfg["games"][idx] if idx < len(self.cfg["games"]) else None
             if live_game:
                 self._show_sync_conflict_dialog(live_game)
         else:
@@ -10540,7 +10783,9 @@ class SteamSaveManager(ctk.CTk):
                 appid = str(g.get("appid", "") or "").strip()
                 if not appid or appid not in running_appids:
                     continue
-                create_backup(g, self.bi("定时自动备份", "Scheduled Backup"))
+                result = create_backup(g, self.bi("定时自动备份", "Scheduled Backup"))
+                if result:
+                    self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
 
     def _update_status(self):
         if self.cfg.get("auto_backup_enabled"):
@@ -10573,8 +10818,12 @@ class SteamSaveManager(ctk.CTk):
             if self._sync_stop.is_set():
                 break
             try:
-                run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""))
+                retry_results = run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""))
+                if retry_results:
+                    self.after(0, self._on_backups_changed)
                 results = sync_all_games(self.cfg, auto=True)
+                if results:
+                    self.after(0, self._on_backups_changed)
                 for game in self.cfg.get("games", []):
                     state = get_game_sync_state(self.cfg, game)
                     if state.get("pending_conflict"):
@@ -10619,7 +10868,12 @@ class SteamSaveManager(ctk.CTk):
             if not g.get("auto_backup", True):
                 continue
             for save_path in get_game_save_paths(g, existing_only=True):
-                handler = SaveChangeHandler(g, cd)
+                handler = SaveChangeHandler(
+                    g, cd,
+                    on_backup_created=lambda game_ref, self=self: self.after(
+                        0, lambda gr=dict(game_ref): self._on_backups_changed(gr)
+                    ),
+                )
                 observer.schedule(handler, save_path, recursive=True)
                 self._watch_handlers.append(handler)
                 handler_count += 1
