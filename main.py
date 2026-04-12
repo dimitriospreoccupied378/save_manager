@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Steam 游戏存档备份管理器 v1.3.5 — 通用版"""
+"""Steam 游戏存档备份管理器 v1.3.6 — 通用版"""
 
 import os
 import sys
@@ -80,7 +80,7 @@ except ImportError as exc:
 # ══════════════════════════════════════════════
 
 APP_NAME = "Steam Save Manager"
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 APP_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 LEGACY_CONFIG_DIR = Path.home() / ".steam_save_manager"
 STARTUP_AUTOSTART_FLAG = "--startup-launch"
@@ -5910,7 +5910,7 @@ class GameProcessMonitor:
     3. 进程名关键词模糊匹配（兜底，覆盖非 Steam 启动的场景）
     """
 
-    def __init__(self, cfg: dict, poll_interval: int = 10):
+    def __init__(self, cfg: dict, poll_interval: int = 10, *, on_backups_changed=None):
         self.cfg = cfg
         self.poll_interval = poll_interval  # 秒
         self._stop_event = threading.Event()
@@ -5918,6 +5918,7 @@ class GameProcessMonitor:
         self._thread: Optional[threading.Thread] = None
         self.sync_log: list[str] = []  # 同步活动日志（最近50条）
         self._upload_guards: dict[str, dict] = {}
+        self._on_backups_changed_cb = on_backups_changed
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -6325,7 +6326,12 @@ class GameProcessMonitor:
 
         retry_results = run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
         if retry_results:
-            self.after(0, self._on_backups_changed)
+            cb = self._on_backups_changed_cb
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
 
         # 初始扫描，记录已在运行的游戏并立即触发一次下载同步
         self._running_games = self._find_running_games()
@@ -6350,7 +6356,12 @@ class GameProcessMonitor:
                         guarded = self._arm_upload_guard_after_launch(g, sync_folder)
                         r = sync_game_save(g, sync_folder, "download",
                                            auto=True, cfg=self.cfg)
-                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
+                        _cb = self._on_backups_changed_cb
+                        if _cb:
+                            try:
+                                _cb(dict(g))
+                            except Exception:
+                                pass
                         _ts2 = datetime.datetime.now().strftime("%H:%M:%S")
                         self.sync_log.append(f"[{_ts2}] " + bilingual_cfg(
                             self.cfg,
@@ -6395,7 +6406,12 @@ class GameProcessMonitor:
                 continue
             retry_results = run_sync_retries(self.cfg, self.cfg.get("sync_folder", ""), log_cb=_log)
             if retry_results:
-                self.after(0, self._on_backups_changed)
+                _cb = self._on_backups_changed_cb
+                if _cb:
+                    try:
+                        _cb()
+                    except Exception:
+                        pass
             game_by_appid = {
                 g.get("appid"): g
                 for g in self.cfg.get("games", []) if g.get("appid")
@@ -6414,7 +6430,12 @@ class GameProcessMonitor:
                         guarded = self._arm_upload_guard_after_launch(g, sync_folder)
                         r = sync_game_save(g, sync_folder, "download",
                                            auto=True, cfg=self.cfg)
-                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
+                        _cb = self._on_backups_changed_cb
+                        if _cb:
+                            try:
+                                _cb(dict(g))
+                            except Exception:
+                                pass
                         self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                             self.cfg,
                             f"↓ {g['name']}: {r}",
@@ -6493,7 +6514,12 @@ class GameProcessMonitor:
                             ))
                         r = sync_game_save(g, sync_folder, "upload",
                                            auto=True, cfg=self.cfg)
-                        self.after(0, lambda game_ref=dict(g): self._on_backups_changed(game_ref))
+                        _cb = self._on_backups_changed_cb
+                        if _cb:
+                            try:
+                                _cb(dict(g))
+                            except Exception:
+                                pass
                         self.sync_log.append(f"[{_ts}] " + bilingual_cfg(
                             self.cfg,
                             f"↑ {g['name']}: {r}",
@@ -7402,7 +7428,7 @@ class SteamSaveManager(ctk.CTk):
             note = self._get_scan_candidate_account_note(candidate, accountid_map, steam64_map)
             label = path
             if note:
-                label = self.bi(f"{path}  ·  Steam昵称：{note}", f"{path}  ·  Steam: {note}")
+                label = f"{path}  ({note})"
             if label in label_to_path:
                 suffix = 2
                 base_label = label
@@ -10849,7 +10875,10 @@ class SteamSaveManager(ctk.CTk):
     # ─── 智能云存档进程监控 ───
     def _start_game_monitor(self):
         self._stop_game_monitor()
-        self._game_monitor = GameProcessMonitor(self.cfg)
+        self._game_monitor = GameProcessMonitor(
+            self.cfg,
+            on_backups_changed=lambda *a: self.after(0, lambda: self._on_backups_changed(*a) if a else self._on_backups_changed()),
+        )
         self._game_monitor.start()
 
     def _stop_game_monitor(self):
